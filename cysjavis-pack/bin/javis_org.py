@@ -592,56 +592,6 @@ def _quarantine(src, trash_dir, label):
     shutil.move(src, dest)
     return (f"quarantine_{label}", dest)
 
-# ─── S8 M3: `.producer` 표식 쓰기 — "이 격리는 지금 진행 중이다"를 디스크에 남긴다 ──────────────
-# 읽는 쪽은 데몬(`trash.rs` producer_state)이고, 읽는 규칙은 설계 r2 §3.4 다:
-#   open+살아 있는 pid → 삭제 거부(producer_active) · open+죽은 pid → "생산자가 끝내지 못함" 표지와
-#   함께 삭제 가능 · complete|aborted → 보통 항목 · 표식 없음 → "생산자 알 수 없음"(구 버전과 동일).
-# ★절대 규칙(r2 §3.4 · R1-k): **표식 기록 실패가 격리를 실패·지연·재배열시키지 않는다.** 오류는
-#   stderr 한 줄이고, 그래서 이 함수는 어떤 예외도 밖으로 내보내지 않는다.
-# ★남의 창은 건드리지 않는다: 같은 격리 폴더를 쓰는 생산자가 둘(이 파일과 cys-dept)이라 표식 파일도
-#   하나다 — 다른 pid 의 `open` 은 덮지 않고, 닫는 것도 **내 pid 의 표식**만 닫는다.
-def _proc_start_token():
-    """pid 재사용을 구별할 프로세스 시작 토큰. Linux `/proc` 에서만 얻고 없으면 빈 문자열이다.
-    ★현재 판독기(`trash.rs real_alive`)는 이 값을 **대조하지 않는다**(pid 존재만 본다) — 나중을
-    위한 기록이며, 그래서 빈 문자열이어도 판정이 달라지지 않는다."""
-    try:
-        with open("/proc/self/stat", encoding="utf-8") as f:
-            return f.read().rsplit(")", 1)[1].split()[19]
-    except Exception:
-        return ""
-
-def _producer_mark(trash_dir, state, producer, create=False):
-    """`create=True` 는 **곧 이동이 일어난다고 이미 확정된 순간**에만 쓴다 — 그때는 `_quarantine` 이
-    같은 폴더를 바로 만들기 때문에 표식이 폴더를 먼저 만드는 것이 새 쓰레기가 되지 않는다. 닫을
-    때는 절대 만들지 않는다(없으면 쓸 것도 없다)."""
-    try:
-        if create and not os.path.isdir(trash_dir):
-            os.makedirs(trash_dir, exist_ok=True)
-        if not os.path.isdir(trash_dir):
-            return  # 격리 폴더가 없다 — 표식 때문에 **빈 격리 항목을 만들지 않는다**
-        path = os.path.join(trash_dir, ".producer")
-        mine = os.getpid()
-        cur = None
-        try:
-            with open(path, encoding="utf-8") as f:
-                cur = json.load(f)
-        except Exception:
-            cur = None
-        if isinstance(cur, dict) and cur.get("pid") != mine:
-            if state == "open" and cur.get("state") == "open":
-                return  # 다른 생산자가 창을 열어 뒀다 — 더 넓은 창이 이긴다
-            if state != "open":
-                return  # 내 표식이 아니면 닫지 않는다
-        body = json.dumps({"v": 1, "state": state, "producer": producer, "pid": mine,
-                           "start_token": _proc_start_token(), "ts": time.time()},
-                          ensure_ascii=False)
-        tmp = "%s.tmp-%d" % (path, mine)
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(body)
-        os.replace(tmp, path)  # 원자적 tmp+rename
-    except Exception as e:
-        sys.stderr.write("[destroy] .producer 표식 기록 실패(격리는 그대로 계속한다): %s\n" % e)
-
 def destroy_dept(name, mission_key, purge=False, purge_workdir=False, purge_state=False):
     require_cso()  # 게이트를 효과 함수에 (R1 REVISE-1) — import 직접호출 우회 차단
     actions = []
@@ -711,28 +661,15 @@ def destroy_dept(name, mission_key, purge=False, purge_workdir=False, purge_stat
     if r.returncode != 0:
         sys.stderr.write("[destroy] %s: cys-dept down 실패(rc=%d) — %s\n"
                          % (name, r.returncode, (r.stderr or "").strip()[:300]))
-    # ★S8 M3: 내가 옮기는 동안을 표식으로 알린다 — **옮길 것이 실제로 있을 때만** 쓴다(표식 때문에
-    #   빈 격리 항목이 생기면 그 자체가 새 쓰레기다). 이 창은 내 이동 둘(pack·workdir)을 덮고,
-    #   위임한 `cys-dept down --purge-state` 의 state 이동은 그쪽이 자기 표식으로 덮는다.
-    #   두 창 사이의 틈(down 종료 ~ 여기)은 미리보기-digest 결박이 막는다: 그 사이에 pack 이 들어오면
-    #   주문은 `entry_changed_since_preview` 로 거부되고, 삭제가 먼저면 pack 은 새 항목으로 남는다.
-    pack = f"{HOME}/.cys/pack-dept-{name}" if purge else None
-    _mark_srcs = [p for p in (pack, workdir if (purge_workdir and wd_eligible) else None)
-                  if p and os.path.isdir(p)]
-    if _mark_srcs:
-        _producer_mark(trash_dir, "open", "javis_org.destroy_dept", create=True)
     # 3) pack-dept 격리(백업 없는 rmtree → mv 정합화) — forwarder는 self-reap(직접 회수 안 함)
     if purge:
+        pack = f"{HOME}/.cys/pack-dept-{name}"
         a = _quarantine(pack, trash_dir, "pack")
         if a: actions.append(a)
     # 4) workdir 격리(down 전 포착 경로 사용) — D1a 자격 게이트 통과 시에만(스냅샷과 대칭)
     if purge_workdir and wd_eligible:
         a = _quarantine(workdir, trash_dir, "workdir")
         if a: actions.append(a)
-    # 내 이동이 끝났다 — 창을 닫는다. ★예외로 여기 도달하지 못하면 표식은 `open` + 곧 죽는 pid 로
-    #   남고, 그것이 설계가 말하는 "생산자가 끝내지 못함(중단)" 표지다(I-9).
-    if _mark_srcs:
-        _producer_mark(trash_dir, "complete", "javis_org.destroy_dept")
     # ★F1(reviewer1): purge_state 성공 경로에 사후 결정론 검증기를 배선한다 — 라이브에서도 재등재0·
     #   묘비생존·형제무오염을 확인하고, 검증 실패도 비0로 전파(격리 미완/부활창을 "done"으로 오보하지
     #   않는다). down이 이미 실패면 검증 skip(중복 보고 회피 — cmd_destroy가 down 실패로 이미 비0).
@@ -1146,78 +1083,6 @@ def self_test():
         and "레지스트리 복구 후 down 재시도" in refuse_diag.getvalue()
         and "부서는 살아 있다" not in refuse_diag.getvalue(),
         "down rc=10 에서 pack/workdir 격리 또는 원본 변경·거부 사유 누락: %r" % refuse_actions)
-    # --- S8 M3: `.producer` 표식 — 쓰기 규칙과 '격리를 절대 방해하지 않는다' ---
-    def _mark_read(d):
-        try:
-            with open(os.path.join(d, ".producer"), encoding="utf-8") as f: return json.load(f)
-        except Exception: return None
-    mk_home = os.path.join(td, "destroy-mark-home")
-    mk_name = "marked"
-    mk_pack = os.path.join(mk_home, ".cys", "pack-dept-" + mk_name)
-    mk_work = os.path.join(mk_home, "workdir")
-    mk_trash_root = os.path.join(mk_home, ".local", "state", "cys-trash")
-    for _p in (mk_pack, mk_work): os.makedirs(_p, exist_ok=True)
-    mk_reg = os.path.join(mk_home, "depts.json")
-    with open(mk_reg, "w", encoding="utf-8") as f:
-        json.dump({"depts": {mk_name: {"cwd": mk_work, "workdir_owned": True}}}, f)
-    mk_bin = os.path.join(mk_home, "cys-dept-mock")
-    with open(mk_bin, "w", encoding="utf-8") as f: f.write("CYS_DEPT_BIN self-test fixture\n")
-    with patch.multiple(sys.modules[__name__], HOME=mk_home, DEPTS=mk_reg, TRASH_ROOT=mk_trash_root), \
-         patch.object(sys.modules[__name__], "require_cso"), \
-         patch.dict(os.environ, {"CYS_DEPT_BIN": mk_bin, "CYS_TRASH_STAMP": "100"}), \
-         patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
-             [mk_bin, "down", mk_name], 0, "", "")), \
-         redirect_stderr(StringIO()):
-        mk_actions = destroy_dept(mk_name, None, purge=True, purge_workdir=True)
-    mk_dir = os.path.join(mk_trash_root, mk_name + "-100")
-    mk_rec = _mark_read(mk_dir)
-    chk("producer-mark-complete-after-moves",
-        isinstance(mk_rec, dict) and mk_rec.get("state") == "complete" and mk_rec.get("v") == 1
-        and mk_rec.get("pid") == os.getpid() and mk_rec.get("producer") == "javis_org.destroy_dept"
-        and "start_token" in mk_rec and isinstance(mk_rec.get("ts"), float)
-        and os.path.isdir(os.path.join(mk_dir, "pack")) and os.path.isdir(os.path.join(mk_dir, "workdir"))
-        and not [f for f in os.listdir(mk_dir) if f.startswith(".producer.tmp-")],
-        "격리 뒤 표식이 complete 가 아니거나 임시파일 잔존: %r / %r" % (mk_rec, mk_actions))
-    # 옮길 것이 하나도 없으면 표식도 격리 폴더도 만들지 않는다(빈 항목 금지).
-    none_home = os.path.join(td, "destroy-mark-none-home")
-    none_trash = os.path.join(none_home, ".local", "state", "cys-trash")
-    none_reg = os.path.join(none_home, "depts.json"); os.makedirs(none_home, exist_ok=True)
-    with open(none_reg, "w", encoding="utf-8") as f: json.dump({"depts": {"nomove": {}}}, f)
-    with patch.multiple(sys.modules[__name__], HOME=none_home, DEPTS=none_reg, TRASH_ROOT=none_trash), \
-         patch.object(sys.modules[__name__], "require_cso"), \
-         patch.dict(os.environ, {"CYS_DEPT_BIN": mk_bin, "CYS_TRASH_STAMP": "100"}), \
-         patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
-             [mk_bin, "down", "nomove"], 0, "", "")), \
-         redirect_stderr(StringIO()):
-        destroy_dept("nomove", None, purge=True, purge_workdir=True)
-    chk("producer-mark-no-empty-entry", not os.path.exists(none_trash),
-        "옮길 것이 없는데 격리 폴더·표식이 생겼다: %s" % none_trash)
-    # 남의 창은 덮지 않고, 남의 표식은 닫지 않는다(한 폴더를 두 생산자가 쓴다).
-    own_dir = os.path.join(td, "mark-ownership"); os.makedirs(own_dir, exist_ok=True)
-    foreign = {"v": 1, "state": "open", "producer": "cys-dept", "pid": 1, "start_token": "", "ts": 1.0}
-    with open(os.path.join(own_dir, ".producer"), "w", encoding="utf-8") as f: json.dump(foreign, f)
-    _producer_mark(own_dir, "open", "javis_org.destroy_dept")
-    chk("producer-mark-foreign-open-not-overwritten", _mark_read(own_dir) == foreign,
-        "다른 pid 의 open 창을 덮었다: %r" % _mark_read(own_dir))
-    _producer_mark(own_dir, "complete", "javis_org.destroy_dept")
-    chk("producer-mark-foreign-not-closed", _mark_read(own_dir) == foreign,
-        "내 것이 아닌 표식을 닫았다: %r" % _mark_read(own_dir))
-    # 내 표식은 내가 닫는다.
-    _producer_mark(own_dir + "-mine", "open", "javis_org.destroy_dept", create=True)
-    _producer_mark(own_dir + "-mine", "complete", "javis_org.destroy_dept")
-    chk("producer-mark-own-closed", (_mark_read(own_dir + "-mine") or {}).get("state") == "complete",
-        "내 표식을 닫지 못했다: %r" % _mark_read(own_dir + "-mine"))
-    # 없는 폴더에 닫기 — 폴더를 만들지 않는다.
-    _producer_mark(os.path.join(td, "mark-absent"), "complete", "javis_org.destroy_dept")
-    chk("producer-mark-close-never-creates", not os.path.exists(os.path.join(td, "mark-absent")),
-        "닫기가 격리 폴더를 만들었다")
-    # ★기록 실패가 예외로 새지 않는다(격리를 실패·지연시키지 않는다는 규칙의 기계 확인).
-    raise_diag = StringIO()
-    def _boom(*a, **k): raise OSError(28, "No space left on device")
-    with patch.object(os, "replace", _boom), redirect_stderr(raise_diag):
-        _producer_mark(own_dir + "-mine", "open", "javis_org.destroy_dept")
-    chk("producer-mark-never-raises", "표식 기록 실패(격리는 그대로 계속한다)" in raise_diag.getvalue(),
-        "표식 기록 실패가 stderr 1줄로 보고되지 않았다: %r" % raise_diag.getvalue())
     print(json.dumps({"self_test": "ok" if not failures else "fail",
                       "failures": failures}, ensure_ascii=False))
     return 1 if failures else 0

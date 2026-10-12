@@ -1576,9 +1576,6 @@ pub fn execute_quarantine(
 
     std::fs::create_dir_all(&plan.trash_dir)
         .map_err(|e| format!("격리 디렉토리 생성 실패 {}: {e}", plan.trash_dir.display()))?;
-    // ★S8 M3: 여기부터 마지막 쓰기(REPORT.txt)까지가 내 격리 창이다. 중간에 Err 로 돌아가면 표식은
-    //   `open` + 곧 죽는 pid 로 남고, 그것이 설계가 말하는 "생산자가 끝내지 못함(중단)" 표지다.
-    producer_mark(&plan.trash_dir, "open", false);
 
     // ★J1(성찰 확정): 복구 지도를 **이동 전에** 한 줄씩 선기록한다(append-only journal).
     // 종전엔 전 항목 이동이 끝난 뒤에야 manifest 를 썼다 — 중도 사망(강제종료·전원·업데이트
@@ -1827,8 +1824,6 @@ pub fn execute_quarantine(
         &plan.trash_dir.join("REPORT.txt"),
         report.human_report().as_bytes(),
     );
-    // 마지막 쓰기가 끝났다 — 창을 닫는다(이 뒤로 이 폴더에 쓰는 것이 없다).
-    producer_mark(&plan.trash_dir, "complete", false);
     Ok(report)
 }
 
@@ -1841,66 +1836,6 @@ pub fn execute_quarantine(
 // 공백·ZWSP 가 섞여도 육안으로는 구분이 안 된다. 전부 같은 뜻이므로 같게 취급한다.
 // ★의존성 0: 전면 NFC 가 아니라 **한글 음절 합성**만 직접 구현한다(대상 문구가 한글이므로 충분).
 // ─────────────────────────────────────────────────────────────────────────────
-
-// ─── S8 M3: `.producer` 표식 — "이 격리는 지금 진행 중이다"를 디스크에 남긴다 ────────────────────
-// 읽는 쪽은 데몬(`cysd::trash::producer_state`)이고 규칙은 설계 r2 §3.4 다: `open` + 살아 있는 pid 는
-// 삭제를 거부하고(`producer_active`), `open` + 죽은 pid 는 "생산자가 끝내지 못함(중단)" 표지와 함께
-// 삭제를 허용하며, `complete`|`aborted` 는 보통 항목, 표식 없음은 "생산자 알 수 없음"이다.
-// ★이 표식은 `manifest.json` 과 다른 질문에 답한다: manifest 는 **이동 전에** 써지므로 완료의 증거가
-//   아니고(REPORT.txt 가 마지막이다), 표식은 "지금 돌고 있는가"를 답한다 — 설계 I-10 이 그 둘을
-//   구별하라고 요구한 자리다.
-// ★절대 규칙(r2 §3.4 · R1-k): 표식 기록 실패가 격리를 실패·지연·재배열시키지 않는다 — 돌려주는 값이
-//   없고, 오류는 stderr 한 줄이다. 이 함수는 초기화 흐름의 어떤 분기도 바꾸지 않는다.
-// ★남의 표식은 건드리지 않는다(한 격리 폴더에 생산자가 둘일 수 있다 — 여기선 폴더 이름이
-//   `factory-reset-<stamp>` 라 겹치지 않지만, 규칙은 세 writer 가 같다).
-fn producer_start_token() -> String {
-    // pid 재사용 구별용. Linux `/proc` 에서만 얻고 없으면 빈 문자열이다.
-    // ★현재 판독기는 이 값을 **대조하지 않는다**(pid 존재만 본다) — 나중을 위한 기록이다.
-    std::fs::read_to_string("/proc/self/stat")
-        .ok()
-        .and_then(|t| {
-            let after = t.rsplit_once(')').map(|(_, a)| a.to_string())?;
-            after.split_whitespace().nth(19).map(|s| s.to_string())
-        })
-        .unwrap_or_default()
-}
-
-fn producer_mark(trash_dir: &Path, state: &str, create: bool) {
-    let mine = std::process::id();
-    if create && !trash_dir.is_dir() {
-        let _ = std::fs::create_dir_all(trash_dir);
-    }
-    if !trash_dir.is_dir() {
-        return; // 표식 때문에 **빈 격리 항목을 만들지 않는다**
-    }
-    let path = trash_dir.join(".producer");
-    if let Ok(txt) = std::fs::read_to_string(&path) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-            let cur_pid = v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-            if cur_pid != mine {
-                let cur_open = v.get("state").and_then(|x| x.as_str()) == Some("open");
-                if state == "open" && cur_open {
-                    return; // 더 넓은 창이 이긴다
-                }
-                if state != "open" {
-                    return; // 내 표식이 아니면 닫지 않는다
-                }
-            }
-        }
-    }
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    let body = serde_json::json!({
-        "v": 1, "state": state, "producer": "cys factory-reset",
-        "pid": mine, "start_token": producer_start_token(), "ts": ts,
-    })
-    .to_string();
-    if let Err(e) = crate::pack::write_atomic(&path, body.as_bytes()) {
-        eprintln!("[factory-reset] .producer 표식 기록 실패(격리는 그대로 계속한다): {e}");
-    }
-}
 
 /// 한글 자모(L+V[+T])를 완성형 음절로 합성한다(유니코드 표준 알고리즘 · NFD→NFC 부분집합).
 fn compose_hangul(input: &str) -> String {
@@ -3347,67 +3282,6 @@ mod tests {
         assert!(txt.contains("cys 완전 초기화 결과"));
         assert!(txt.contains("이미 없음"));
         assert!(txt.contains("--undo"));
-    }
-
-    /// ★S8 M3: 격리가 끝나면 `.producer` 가 `complete` 로 닫혀 있다 — 그리고 그것은
-    /// `manifest.json`(이동 **전에** 써진다)이 아니라 **이 표식**이 완료를 말한다는 뜻이다.
-    /// 읽는 쪽과 같은 길로(serde_json) 파싱해 계약 필드를 본다.
-    #[test]
-    fn producer_marker_is_closed_after_quarantine() {
-        let td = test_home("producer-mark");
-        let r = seed_practice_tree(&td);
-        let plan = build_plan(
-            &r,
-            &ResetOptions { purge_license: false, purge_local: false, purge_round: false },
-        );
-        let not_cysd = |_p: u32| false;
-        let no_daemon = || false;
-        let mut noop = |_p: &str, _d: &str| {};
-        let rep = execute_quarantine(&plan, &r, &not_cysd, &no_daemon, &mut noop).unwrap();
-        let mark = plan.trash_dir.join(".producer");
-        let txt = std::fs::read_to_string(&mark).expect("표식이 없다");
-        let v: serde_json::Value = serde_json::from_str(&txt).expect("표식이 JSON 이 아니다");
-        assert_eq!(v["state"], "complete", "{txt}");
-        assert_eq!(v["v"], 1);
-        assert_eq!(v["pid"].as_u64().unwrap() as u32, std::process::id());
-        assert_eq!(v["producer"], "cys factory-reset");
-        assert!(v.get("start_token").is_some() && v["ts"].as_f64().unwrap() > 0.0, "{txt}");
-        // 표식은 격리분의 dot-file 이라 첫 단계 목록·복구 지도에 섞이지 않는다.
-        assert!(rep.manifest_written);
-        let man = std::fs::read_to_string(plan.trash_dir.join("manifest.json")).unwrap();
-        assert!(!man.contains(".producer"), "복구 지도에 표식이 섞였다");
-        let _ = rep;
-    }
-
-    /// ★S8 M3 소유 규칙: 다른 pid 의 `open` 창은 덮지 않고, 남의 표식은 닫지 않는다
-    /// (한 격리 폴더를 생산자 둘이 쓸 수 있고, 표식 파일은 하나다). pid 1 은 언제나 살아 있다.
-    #[test]
-    fn producer_marker_never_touches_another_producers_window() {
-        let td = test_home("producer-own");
-        let dir = td.join("entry");
-        std::fs::create_dir_all(&dir).unwrap();
-        let foreign = serde_json::json!({
-            "v": 1, "state": "open", "producer": "cys-dept purge-state",
-            "pid": 1, "start_token": "", "ts": 1.0
-        })
-        .to_string();
-        let mark = dir.join(".producer");
-        std::fs::write(&mark, &foreign).unwrap();
-        producer_mark(&dir, "open", false);
-        assert_eq!(std::fs::read_to_string(&mark).unwrap(), foreign, "남의 창을 덮었다");
-        producer_mark(&dir, "complete", false);
-        assert_eq!(std::fs::read_to_string(&mark).unwrap(), foreign, "남의 표식을 닫았다");
-        // 내 표식은 내가 닫는다.
-        let mine = td.join("mine");
-        producer_mark(&mine, "open", true);
-        producer_mark(&mine, "complete", false);
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(mine.join(".producer")).unwrap()).unwrap();
-        assert_eq!(v["state"], "complete");
-        // 닫기는 폴더를 만들지 않는다(표식 때문에 빈 격리 항목이 생기지 않는다).
-        let never = td.join("never");
-        producer_mark(&never, "complete", false);
-        assert!(!never.exists(), "닫기가 격리 폴더를 만들었다");
     }
 
     /// ★P0(복구) 회귀: undo 가 격리본을 원위치로 되돌리고, 원위치가 차 있으면 덮어쓰지 않는다.
