@@ -19,8 +19,9 @@ named content pins (one root cause), and the companion re-pin is a code change t
 | `MASTER_DIRECTIVE.md.new` (+ `.diff`) | the owner's 2026-10-12 reversal, **authority only** | the S6 MECHANISM does NOT ship in 0.14.51; this text claims no behaviour |
 | `CEO_TEMPLATE.md.new` (+ `.diff`) | derived | generated from the MASTER proposal by `scripts/gen_ceo_template.py` (byte concatenation) |
 
-S5 has no text: nothing landed for it (zero commits carrying `Bundle-Item: S5` on any ref), so a
-directive sentence about its relay would promise a carrier this release lacks.
+S5 has no text: its code landed but its carrier is never called in product code, so a directive sentence about its relay would promise a
+path nothing takes. `select_carrier` is defined at `src/bin/cysd/s5_escalation.rs:173`, called only by that file's own unit tests
+(:483 :487 :492 :493 :495 :497). `Bundle-Item: S5` is on four commits by the consumer's full-message regex, one by the trailer-block parser.
 
 Measurement log for all of this: `~/Desktop/CYSjavis/_evidence/dept5-directive-new-20261012/`
 (WHAT-SHIPS.md, REQUIREMENTS-TRACE.md, REFLECT-1-adversarial.md, REFLECT-2-architect.md, raw/).
