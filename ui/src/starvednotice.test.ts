@@ -949,3 +949,59 @@ describe("새 순수 모듈 starvednotice.ts — 불변식(최상위 부수효�
       expect({ 낱말: bad, 있음: code.includes(bad) }).toEqual({ 낱말: bad, 있음: false });
   });
 });
+
+// ===================================================================================================
+// ★S5 O-3 / m3 — WIRING: ONE INCIDENT = ONE STABLE KEY, AND THE VOCABULARY IS `remedy_code`
+//
+// m3 of the S5 r3 review: the carrier selector and the shared incident identity were under-specified —
+// carrier A's predicate is `!eligible` and carrier B's is `eligible OR hang`, so a CALM-CODE HANG satisfies
+// both, and the fix is ONE ORDERED selector plus ONE stable, persisted incident id with an explicit handoff.
+// The daemon side of that is `s5_escalation::select_carrier` (ordered: B first) and its incident record.
+// THE UI SIDE, pinned here, is the other half of the same identity: the toast's id and episode key must NOT
+// move when the remedy code flips, or a seat whose screen changes mints a new incident per flip — the exact
+// storm the episode key exists to stop. These cases were missing from the wiring section, which is why m3
+// could be filed; they are added rather than replacing the existing branch-execution cases, because those
+// cases pass and cover a different question (that main.ts really calls these helpers).
+// ===================================================================================================
+describe("★S5 m3 — 한 사건은 하나의 안정된 키다(코드가 바뀌어도) · 분류 어휘는 remedy_code 다", () => {
+  const FLIPS = ["human_draft", "machine_residue", "phantom_count", "after_cursor_text", "input_pending_unknown"];
+
+  it("같은 좌석에서 사람 코드가 연달아 바뀌어도 id 는 하나다 — 코드별로 새 사건을 찍지 않는다", () => {
+    const ids = FLIPS.map((c) => starvedNotice(payload({ remedy_code: c, remedy: "처방-" + c }), "abc")!.id);
+    expect(new Set(ids).size).toBe(1);
+    expect(ids[0]).toBe("starved:abc:surface:12");
+  });
+
+  it("구간 키(stateKey)도 코드를 담지 않는다 — 기억한 구간이 코드 플랩마다 갈리지 않는다", () => {
+    const keys = FLIPS.map((c) => starvedNotice(payload({ remedy_code: c, remedy: "처방-" + c }), "abc")!.stateKey);
+    expect(new Set(keys).size).toBe(1);
+    expect(keys[0]).toBe("⏳ 큐 막힘 — worker surface:12\nq-1");
+  });
+
+  it("해제 id = 알림 id — 코드가 바뀐 뒤에 거둬도 같은 토스트를 거둔다(운반자 인계의 UI 쪽 절반)", () => {
+    const n = starvedNotice(payload({ remedy_code: "machine_residue" }), "abc")!;
+    expect(starvedDismissId("abc", surfaceIdOfRef("surface:12"))).toBe(n.id);
+  });
+
+  it("★분류는 code 가 한다 — 막힘 사유가 calm 처럼 보여도 code 가 사람 코드면 사람 손이다", () => {
+    const n = starvedNotice(payload({ blocked_by: "busy(화면 정적)", remedy_code: "answer_modal" }), "abc")!;
+    expect(n.humanNeeded).toBe(true);
+  });
+
+  it("★그 반대도 — 사유가 input_pending 이어도 code 가 wait 면 calm 이다(11 중 8 쌍은 이름이 어긋난다)", () => {
+    const n = starvedNotice(payload({ blocked_by: "input_pending(입력줄 계수 0)", remedy_code: "wait" }), "abc")!;
+    expect(n.humanNeeded).toBe(false);
+  });
+
+  it("★calm 코드 + 멈춘 것처럼 보이는 사유는 UI 에서 사람 알림이 되지 않는다 — 그 판정은 상류(정렬된 선택자)가 code 로 한다", () => {
+    for (const code of STARVED_CALM_CODES) {
+      const n = starvedNotice(payload({ blocked_by: "busy(멈춘 듯 보임)", remedy_code: code, waited_secs: 7200 }), "abc")!;
+      expect({ code, humanNeeded: n.humanNeeded }).toEqual({ code, humanNeeded: false });
+    }
+  });
+
+  it("사람 손 알림은 매번 뜬다(설계) — 억제는 토스트가 아니라 상류의 합침이 한다", () => {
+    const n = starvedNotice(payload({ remedy_code: "human_draft" }), "abc")!;
+    expect(starvedShouldPop(n.stateKey, n, 0)).toBe(true);
+  });
+});

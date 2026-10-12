@@ -549,3 +549,45 @@ describe("0.14.48 D — 등급은 기존 토스트 등급 중 하나", () => {
     expect(read("./main.ts")).toContain("el.className = toastClassName(category);");
   });
 });
+
+// ===================================================================================================
+// ★S5 O-3 / m3 — WIRING, THE SPLIT FILE'S HALF. The pair is rewritten TOGETHER on purpose: landing this on
+// one file and claiming the pair is the failure shape this lane has ruled against. Same facts as the sibling
+// file, asserted through this file's own `mk(code)` builder and its 14-code table, so the two files agree
+// about the incident identity instead of each believing its own version of it.
+// ===================================================================================================
+describe("★S5 m3 — 사건 하나 = 안정된 키 하나(코드 플랩과 무관) · code 가 분류하고 raw 사유는 진단이다", () => {
+  const FLIPS = ["human_draft", "machine_residue", "phantom_count", "after_cursor_text", "input_pending_unknown"];
+
+  it("코드가 바뀌어도 id 는 하나다 — 이 파일의 14종 표 전체에서도 좌석 키는 하나다", () => {
+    const ids = FLIPS.map((c) => SN.starvedNotice(mk(c), "abc")!.id);
+    expect(new Set(ids).size).toBe(1);
+    expect(ids[0]).toBe("starved:abc:surface:12");
+    // 그리고 14종 전체: 사람 코드든 calm 이든 같은 좌석이면 같은 id 다(없는 알림은 제외)
+    const all = SN.STARVED_HUMAN_CODES.concat(SN.STARVED_CALM_CODES)
+      .map((c) => SN.starvedNotice(mk(c), "abc"))
+      .filter((n): n is NonNullable<typeof n> => n !== null)
+      .map((n) => n.id);
+    expect(new Set(all).size).toBe(1);
+  });
+
+  it("★code 가 사람/calm 을 가른다 — 이 파일의 mk() 는 사유를 'gate:<code>' 로 만들지만 판정은 code 가 한다", () => {
+    const human = SN.starvedNotice(mk("answer_modal", { blocked_by: "busy(화면 정적)" }), "abc")!;
+    const calm = SN.starvedNotice(mk("wait", { blocked_by: "input_pending(계수 0)" }), "abc")!;
+    expect({ human: human.humanNeeded, calm: calm.humanNeeded }).toEqual({ human: true, calm: false });
+  });
+
+  it("★calm 3종은 오래 기다려도 사람 알림이 되지 않는다 — 멈춤 판정은 상류의 정렬된 선택자가 code 로 한다", () => {
+    for (const c of SN.STARVED_CALM_CODES) {
+      const n = SN.starvedNotice(mk(c, { waited_secs: 7200, blocked_by: "busy(멈춘 듯)" }), "abc")!;
+      expect({ c, human: n.humanNeeded }).toEqual({ c, human: false });
+    }
+  });
+
+  it("사람 코드 11종은 전부 사람 손이다 — 상류의 ELIGIBLE 집합과 같은 11종이어야 한다", () => {
+    expect(SN.STARVED_HUMAN_CODES.length).toBe(11);
+    for (const c of SN.STARVED_HUMAN_CODES) {
+      expect({ c, human: SN.starvedNotice(mk(c), "abc")!.humanNeeded }).toEqual({ c, human: true });
+    }
+  });
+});
