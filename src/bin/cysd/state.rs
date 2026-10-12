@@ -3768,6 +3768,14 @@ pub struct Daemon {
     /// 대용량 body가 분할 write되면 다른 동시 appender의 라인이 끼어들어 JSONL이
     /// 손상되고 복원(replay)에서 pending 항목이 무음 유실될 수 있다.
     pub feed_persist_lock: Mutex<()>,
+    /// ★S7/F-2 (codex R1 · 티켓 T-S7-R1-FIXES §2·§6-3): **원격 allow 일일 상한의 계수가 믿을 수
+    /// 없게 된 날**(`YYYY-MM-DD`, 그 날의 로컬 날짜). 비어 있으면 계수는 정상이다.
+    ///
+    /// 왜 메모리에 두는가: 이 사실을 적을 곳은 **방금 쓰기가 실패한 바로 그 DB** 뿐이다. 그래서
+    /// 같은 곳에 적으려 하면 같은 이유로 또 실패한다. 상한은 폭발반경 제한이고 데몬 수명 동안만
+    /// 강제하면 되므로, 데몬 메모리가 올바른 자리다(재기동하면 계수는 DB 에서 다시 읽히고,
+    /// 그 읽기가 성공하면 상한은 저절로 다시 믿을 수 있게 된다).
+    pub remote_cap_counter_broken_day: Mutex<Option<String>>,
     /// 큐 WAL(P7): 미배달 `--queued` 메시지의 데몬 재기동 생존분(queue-state.json replay).
     /// 라이브 큐는 surface.pending_queue(휘발)이고, 이건 재시작을 넘긴 스냅샷이다 —
     /// queue.list가 라이브 큐와 함께 노출한다. id 우선(레거시는 mid)으로 이중 replay를 dedup한다.
@@ -5722,6 +5730,7 @@ impl Daemon {
             feed_waiters: Mutex::new(HashMap::new()),
             operator_token,
             feed_persist_lock: Mutex::new(()),
+            remote_cap_counter_broken_day: Mutex::new(None),
             restored_queue: Mutex::new(restored_qentries),
             restored_expired: Mutex::new(restored_expired),
             queue_seq: AtomicU64::new(queue_seq_seed),

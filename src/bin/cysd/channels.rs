@@ -1304,27 +1304,40 @@ fn attempt_cooldown_until(conn: &Connection, channel: &str, sender_id: &str) -> 
     .unwrap_or(0.0)
 }
 
-/// V7: 로컬 날짜 day의 성공 원격 allow 건수(없으면 0). 상한 대조에 쓴다.
-fn daily_allow_count(conn: &Connection, day: &str) -> u64 {
-    conn.query_row(
-        "SELECT allow_count FROM remote_approve_daily WHERE day=?1",
-        params![day],
-        |r| r.get::<_, i64>(0),
-    )
-    .optional()
-    .ok()
-    .flatten()
-    .unwrap_or(0)
-    .max(0) as u64
+/// V7: 로컬 날짜 day의 성공 원격 allow 건수. 상한 대조에 쓴다.
+///
+/// ★S7/F-2 (codex R1): **행 없음과 질의 실패를 가른다.** 종전에는 `.ok().flatten().unwrap_or(0)`
+/// 로 둘을 한 칸에 뭉쳐서, 질의가 실패하면 "오늘 0 건" 이 되어 **상한이 활짝 열렸다** — 쓰기 쪽
+/// (`bump_daily_allow`)이 `let _ =` 로 실패를 버린 것과 **같은 결함이 읽기 쪽에 있던 것**이다.
+/// 한쪽만 고치면 그 규칙은 자기 범위의 절반에만 내려앉는다.
+/// · `Ok(0)` = 행이 없다(정당한 0 건) · `Err` = **모른다**(0 이 아니다 — 호출자가 판단한다).
+fn daily_allow_count(conn: &Connection, day: &str) -> Result<u64, rusqlite::Error> {
+    match conn
+        .query_row(
+            "SELECT allow_count FROM remote_approve_daily WHERE day=?1",
+            params![day],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+    {
+        Ok(Some(n)) => Ok(n.max(0) as u64),
+        Ok(None) => Ok(0),
+        Err(e) => Err(e),
+    }
 }
 
 /// V7: 로컬 날짜 day의 성공 원격 allow 건수 +1(성공 allow 해소 직후 호출).
-fn bump_daily_allow(conn: &Connection, day: &str, now: f64) {
-    let _ = conn.execute(
+///
+/// ★S7/F-2 (codex R1 · 티켓 §2): 종전에는 `let _ =` 로 **쓰기 실패를 버렸다.** 그 한 줄이
+/// 하는 일은 작지 않다 — 계수가 늘지 않으면 다음 요청이 **더 낮은 수**를 보고 통과하므로
+/// **상한이 조용히 올라간다**(측정 실패가 사실이 되는 꼴). 이제 오류를 **돌려준다**;
+/// 무엇을 할지는 호출자가 정하고, 그 선택은 호출 지점에 적혀 있다.
+fn bump_daily_allow(conn: &Connection, day: &str, now: f64) -> Result<usize, rusqlite::Error> {
+    conn.execute(
         "INSERT INTO remote_approve_daily(day, allow_count, updated_ts) VALUES(?1,1,?2)
          ON CONFLICT(day) DO UPDATE SET allow_count=allow_count+1, updated_ts=?2",
         params![day, now],
-    );
+    )
 }
 
 // ── 승인 버튼 interaction 검증(§2.4-4) — nonce 3중 + 게이트 + allow-once ─────────
@@ -1431,8 +1444,35 @@ fn verify_interaction(daemon: &Arc<Daemon>, conn: &Connection, channel: &str, pa
     }
     // ★V7 일일 원격 allow 상한 — nonce 소각 前 검사(초과 시 소각·해소 없이 pending 유지=로컬 강등).
     // allow만 계수·검사(deny 해소는 안전측이라 상한 비적용). soft_deny(정당 owner·비계수).
-    if decision == "allow" && cap_reached(daily_allow_count(conn, &local_date(now_ts)), REMOTE_APPROVE_DAILY_CAP) {
-        return soft_deny("daily_cap");
+    //
+    // ★★S7/F-2 (codex R1 · 티켓 §2·§6-3) — **계수를 믿을 수 없으면 통과시키지 않는다.**
+    // 상한은 폭발반경 제한이고, 그 강제는 **계수가 참이라는 전제** 위에 서 있다. 전제가 깨졌는데
+    // 통과시키면 그것은 "측정 실패가 사실이 되는" 모양이다 — 오늘 우리가 여러 번 판정한 그 꼴.
+    // 두 갈래 모두 **fail closed**:
+    // · 읽기 실패(`Err`) = 오늘 몇 건인지 **모른다** ⇒ 통과시키지 않는다.
+    // · 이 데몬에서 **쓰기가 실패한 날**이면 저장된 수는 실제보다 **작다** ⇒ 통과시키지 않는다.
+    // ★정상 배달을 세우지 않는다: 이 거부는 `soft_deny`(비계수)이고 **nonce 소각 전**이라
+    //   feed 항목은 pending 그대로다 ⇒ 주인님은 **그 자리에서 로컬로 결재**할 수 있다. 상한
+    //   초과 때와 **똑같은 강등 경로**이지 새로 생기는 막다른 길이 아니다.
+    if decision == "allow" {
+        let today = local_date(now_ts);
+        let counter_broken = daemon
+            .remote_cap_counter_broken_day
+            .lock()
+            .unwrap()
+            .as_deref()
+            == Some(today.as_str());
+        if counter_broken {
+            return soft_deny("cap_counter_unavailable");
+        }
+        match daily_allow_count(conn, &today) {
+            Ok(n) if cap_reached(n, REMOTE_APPROVE_DAILY_CAP) => return soft_deny("daily_cap"),
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("cysd: 원격 결재 일일 상한 계수 읽기 실패 — 통과시키지 않는다(로컬 결재는 그대로): {e}");
+                return soft_deny("cap_counter_unavailable");
+            }
+        }
     }
     // ⑤ ★S7 (0.14.51 · O-S7-2 · 설계 §2.1 row 6 = **MOVE**): **해소를 먼저 하고 nonce 를 그 뒤에
     //   태운다.** 종전 순서(소각 → 해소)에서는, 소각과 해소 사이에 항목이 사라지면 주인님의 1회용
@@ -1495,8 +1535,26 @@ fn verify_interaction(daemon: &Arc<Daemon>, conn: &Connection, channel: &str, pa
             // ★상한 계수는 **적용된 allow 마다**다(내구성과 무관). 되돌림이 없는 이 판에서
             //   `uncertain` 은 드문 경우가 아니라 **흔한 경우**이므로, 거기서 계수를 건너뛰면
             //   일일 상한이 조용히 누출된다(상한은 폭발반경 제한이라 그 누출이 곧 결함이다).
+            // ★S7/F-2: 쓰기 실패를 **기억한다**. 이 계수를 적을 곳은 방금 실패한 그 DB 뿐이라
+            //   같은 곳에 다시 적으려 하면 같은 이유로 또 실패한다 ⇒ 데몬 메모리에 날짜를 남겨
+            //   **그 날의 남은 원격 allow 를 fail closed** 로 만든다(위 게이트). 성공하면 지운다.
+            //   ★이미 일어난 해소를 되돌리지는 않는다 — 되돌림은 이 판에 없고, 거짓 거부가 된다.
+            let mut cap_note: Option<String> = None;
             if decision == "allow" {
-                bump_daily_allow(conn, &local_date(now_ts), now_ts);
+                let today = local_date(now_ts);
+                match bump_daily_allow(conn, &today, now_ts) {
+                    Ok(_) => {
+                        *daemon.remote_cap_counter_broken_day.lock().unwrap() = None;
+                    }
+                    Err(e) => {
+                        *daemon.remote_cap_counter_broken_day.lock().unwrap() = Some(today);
+                        eprintln!(
+                            "cysd: 원격 결재 {feed_id} — 해소는 적용됨 · 일일 상한 계수 기록 실패: {e} \
+                             ⇒ 오늘의 남은 원격 allow 는 거부된다(상한이 조용히 올라가지 않게 · 로컬 결재는 그대로)"
+                        );
+                        cap_note = Some(format!("cap_counter_write_failed: {e}"));
+                    }
+                }
             }
             daemon.bus.publish(
                 "channel.approval.resolved",
@@ -1504,12 +1562,13 @@ fn verify_interaction(daemon: &Arc<Daemon>, conn: &Connection, channel: &str, pa
                 None,
                 json!({"channel": channel, "feed_id": feed_id, "sender_id": sender_id, "decision": decision,
                        // ★S7 additive: 기록의 내구성과 자격 소각의 사실을 구독자가 볼 수 있게.
-                       "durability": outcome.durability(), "nonce_note": nonce_note}),
+                       // ★F-2 additive: 상한 계수가 이 해소에서 기록되지 못했다는 사실도(조용히 두지 않는다).
+                       "durability": outcome.durability(), "nonce_note": nonce_note, "cap_note": cap_note}),
             );
             ok_response(
                 id,
                 json!({"action": "approval_resolved", "feed_id": feed_id, "decision": decision,
-                       "durability": outcome.durability(), "nonce_note": nonce_note}),
+                       "durability": outcome.durability(), "nonce_note": nonce_note, "cap_note": cap_note}),
             )
         }
     }
@@ -3992,7 +4051,7 @@ mod tests {
     fn read_daily(d: &Arc<Daemon>) -> u64 {
         let g = d.channels.lock().unwrap();
         let conn = g.as_ref().unwrap();
-        daily_allow_count(conn, &local_date(now()))
+        daily_allow_count(conn, &local_date(now())).expect("계수 읽기")
     }
 
     fn nonce_used_flag(d: &Arc<Daemon>, channel: &str, nonce: &str) -> i64 {
@@ -4108,6 +4167,114 @@ mod tests {
         assert_eq!(r["result"]["action"], json!("approval_resolved"), "deny는 상한과 무관 해소: {r}");
         assert_eq!(r["result"]["decision"], json!("deny"));
         assert_eq!(read_daily(&d), REMOTE_APPROVE_DAILY_CAP, "deny 해소는 allow 카운터 불변");
+    }
+
+
+    // ── ★S7/F-2: 계수가 실패했을 때도 상한이 묶이는가 (codex R1 · 티켓 §2·§6-3) ──
+
+    /// 상한 **경계 20 → 21** 에서 **카운터 쓰기를 강제 실패**시킨다(새 오류 경로를 읽는 것은 증명이
+    /// 아니라는 부서장 요구 그대로).
+    ///
+    /// 종전 거동: 20 번째 allow 가 해소되고 `bump_daily_allow` 가 `let _ =` 로 실패를 버리면 계수는
+    /// 19 에 머문다 ⇒ **21 번째가 통과**한다. 상한 20 이 조용히 21 이상이 된다.
+    /// 이 검체가 박는 것: 쓰기가 실패하면 **그 날의 남은 원격 allow 는 통과하지 못한다**, 그리고
+    /// 그 거부는 **로컬 강등**이지 막다른 길이 아니다(nonce 미소각 · feed pending 유지).
+    #[test]
+    fn s7_f2_cap_still_binds_when_the_counter_write_fails() {
+        let d = tmp_daemon("s7_f2_write");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        push_pending_feed(&d, "feed1");
+        mirror_approval(&d, "feed1", "t", "b", Some("c"));
+        let nonce1 = mirror_nonce(&d, "slack", "feed1", "U1").unwrap();
+        push_pending_feed(&d, "feed2");
+        mirror_approval(&d, "feed2", "t", "b", Some("c"));
+        let nonce2 = mirror_nonce(&d, "slack", "feed2", "U1").unwrap();
+
+        // 19 건 — 20 번째는 통과해야 하는 자리.
+        seed_daily_allow(&d, (REMOTE_APPROVE_DAILY_CAP - 1) as i64);
+        // ★강제 실패: 이 표에 대한 쓰기를 ABORT 시킨다(INSERT·UPDATE 양쪽 — upsert 라 둘 다 탄다).
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER s7f2_block_ins BEFORE INSERT ON remote_approve_daily \
+                 BEGIN SELECT RAISE(ABORT,'s7-f2 forced write failure'); END; \
+                 CREATE TRIGGER s7f2_block_upd BEFORE UPDATE ON remote_approve_daily \
+                 BEGIN SELECT RAISE(ABORT,'s7-f2 forced write failure'); END;",
+            )
+            .expect("트리거 설치");
+        }
+
+        // ① 20 번째 — 해소는 일어난다(이미 적용된 결정을 되돌리지 않는다).
+        let r20 = call(&d, "inbound", interaction_params("slack", "U1", "feed1", &nonce1, "allow"), own_pid());
+        assert_eq!(r20["result"]["action"], json!("approval_resolved"), "{r20}");
+        // ★그리고 실패가 **보인다**(조용하지 않다).
+        assert!(
+            r20["result"]["cap_note"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("cap_counter_write_failed"),
+            "상한 계수 실패가 응답에 실리지 않았다: {r20}"
+        );
+        assert_eq!(read_daily(&d), REMOTE_APPROVE_DAILY_CAP - 1, "계수는 늘지 못했다(강제 실패)");
+
+        // ② 21 번째 — 저장된 수는 아직 19 다. 종전이라면 통과했을 자리.
+        let r21 = call(&d, "inbound", interaction_params("slack", "U1", "feed2", &nonce2, "allow"), own_pid());
+        assert_eq!(r21["result"]["action"], json!("interaction_denied"), "상한이 묶이지 않았다: {r21}");
+        assert_eq!(r21["result"]["reason"], json!("cap_counter_unavailable"), "{r21}");
+        // ③ ★막다른 길이 아니다 — 로컬로 결재할 수 있는 상태 그대로다.
+        assert_eq!(nonce_used_flag(&d, "slack", &nonce2), 0, "거부는 nonce 미소각이어야 한다");
+        assert_eq!(feed_status(&d, "feed2").as_deref(), Some("pending"), "feed 는 pending 으로 남아야 한다");
+        // ④ ★그리고 **정당한 보낸이를 벌주지 않는다** — 이 거부는 brute 가 아니라 우리 쪽 계수 고장이다.
+        //    soft_deny(비계수)여야 하므로 연속실패·쿨다운이 서지 않아야 한다. 이 줄이 없으면
+        //    "로컬 강등이지 막다른 길이 아니다"라는 내 주장이 **검체 없는 주장**으로 남는다.
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            // ★쿨다운이 아니라 **연속실패 카운터**를 본다: 한 번의 fail_deny 는 임계에 못 미쳐
+            //   쿨다운을 세우지 않으므로, 쿨다운만 보는 단정은 fail_deny 변이를 **놓친다**
+            //   (변이 MP-F2-D 가 살아남아 그것을 측정했다 — 그래서 이 줄로 바꿨다).
+            let fails: i64 = conn
+                .query_row(
+                    "SELECT consecutive_fails FROM approval_attempts WHERE channel=?1 AND sender_id=?2",
+                    params!["slack", "U1"],
+                    |r| r.get(0),
+                )
+                .optional()
+                .expect("질의")
+                .unwrap_or(0);
+            assert_eq!(
+                fails, 0,
+                "계수 고장에 의한 거부가 보낸이의 연속실패로 계수됐다(soft 가 아니라 fail 로 센 것)"
+            );
+            assert_eq!(attempt_cooldown_until(conn, "slack", "U1"), 0.0, "쿨다운도 서지 않아야 한다");
+        }
+    }
+
+    /// ★같은 결함의 **읽기 쪽**: 질의가 실패하면 종전에는 `.unwrap_or(0)` 로 "오늘 0 건" 이 되어
+    /// 상한이 활짝 열렸다. 강제 실패는 표를 **없애서** 만든다(SELECT 가 실제로 오류를 낸다).
+    #[test]
+    fn s7_f2_cap_does_not_open_when_the_counter_read_fails() {
+        let d = tmp_daemon("s7_f2_read");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        push_pending_feed(&d, "feed1");
+        mirror_approval(&d, "feed1", "t", "b", Some("c"));
+        let nonce = mirror_nonce(&d, "slack", "feed1", "U1").unwrap();
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            conn.execute_batch("DROP TABLE remote_approve_daily;")
+                .expect("표 제거");
+        }
+        let r = call(&d, "inbound", interaction_params("slack", "U1", "feed1", &nonce, "allow"), own_pid());
+        assert_eq!(r["result"]["action"], json!("interaction_denied"), "읽기 실패가 상한을 열었다: {r}");
+        assert_eq!(r["result"]["reason"], json!("cap_counter_unavailable"), "{r}");
+        assert_eq!(nonce_used_flag(&d, "slack", &nonce), 0, "거부는 nonce 미소각");
+        assert_eq!(feed_status(&d, "feed1").as_deref(), Some("pending"), "feed pending 유지");
     }
 
     // ── V4: 연속 실패 sender 쿨다운 ──
