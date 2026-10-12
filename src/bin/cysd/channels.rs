@@ -1326,45 +1326,18 @@ fn daily_allow_count(conn: &Connection, day: &str) -> Result<u64, rusqlite::Erro
     }
 }
 
-/// V7: 로컬 날짜 day 의 원격 allow 자리를 **원자적으로 예약**한다 — 상한 검사와 증가가 한 문장이다.
+/// V7: 로컬 날짜 day의 성공 원격 allow 건수 +1(성공 allow 해소 직후 호출).
 ///
-/// 반환: `Ok(true)` = 예약됐다(이 요청은 상한 안) · `Ok(false)` = 상한 도달(증가하지 않았다) ·
-/// `Err(e)` = 저장 실패(오늘 몇 건인지 **모른다**).
-///
-/// ★S7/F-2 (codex R1 · 티켓 §2): 종전에는 `let _ =` 로 **쓰기 실패를 버렸다.** 계수가 늘지 않으면
-/// 다음 요청이 **더 낮은 수**를 보고 통과하므로 **상한이 조용히 올라간다**(측정 실패가 사실이 되는 꼴).
-///
-/// ★★R3-B (codex R2 major · 부서장 티켓 T-S7-R3-FIXES §1 R3-B) — **왜 "해소 뒤 증가"가 아니라
-/// "예약 뒤 해소"로 바뀌었는가.** F-2 의 수리는 쓰기 실패를 **데몬 메모리의 래치**로 기억해 그 날의
-/// 남은 allow 를 막는 것이었다. 그런데 그 래치는 **프로세스와 함께 죽는다**: 저장된 수는 실제보다
-/// 1 작은 채로 남고, 재기동하면 래치가 비어 **21 번째가 통과한다** — 상한이 **재시작 때문에
-/// 올라간다**(그리고 성공한 재읽기는 잃어버린 증가를 **복원하지 못한다**).
-/// ⇒ 이 판의 선택: **적용 전에 자리를 잡는다.** 계수가 커밋되지 않으면 해소를 **하지 않는다**
-/// (`soft_deny` · nonce 미소각 · feed pending 유지 = 주인님의 로컬 결재는 그대로) ⇒ 저장된 계수는
-/// **적용된 allow 보다 작아질 수 없고**, 래치도 재기동 고려도 필요 없어진다.
-/// ★어긋나는 방향은 **과다 계수** 하나뿐이다(예약 뒤 경합으로 해소가 일어나지 않은 경우) — 그것은
-/// 상한을 **보수적으로** 만들 뿐이다. 둘 중 틀려도 되는 방향은 이쪽이다.
-/// ★`WHERE allow_count < ?3` 에 대해 **과장하지 않고 적는다**(변이 MP-R3B-2 가 살아남아 그것을
-/// 측정했다): 한 데몬 안에서는 `channel.*` RPC 전 구간이 `daemon.channels` 뮤텍스를 쥐고 돌기
-/// 때문에 **검사와 증가의 경합은 이미 그 락이 닫고 있다** — 이 WHERE 가 그 경합을 닫는 것이 아니다.
-/// 이 절이 실제로 더하는 것은 **같은 DB 에 다른 writer 가 붙는 경우**의 원자성이고(codex R2 MJR-1 이
-/// 같은 디렉터리의 두 데몬을 구성 가능하다고 보고했다), 그 경우는 **이 리그에서 측정하지 않았다**.
-/// 비용이 0 이라 남겨 두지만, 근거는 측정이 아니라 **논증**이다.
-/// ★그리고 변이로 확인했다: `WHERE` 절을 지워도(MP-R3B-2) 이 레인의 검체는 5/5 **초록**이다 —
-/// 그 절을 지키는 검체가 없다는 뜻이고, 그것이 위 문단이 "논증"이라고 적은 이유다.
-fn reserve_daily_allow(
-    conn: &Connection,
-    day: &str,
-    now: f64,
-    cap: u64,
-) -> Result<bool, rusqlite::Error> {
-    let changed = conn.execute(
+/// ★S7/F-2 (codex R1 · 티켓 §2): 종전에는 `let _ =` 로 **쓰기 실패를 버렸다.** 그 한 줄이
+/// 하는 일은 작지 않다 — 계수가 늘지 않으면 다음 요청이 **더 낮은 수**를 보고 통과하므로
+/// **상한이 조용히 올라간다**(측정 실패가 사실이 되는 꼴). 이제 오류를 **돌려준다**;
+/// 무엇을 할지는 호출자가 정하고, 그 선택은 호출 지점에 적혀 있다.
+fn bump_daily_allow(conn: &Connection, day: &str, now: f64) -> Result<usize, rusqlite::Error> {
+    conn.execute(
         "INSERT INTO remote_approve_daily(day, allow_count, updated_ts) VALUES(?1,1,?2)
-         ON CONFLICT(day) DO UPDATE SET allow_count=allow_count+1, updated_ts=?2
-         WHERE allow_count < ?3",
-        params![day, now, cap as i64],
-    )?;
-    Ok(changed > 0)
+         ON CONFLICT(day) DO UPDATE SET allow_count=allow_count+1, updated_ts=?2",
+        params![day, now],
+    )
 }
 
 // ── 승인 버튼 interaction 검증(§2.4-4) — nonce 3중 + 게이트 + allow-once ─────────
@@ -1474,44 +1447,29 @@ fn verify_interaction(daemon: &Arc<Daemon>, conn: &Connection, channel: &str, pa
     //
     // ★★S7/F-2 (codex R1 · 티켓 §2·§6-3) — **계수를 믿을 수 없으면 통과시키지 않는다.**
     // 상한은 폭발반경 제한이고, 그 강제는 **계수가 참이라는 전제** 위에 서 있다. 전제가 깨졌는데
-    // 통과시키면 그것은 "측정 실패가 사실이 되는" 모양이다.
-    // ★정상 배달을 세우지 않는다: 아래 거부는 전부 `soft_deny`(비계수)이고 **nonce 소각 전**이라
+    // 통과시키면 그것은 "측정 실패가 사실이 되는" 모양이다 — 오늘 우리가 여러 번 판정한 그 꼴.
+    // 두 갈래 모두 **fail closed**:
+    // · 읽기 실패(`Err`) = 오늘 몇 건인지 **모른다** ⇒ 통과시키지 않는다.
+    // · 이 데몬에서 **쓰기가 실패한 날**이면 저장된 수는 실제보다 **작다** ⇒ 통과시키지 않는다.
+    // ★정상 배달을 세우지 않는다: 이 거부는 `soft_deny`(비계수)이고 **nonce 소각 전**이라
     //   feed 항목은 pending 그대로다 ⇒ 주인님은 **그 자리에서 로컬로 결재**할 수 있다. 상한
     //   초과 때와 **똑같은 강등 경로**이지 새로 생기는 막다른 길이 아니다.
-    // ★★R3-B (codex R2 major · 티켓 §1 R3-B): **메모리 래치가 사라졌다.** 래치는 재기동과 함께
-    //   죽어 적자를 잊었다(저장된 수는 1 작은데 새 프로세스는 그것을 전부라고 믿는다) ⇒ 상한이
-    //   재시작 때문에 올라갔다. 이제 **적용 전에 자리를 예약**하므로 기억할 적자 자체가 생기지
-    //   않는다 — 계수가 커밋되지 않으면 해소가 일어나지 않는다([`reserve_daily_allow`]).
     if decision == "allow" {
         let today = local_date(now_ts);
-        // ① 먼저 읽어 상한 초과를 거부한다.
-        // ★**① 과 ②-의-상한도달-갈래는 서로 중복이다 — 변이로 둘 다 재 봤다**(측정이지 독해가 아니다):
-        //   · MP-R3B-4(① 을 통째로 지움) → 검체 5/5 **초록**(② 의 `Ok(false)` 가 같은 이름으로 거부한다)
-        //   · MP-R3B-5(② 의 `Ok(false)` 갈래를 통과시킴) → 검체 5/5 **초록**(① 이 먼저 잡는다)
-        //   ⇒ 둘 중 **어느 하나도 단독으로는 필요하지 않고**, 둘이 함께 심층 방어가 된다.
-        //   ★진짜로 필요한 것은 ② 의 **쓰기 자체**(MP-R3B-1 → 3 검체 빨강)와 그 **`Err` 갈래**
-        //   (MP-R3B-3 → 2 검체 빨강)다. 그래서 상한 강제의 **정본은 ②** 이고 ① 은 중복 방어다.
-        // ★그 중복을 **일부러 남긴다**: 상한 강제가 전부 upsert 의 `WHERE` 한 줄에 걸리면, 그 한 줄이
-        //   어떤 플랫폼에서 기대와 다르게 동작할 때 상한이 통째로 풀린다(윈도우는 이 레인에서 늘
-        //   다르게 구는 자리이고, 이 판에서 윈도우 실행은 **측정하지 않았다**).
+        let counter_broken = daemon
+            .remote_cap_counter_broken_day
+            .lock()
+            .unwrap()
+            .as_deref()
+            == Some(today.as_str());
+        if counter_broken {
+            return soft_deny("cap_counter_unavailable");
+        }
         match daily_allow_count(conn, &today) {
             Ok(n) if cap_reached(n, REMOTE_APPROVE_DAILY_CAP) => return soft_deny("daily_cap"),
             Ok(_) => {}
             Err(e) => {
                 eprintln!("cysd: 원격 결재 일일 상한 계수 읽기 실패 — 통과시키지 않는다(로컬 결재는 그대로): {e}");
-                return soft_deny("cap_counter_unavailable");
-            }
-        }
-        // ② ★그리고 **적용 전에** 자리를 잡는다 — 커밋되지 않으면 해소하지 않는다(write-ahead).
-        match reserve_daily_allow(conn, &today, now_ts, REMOTE_APPROVE_DAILY_CAP) {
-            Ok(true) => {}
-            // 동시 요청이 마지막 자리를 가져갔다 — ① 과 같은 사실이므로 같은 이름으로 거부한다.
-            Ok(false) => return soft_deny("daily_cap"),
-            Err(e) => {
-                eprintln!(
-                    "cysd: 원격 결재 일일 상한 예약 실패 — 해소하지 않는다(상한이 조용히 올라가지 \
-                     않게 · 로컬 결재는 그대로): {e}"
-                );
                 return soft_deny("cap_counter_unavailable");
             }
         }
@@ -1581,23 +1539,43 @@ fn verify_interaction(daemon: &Arc<Daemon>, conn: &Connection, channel: &str, pa
             }
             // 성공 = brute 의심 해제 → V4 카운터 리셋.
             reset_attempt(conn, channel, &sender_id, now_ts);
-            // ★★R3-B: **여기 있던 상한 계수 블록은 사라졌다.** 계수는 해소 **전에** 예약으로
-            //   커밋됐다(위 게이트 ②) ⇒ "적용됐는데 계수되지 않은 allow" 라는 상태가 생기지
-            //   않으므로 기억할 적자도, 응답에 실을 `cap_note` 도 없다. 그 키는 오늘 F-2 가
-            //   더한 것이고 아직 배포되지 않았으므로 **지운다**(구조적으로 늘 null 인 칸을
-            //   남기면 그것은 아무것도 하지 않는 장치다).
+            // ★상한 계수는 **적용된 allow 마다**다(내구성과 무관). 되돌림이 없는 이 판에서
+            //   `uncertain` 은 드문 경우가 아니라 **흔한 경우**이므로, 거기서 계수를 건너뛰면
+            //   일일 상한이 조용히 누출된다(상한은 폭발반경 제한이라 그 누출이 곧 결함이다).
+            // ★S7/F-2: 쓰기 실패를 **기억한다**. 이 계수를 적을 곳은 방금 실패한 그 DB 뿐이라
+            //   같은 곳에 다시 적으려 하면 같은 이유로 또 실패한다 ⇒ 데몬 메모리에 날짜를 남겨
+            //   **그 날의 남은 원격 allow 를 fail closed** 로 만든다(위 게이트). 성공하면 지운다.
+            //   ★이미 일어난 해소를 되돌리지는 않는다 — 되돌림은 이 판에 없고, 거짓 거부가 된다.
+            let mut cap_note: Option<String> = None;
+            if decision == "allow" {
+                let today = local_date(now_ts);
+                match bump_daily_allow(conn, &today, now_ts) {
+                    Ok(_) => {
+                        *daemon.remote_cap_counter_broken_day.lock().unwrap() = None;
+                    }
+                    Err(e) => {
+                        *daemon.remote_cap_counter_broken_day.lock().unwrap() = Some(today);
+                        eprintln!(
+                            "cysd: 원격 결재 {feed_id} — 해소는 적용됨 · 일일 상한 계수 기록 실패: {e} \
+                             ⇒ 오늘의 남은 원격 allow 는 거부된다(상한이 조용히 올라가지 않게 · 로컬 결재는 그대로)"
+                        );
+                        cap_note = Some(format!("cap_counter_write_failed: {e}"));
+                    }
+                }
+            }
             daemon.bus.publish(
                 "channel.approval.resolved",
                 "channel",
                 None,
                 json!({"channel": channel, "feed_id": feed_id, "sender_id": sender_id, "decision": decision,
                        // ★S7 additive: 기록의 내구성과 자격 소각의 사실을 구독자가 볼 수 있게.
-                       "durability": outcome.durability(), "nonce_note": nonce_note}),
+                       // ★F-2 additive: 상한 계수가 이 해소에서 기록되지 못했다는 사실도(조용히 두지 않는다).
+                       "durability": outcome.durability(), "nonce_note": nonce_note, "cap_note": cap_note}),
             );
             ok_response(
                 id,
                 json!({"action": "approval_resolved", "feed_id": feed_id, "decision": decision,
-                       "durability": outcome.durability(), "nonce_note": nonce_note}),
+                       "durability": outcome.durability(), "nonce_note": nonce_note, "cap_note": cap_note}),
             )
         }
     }
@@ -2720,32 +2698,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Daemon::new(dir.join("cysd.sock"))
-    }
-
-    /// ★R3-B: **같은 상태 폴더**로 데몬을 다시 연다(= 재기동). `tmp_daemon` 은 폴더를 지우므로
-    /// 재기동 검체에는 쓸 수 없다 — channels.db·feed.jsonl 이 그대로 있어야 "재시작을 건넜다"가
-    /// 측정된다.
-    fn restart_daemon(tag: &str) -> Arc<Daemon> {
-        crate::delivery::tests::isolate_state_dir_for_thread(tag);
-        let dir = std::env::temp_dir().join(format!("cys_chan_test_{}_{}", std::process::id(), tag));
-        Daemon::new(dir.join("cysd.sock"))
-    }
-
-    /// pending feed 를 **디스크에도** 남긴다 — 재기동 뒤에도 해소 대상이 살아 있어야 한다.
-    fn push_pending_feed_durable(d: &Arc<Daemon>, request_id: &str) {
-        push_pending_feed(d, request_id);
-        let snap = d
-            .feed_items
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|i| i.request_id == request_id)
-            .cloned()
-            .expect("방금 넣은 항목");
-        assert!(
-            d.persist_feed_item(&snap).is_committed(),
-            "전제: 재시작을 건너려면 그 항목이 디스크에 있어야 한다"
-        );
     }
 
     fn call(daemon: &Arc<Daemon>, sub: &str, params: Value, caller_pid: Option<u32>) -> Value {
@@ -4230,14 +4182,10 @@ mod tests {
     /// 상한 **경계 20 → 21** 에서 **카운터 쓰기를 강제 실패**시킨다(새 오류 경로를 읽는 것은 증명이
     /// 아니라는 부서장 요구 그대로).
     ///
-    /// 종전 거동(F-2 이전): 20 번째 allow 가 해소되고 `bump_daily_allow` 가 `let _ =` 로 실패를
-    /// 버리면 계수는 19 에 머문다 ⇒ **21 번째가 통과**한다. 상한 20 이 조용히 21 이상이 된다.
-    ///
-    /// ★★R3-B 로 거동이 한 번 더 바뀌었다(codex R2 major): F-2 는 쓰기 실패를 **메모리 래치**로
-    /// 막았는데 그 래치가 재기동과 함께 죽었다 ⇒ 이제 계수를 **적용 전에 예약**한다. 그래서 쓰기가
-    /// 실패하면 **그 allow 는 애초에 적용되지 않는다**(해소 없음·`soft_deny`). 이 검체는 그 새
-    /// 성질을 박는다: 계수가 커밋되지 않으면 **해소도 없다** — 그리고 그 거부는 **로컬 강등**이지
-    /// 막다른 길이 아니다(nonce 미소각 · feed pending 유지 · 보낸이의 연속실패 0).
+    /// 종전 거동: 20 번째 allow 가 해소되고 `bump_daily_allow` 가 `let _ =` 로 실패를 버리면 계수는
+    /// 19 에 머문다 ⇒ **21 번째가 통과**한다. 상한 20 이 조용히 21 이상이 된다.
+    /// 이 검체가 박는 것: 쓰기가 실패하면 **그 날의 남은 원격 allow 는 통과하지 못한다**, 그리고
+    /// 그 거부는 **로컬 강등**이지 막다른 길이 아니다(nonce 미소각 · feed pending 유지).
     #[test]
     fn s7_f2_cap_still_binds_when_the_counter_write_fails() {
         let d = tmp_daemon("s7_f2_write");
@@ -4266,13 +4214,17 @@ mod tests {
             .expect("트리거 설치");
         }
 
-        // ① 20 번째 — ★계수를 커밋할 수 없으므로 **해소하지 않는다**(R3-B: 예약 뒤 해소).
+        // ① 20 번째 — 해소는 일어난다(이미 적용된 결정을 되돌리지 않는다).
         let r20 = call(&d, "inbound", interaction_params("slack", "U1", "feed1", &nonce1, "allow"), own_pid());
-        assert_eq!(r20["result"]["action"], json!("interaction_denied"), "{r20}");
-        assert_eq!(r20["result"]["reason"], json!("cap_counter_unavailable"), "{r20}");
-        // ★적용되지 않았다는 것을 **상태로** 박는다(응답 문자열만 보지 않는다).
-        assert_eq!(feed_status(&d, "feed1").as_deref(), Some("pending"), "해소되지 않아야 한다");
-        assert_eq!(nonce_used_flag(&d, "slack", &nonce1), 0, "자격이 소모되지 않아야 한다");
+        assert_eq!(r20["result"]["action"], json!("approval_resolved"), "{r20}");
+        // ★그리고 실패가 **보인다**(조용하지 않다).
+        assert!(
+            r20["result"]["cap_note"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("cap_counter_write_failed"),
+            "상한 계수 실패가 응답에 실리지 않았다: {r20}"
+        );
         assert_eq!(read_daily(&d), REMOTE_APPROVE_DAILY_CAP - 1, "계수는 늘지 못했다(강제 실패)");
 
         // ② 21 번째 — 저장된 수는 아직 19 다. 종전이라면 통과했을 자리.
@@ -4306,87 +4258,6 @@ mod tests {
             );
             assert_eq!(attempt_cooldown_until(conn, "slack", "U1"), 0.0, "쿨다운도 서지 않아야 한다");
         }
-    }
-
-    /// ★★AT-S7-R3B — **강제되는 상한은 재시작 때문에 올라갈 수 없다**(codex R2 major MJR-2 ·
-    /// 부서장 티켓 §1 R3-B: *경계에서 재시작을 건너서* 증명하라).
-    ///
-    /// 결함(F-2 수리 뒤에도 남아 있던 것): 적자의 기억이 **데몬 메모리**에만 있었다
-    /// (`remote_cap_counter_broken_day`). 그래서 이 각본에서 종전 코드는 **적용된 allow 21 건**이
-    /// 된다 — ⒜19 건 상태에서 20 번째가 **적용되고** 계수 쓰기가 실패(저장 19 유지·래치 켜짐)
-    /// ⒝저장이 회복되고 **같은 날 재기동**하면 래치가 비어 있다 ⒞저장된 19 를 읽은 다음 요청이
-    /// 통과해 **21 번째가 적용**된다.
-    ///
-    /// 이 검체가 박는 성질: **그 날 적용된 원격 allow 의 수가 상한을 넘지 않는다 — 재기동을
-    /// 건너서도.** 19(씨드) + 1(재기동 뒤 1건) = 20 = 상한이고, 그 다음은 `daily_cap` 으로 막힌다.
-    /// ★라벨: 쓰기 고장은 **구성한(constructed)** 것이다(트리거로 ABORT) — OS·디스크 고장을
-    /// 결정론적으로 유발한 것이 아니다. 재기동은 **같은 상태 폴더로 `Daemon::new` 를 다시 부르는
-    /// 것**이며 프로세스를 실제로 죽인 것이 아니다(그 차이도 적어 둔다).
-    #[test]
-    fn s7_r3b_the_enforced_cap_does_not_rise_across_a_restart() {
-        let tag = "s7_r3b_restart";
-        let d = tmp_daemon(tag);
-        seed_registered(&d, "slack", "t");
-        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
-        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
-        for f in ["feedA", "feedB", "feedC"] {
-            push_pending_feed_durable(&d, f);
-            mirror_approval(&d, f, "t", "b", Some("c"));
-        }
-        let na = mirror_nonce(&d, "slack", "feedA", "U1").unwrap();
-        let nb = mirror_nonce(&d, "slack", "feedB", "U1").unwrap();
-        let nc = mirror_nonce(&d, "slack", "feedC", "U1").unwrap();
-        seed_daily_allow(&d, (REMOTE_APPROVE_DAILY_CAP - 1) as i64); // 19 적용됨.
-
-        // ① 계수 쓰기를 강제 실패시킨 채 20 번째 — 적용되지 않는다(R3-B).
-        {
-            let g = d.channels.lock().unwrap();
-            let conn = g.as_ref().unwrap();
-            conn.execute_batch(
-                "CREATE TRIGGER s7r3b_block_ins BEFORE INSERT ON remote_approve_daily \
-                 BEGIN SELECT RAISE(ABORT,'r3b forced write failure'); END; \
-                 CREATE TRIGGER s7r3b_block_upd BEFORE UPDATE ON remote_approve_daily \
-                 BEGIN SELECT RAISE(ABORT,'r3b forced write failure'); END;",
-            )
-            .expect("트리거 설치");
-        }
-        let ra = call(&d, "inbound", interaction_params("slack", "U1", "feedA", &na, "allow"), own_pid());
-        assert_eq!(ra["result"]["action"], json!("interaction_denied"), "{ra}");
-        assert_eq!(feed_status(&d, "feedA").as_deref(), Some("pending"), "적용되지 않아야 한다");
-
-        // ② 저장이 회복된다.
-        {
-            let g = d.channels.lock().unwrap();
-            let conn = g.as_ref().unwrap();
-            conn.execute_batch("DROP TRIGGER s7r3b_block_ins; DROP TRIGGER s7r3b_block_upd;")
-                .expect("트리거 제거");
-        }
-
-        // ③ ★같은 날 **재기동** — 메모리의 어떤 기억도 건너오지 않는다.
-        drop(d);
-        let d2 = restart_daemon(tag);
-        assert_eq!(read_daily(&d2), REMOTE_APPROVE_DAILY_CAP - 1, "전제: 저장된 계수는 19 다");
-        assert_eq!(
-            feed_status(&d2, "feedB").as_deref(),
-            Some("pending"),
-            "전제: 재기동 뒤에도 해소 대상이 살아 있다(영속 feed)"
-        );
-
-        // ④ 재기동 뒤 1건은 통과한다(19 + 1 = 20 = 상한 — 이것은 올바른 통과다).
-        let rb = call(&d2, "inbound", interaction_params("slack", "U1", "feedB", &nb, "allow"), own_pid());
-        assert_eq!(rb["result"]["action"], json!("approval_resolved"), "{rb}");
-        assert_eq!(read_daily(&d2), REMOTE_APPROVE_DAILY_CAP, "계수가 20 이 돼야 한다");
-
-        // ⑤ ★그리고 그 다음은 막힌다 — **적용된 allow 는 20 을 넘지 않는다**(재기동을 건너서).
-        let rc = call(&d2, "inbound", interaction_params("slack", "U1", "feedC", &nc, "allow"), own_pid());
-        assert_eq!(
-            rc["result"]["action"],
-            json!("interaction_denied"),
-            "재시작이 상한을 올렸다(적용된 allow 가 21 건이 된다): {rc}"
-        );
-        assert_eq!(rc["result"]["reason"], json!("daily_cap"), "{rc}");
-        assert_eq!(feed_status(&d2, "feedC").as_deref(), Some("pending"), "로컬 결재는 그대로");
-        assert_eq!(nonce_used_flag(&d2, "slack", &nc), 0, "거부는 nonce 미소각");
     }
 
     /// ★같은 결함의 **읽기 쪽**: 질의가 실패하면 종전에는 `.unwrap_or(0)` 로 "오늘 0 건" 이 되어
