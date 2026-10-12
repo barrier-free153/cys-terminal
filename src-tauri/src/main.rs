@@ -4933,6 +4933,85 @@ async fn feed_list_all(status: Option<String>) -> Result<Value, String> {
     Ok(json!({"sockets": rows}))
 }
 
+// ─── S8 휴지통(번들 S8-UI 의 백엔드 절반) ─────────────────────────────────────────────────────
+//
+// 네 명령 모두 **기지 데몬**만 쓴다 — `socket` 인자를 받지 않는다(휴지통은 기계에 하나이고, 부서
+// 데몬은 `base_daemon_only` 로 거절한다). 읽기 둘은 토큰 없이, 쓰기 둘은 **기지 소켓의**
+// operator token 을 매 호출 새로 읽어 붙인다(`feed_reply` 의 부착 방식 그대로 · 데몬을 다시
+// 띄우면 토큰이 바뀐다). 토큰은 이 백엔드에서만 다루고 화면으로 내보내지 않는다.
+//
+// ★`rpc_full` 을 쓰는 이유: 데몬의 **error.code** 가 화면까지 살아서 올라가야 한다
+// (`not_certifiable`·`producer_active`·`confirm_expired`·`recent_may_be_in_use`·
+// `names_not_in_preview`·`busy`·`unsupported_platform_pending_validation`·`base_daemon_only` 를
+// 화면이 구분해 문구와 단추를 정한다 — message 만 올리면 전부 한 덩어리가 된다).
+fn trash_err(resp: &Value) -> String {
+    let code = resp["error"]["code"].as_str().unwrap_or("unknown");
+    let msg = resp["error"]["message"].as_str().unwrap_or("");
+    format!("{code}: {msg}")
+}
+
+/// 읽기 전용 목록 — 토큰 없음. 감사자가 거부당하지 않는 면이다(설계 4.1).
+#[tauri::command]
+async fn trash_list() -> Result<Value, String> {
+    let sock = default_socket();
+    let resp = rpc_full(&sock, "trash.list", json!({})).await?;
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(resp["result"].clone())
+    } else {
+        Err(trash_err(&resp))
+    }
+}
+
+/// 읽기 전용 명령 상태 — 토큰 없음.
+#[tauri::command]
+async fn trash_order(order_id: String) -> Result<Value, String> {
+    let sock = default_socket();
+    let resp = rpc_full(&sock, "trash.order", json!({"order_id": order_id})).await?;
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(resp["result"].clone())
+    } else {
+        Err(trash_err(&resp))
+    }
+}
+
+/// 미리보기 — 오너 등급. 고른 이름만 받는다(빈 목록은 데몬이 거절한다: '전체선택'이 프로토콜에도 없다).
+#[tauri::command]
+async fn trash_preview(names: Vec<String>) -> Result<Value, String> {
+    let sock = default_socket();
+    let mut params = json!({"names": names, "client": "tauri-app"});
+    if let Some(tok) = read_operator_token_for(&sock) {
+        params["operator_token"] = json!(tok);
+    }
+    let resp = rpc_full(&sock, "trash.preview", params).await?;
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(resp["result"].clone())
+    } else {
+        Err(trash_err(&resp))
+    }
+}
+
+/// 명령 — 오너 등급. 미리보기가 준 `confirm_id` 와 `digest` 를 그대로 되보낸다(한 번만 쓰인다).
+/// 즉시 `order_id` 로 돌아오고, 결과는 `trash_order` 로 읽는다.
+#[tauri::command]
+async fn trash_delete(
+    confirm_id: String,
+    names: Vec<String>,
+    digest: String,
+) -> Result<Value, String> {
+    let sock = default_socket();
+    let mut params = json!({"confirm_id": confirm_id, "names": names, "digest": digest,
+                            "client": "tauri-app"});
+    if let Some(tok) = read_operator_token_for(&sock) {
+        params["operator_token"] = json!(tok);
+    }
+    let resp = rpc_full(&sock, "trash.delete", params).await?;
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(resp["result"].clone())
+    } else {
+        Err(trash_err(&resp))
+    }
+}
+
 /// `socket` — 부서 항목에 응답할 때만(없으면 종전처럼 본부). 허용 소켓은 `feed_reply_socket_allowed` 가 가른다(본부 · 세 조건을 채우는 부서).
 /// 그 소켓의 조작자 토큰을 **매번 새로** 읽어 붙인다(데몬을 다시 띄우면 바뀐다). 토큰은 이 백엔드에서만 다루고 화면으로 내보내지 않는다.
 #[tauri::command]
@@ -8079,6 +8158,10 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             dept_tombstone_by_socket,
             dept_tombstones,
+            trash_list,
+            trash_order,
+            trash_preview,
+            trash_delete,
             start_master,
             start_dept_master,
             ceo_pending,
@@ -16217,6 +16300,70 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
         let cys_rs = include_str!("../../src/bin/cys.rs");
         assert!(!cys_rs.contains("operator_token"), "cys CLI 에 조작자 토큰이 생겼다");
     }
+    /// ★S8 12.G — 휴지통 네 명령의 등재와 **토큰을 붙이는 명령의 목록**을 잠근다.
+    ///
+    /// 두 가지를 지킨다: ①읽기 둘(`trash_list`·`trash_order`)에는 토큰이 실리지 않는다(감사자가
+    /// 거부당하지 않는 면이다) ②토큰을 붙이는 명령은 **정확히 네 개**다 — `send_input`·`feed_reply`·
+    /// `trash_preview`·`trash_delete`. 다섯째가 생기면 이 시험이 빨개진다: 부착면이 넓어지는 것은
+    /// S8 이 의존하는 등급이 넓어지는 것과 같다(설계 §5 B2 · H3).
+    #[test]
+    fn s8_trash_commands_are_registered_and_the_token_attach_list_is_exactly_four() {
+        // 경계는 기존 배선 핀(c2_feed_reply_and_list_all_wiring)과 같은 식으로 잡는다.
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        let seg = |head: &str| -> &str {
+            let i = prod.find(head).unwrap_or_else(|| panic!("`{head}` 소실"));
+            &prod[i..i + prod[i..].find("\n}\n").expect("fn 끝")]
+        };
+        let i = prod.find("tauri::generate_handler![").expect("invoke_handler 소실");
+        let reg = &prod[i..i + prod[i..].find("\n        ])").expect("핸들러 목록 끝")];
+        for name in ["trash_list", "trash_order", "trash_preview", "trash_delete"] {
+            assert!(reg.lines().any(|l| l.trim() == format!("{name},")), "{name} 미등재");
+        }
+        for ro in ["async fn trash_list(", "async fn trash_order("] {
+            let body: &str = seg(ro);
+            assert!(!body.contains("read_operator_token_for") && !body.contains("\"operator_token\""),
+                    "{ro} 읽기 전용인데 토큰이 실린다");
+        }
+        for rw in ["async fn trash_preview(", "async fn trash_delete("] {
+            let body: &str = seg(rw);
+            assert!(body.contains("read_operator_token_for(&sock)"), "{rw} 토큰을 매번 새로 읽어야 한다");
+            assert!(body.contains("rpc_full("), "{rw} 데몬의 error.code 가 화면까지 살아야 한다");
+            assert!(!body.contains("socket: Option<String>"), "{rw} 소켓 인자를 받으면 안 된다(기지 전용)");
+        }
+        // ★부착면의 전수: `read_operator_token_for` 를 쓰는 **최상위 명령 함수**는 정확히 넷이다.
+        //   감싸는 함수는 **열 0 의 `fn`/`async fn` 줄**을 거슬러 찾는다(feed_reply 안의 중첩
+        //   `async fn call(` 처럼 들여쓴 보조 함수는 그 바깥 명령으로 귀속된다).
+        let mut callers: Vec<String> = Vec::new();
+        for (k, _) in prod.match_indices("read_operator_token_for") {
+            let head = &prod[..k];
+            let owner = head
+                .lines()
+                .rev()
+                .find_map(|l| {
+                    let t = l.strip_prefix("async fn ").or_else(|| l.strip_prefix("fn "))?;
+                    Some(t.split('(').next().unwrap_or(t).trim().to_string())
+                })
+                .unwrap_or_else(|| "?".into());
+            // 빈 이름 = 정의 줄 자신(`fn read_operator_token_for(` 의 중간에서 끊긴 조각)이다.
+            if !owner.is_empty() && owner != "read_operator_token_for" {
+                callers.push(owner);
+            }
+        }
+        callers.sort();
+        callers.dedup();
+        assert_eq!(
+            callers,
+            vec![
+                "feed_reply".to_string(),
+                "send_input".to_string(),
+                "trash_delete".to_string(),
+                "trash_preview".to_string()
+            ],
+            "operator token 부착 명령 목록이 넷이 아니다(부착면이 넓어지면 삭제 등급도 넓어진다)"
+        );
+    }
+
 
     /// 목록 응답 — 응답 없는 부서(닫힌 소켓)가 있어도 본부와 나머지가 오고, 그 부서는 오류 행으로 남는다 — 실제 소켓 없이 볼 수 있는 부분: 기본 소켓이 없으면 본부 행이 ok=false.
     /// (등록부·소켓 접속은 라이브라 시험에서 부르지 않는다 — 판정은 위 순수 함수가 맡는다.)
