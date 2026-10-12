@@ -14,7 +14,13 @@ import {
   trashSelectable,
   trashSizeText,
   trashUnavailableText,
+  TRASH_ORDER_UNKNOWN,
+  trashOutcomeText,
+  trashOrderProgressText,
+  trashOrderSeverity,
   type TrashEntry,
+  type TrashEntryOutcome,
+  type TrashOrder,
 } from "./trashconfirm";
 
 const E = (o: Partial<TrashEntry> = {}): TrashEntry => ({
@@ -130,4 +136,69 @@ test("모달은 지울 것과 되돌릴 수 없음을 적고, 공장초기화 �
   const fr = trashModalLines([E({ name: "factory-reset-20260912T090920Z" })], 1_760_000_000).join("\n");
   expect(fr).toContain("되돌릴 때 쓰는 원본");
   expect(plain).toContain("안에 있는 것(첫 단계 3/3): account, pack-dept-dept-4, state");
+});
+
+// ─── 결과 문구 표(outcome 하나당 한 줄) ────────────────────────────────────────────────────────
+const O = (o: Partial<TrashEntryOutcome> = {}): TrashEntryOutcome => ({
+  name: "dept-4-20261008T010946Z",
+  outcome: "deleted_verified",
+  reason_code: null,
+  boundary: null,
+  bytes_before: 1024,
+  duration_ms: 12,
+  remaining: null,
+  errors: [],
+  ...o,
+});
+
+test("결과 표: 지운 것과 이미 없던 것만 ok — 나머지는 warn/fail 이고 모르는 outcome 은 fail", () => {
+  expect(trashOutcomeText(O()).severity).toBe("ok");
+  expect(trashOutcomeText(O()).text).toContain("확인했습니다");
+  expect(trashOutcomeText(O({ outcome: "already_gone" })).severity).toBe("ok");
+  // 거부는 사유 문구를 refusal 표에서 가져온다(두 곳에 같은 문장을 쓰지 않는다).
+  const ref = trashOutcomeText(O({ outcome: "refused", reason_code: "confirm_expired" }));
+  expect(ref.severity).toBe("warn");
+  expect(ref.text).toContain(trashRefusalText("confirm_expired").text);
+  // ★모르는 outcome 을 성공으로 접지 않는다.
+  const unknown = trashOutcomeText(O({ outcome: "something_new_from_a_newer_daemon" }));
+  expect(unknown.severity).toBe("fail");
+  expect(unknown.text).toContain("something_new_from_a_newer_daemon");
+});
+
+test("결과 표: 봉인 단계 중단은 '한 바이트도 안 지웠다'고 말하고 스스로 이어가지 않는다고 말한다", () => {
+  const t = trashOutcomeText(O({ outcome: "sealed_not_removed", reason_code: "entry_changed_since_preview" }));
+  expect(t.severity).toBe("fail");
+  expect(t.text).toContain("한 바이트도 지우지 않았고");
+  expect(t.text).toContain(".deleting-");
+  expect(t.text).toContain("새로 미리보기");
+});
+
+test("결과 표: 일부만 지워진 것은 남은 수를 모를 때 '알 수 없음' 이라고 적는다(0 으로 꾸미지 않는다)", () => {
+  const known = trashOutcomeText(O({ outcome: "partial", remaining: 7, errors: ["Permission denied"] }));
+  expect(known.severity).toBe("fail");
+  expect(known.text).toContain("남은 것 7개");
+  expect(known.text).toContain("Permission denied");
+  const unknown = trashOutcomeText(O({ outcome: "partial", remaining: null, errors: [] }));
+  expect(unknown.text).toContain("남은 것 알 수 없음");
+  expect(unknown.text).not.toContain("0개");
+});
+
+test("진행 문구: finished 가 없으면 '삭제 중' — 오래 걸리는 것은 멈춘 것이 아니라고 적는다", () => {
+  const base: TrashOrder = { order_id: "or-1", started: 1, finished: null, running_long: false, per_entry: [] };
+  expect(trashOrderProgressText(base, 3)).toBe("삭제 중 0/3");
+  expect(trashOrderProgressText({ ...base, per_entry: [O()] }, 3)).toBe("삭제 중 1/3");
+  expect(trashOrderProgressText({ ...base, running_long: true }, 3)).toContain("멈추지 않았습니다");
+  expect(trashOrderProgressText({ ...base, finished: 2, per_entry: [O(), O()] }, 2)).toBe("끝났습니다 — 2/2 항목 처리");
+});
+
+test("명령 심각도 = 항목 중 가장 나쁜 것 · 결과를 못 읽었을 때는 성공도 실패도 주장하지 않는다", () => {
+  const mk = (per: TrashEntryOutcome[]): TrashOrder => ({
+    order_id: "or-1", started: 1, finished: 2, running_long: false, per_entry: per,
+  });
+  expect(trashOrderSeverity(mk([]))).toBe("ok");
+  expect(trashOrderSeverity(mk([O(), O({ outcome: "already_gone" })]))).toBe("ok");
+  expect(trashOrderSeverity(mk([O(), O({ outcome: "refused", reason_code: "busy" })]))).toBe("warn");
+  expect(trashOrderSeverity(mk([O({ outcome: "refused" }), O({ outcome: "partial" })]))).toBe("fail");
+  expect(TRASH_ORDER_UNKNOWN).toContain("DELETE-LEDGER.jsonl");
+  for (const bad of ["지웠습니다", "실패했습니다"]) expect(TRASH_ORDER_UNKNOWN).not.toContain(bad);
 });

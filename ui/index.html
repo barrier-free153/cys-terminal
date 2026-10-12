@@ -65,6 +65,7 @@
         <button class="cc-tab" data-view="tasks">작업</button>
         <button class="cc-tab" data-view="feed">승인 Feed <span id="cc-feed-tabbadge" class="badge" hidden>0</span></button>
         <button class="cc-tab" data-view="alarms">🔔 알람</button>
+        <button class="cc-tab" data-view="trash">휴지통</button>
         <button class="cc-tab active" data-view="office">🏢 오피스</button>
       </div>
       <div id="cc-body">
@@ -159,6 +160,19 @@
         <div id="cc-view-alarms" hidden>
           <div class="cc-board-note">화면에 떴던 알람 이력(최신순 · 이 세션에서 최대 200건). 모든 알람은 종류 불문 일정 시간이 지나면 화면에서 자동으로 사라지고, 내용은 여기에 남습니다.</div>
           <div class="cc-section"><div class="cc-h">알람 이력</div><div id="cc-alarm-list"></div></div>
+        </div>
+        <div id="cc-view-trash" hidden>
+          <div class="cc-board-note">여기 있는 것은 그대로 보관됩니다. 고른 항목을 미리 보고 확인 문구를 입력해 명령할 때만 지워지며, 그 삭제는 되돌릴 수 없습니다. 전부 고르기·오래된 것 한번에 지우기는 없습니다.</div>
+          <div class="cc-section">
+            <div class="cc-h">휴지통 <span class="cc-sub" id="cc-trash-root"></span></div>
+            <div id="cc-trash-notice" class="cc-trash-notice" hidden></div>
+            <div id="cc-trash-list"></div>
+            <div class="cc-trash-actions">
+              <button id="btn-cc-trash-delete" disabled>고른 항목 삭제</button>
+              <span id="cc-trash-status" aria-live="polite"></span>
+            </div>
+            <div id="cc-trash-result" class="cc-trash-result"></div>
+          </div>
         </div>
         <div id="cc-view-office" hidden>
           <div id="cc-office-hint" class="cc-board-note" hidden><span id="cc-office-hint-text">오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.</span>
