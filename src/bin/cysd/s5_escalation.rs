@@ -1,9 +1,9 @@
 //! S5 — the queue-block warning leaves the owner's sight. The carrier that would take a person-remedy
 //! block to a person is DEFINED in this file, and no code outside this file calls it. A wide `grep -rn
-//! s5_escalation src/` returns **3 hits**, and they are three different kinds of thing — so the four
+//! s5_escalation src/` mixes together things of different kinds, so the four
 //! facts are separated here, each saying what was counted (measured at this head):
-//!  1. **The module is declared and compiled into the binary** — `main.rs:52` holds `mod s5_escalation;`
-//!     (hit 1 of 3). This file is built; it is not excluded from the binary.
+//!  1. **The module is declared and compiled into the binary** — `main.rs:52` holds `mod s5_escalation;`.
+//!     This file is built; it is not excluded from the binary.
 //!  2. **Lines outside this file that USE the `s5_escalation::` path: 0** (counted: `grep -rn` hits for
 //!     that path in `src/`, excluding this file and comment lines).
 //!  3. **Callers outside this file: 0** for `select_carrier`, `IncidentStore`, `record_unanswered`,
@@ -11,11 +11,17 @@
 //!     file). Superficial hits belong to other code: `owner_text` also names a different function in
 //!     `teamtoken.rs`, and `eligible(` matches `alert_eligible`, `external_eligible` and
 //!     `quarantine_eligible`. What exercises these items is this file's own unit tests.
-//!  4. ★**The name also appears twice INSIDE this file, and neither occurrence is a use** (hits 2 and 3
-//!     of 3): this sentence itself, and the self source pin `include_str!("s5_escalation.rs")` at the
-//!     bottom of this file. A reader who runs the wide grep sees 3 and must be able to tell which is
-//!     which — otherwise a true statement reads as a lie. ★The rule for this is already written 600
-//!     lines below, at the pin itself: "a source pin whose own needles appear in its own source matches
+//!  4. ★**The name also appears INSIDE this file, and no occurrence here is a use**: the sentences of
+//!     this header, and the self source pin `include_str!("s5_escalation.rs")` at the
+//!     bottom of this file. ★**This header states no total for the wide grep, on purpose.** Excluding
+//!     this header, the hits are **2** — the declaration in `main.rs` and this file's own
+//!     `include_str!` pin — and that figure is stated as self-excluding because it is one. A total
+//!     that counts the header too counts a corpus its own text belongs to, so the next edit of the
+//!     header falsifies it: the sentence that used to say the grep "returns 3 hits" was already wrong
+//!     when it was written, because the same commit's new header lines raised the real count to 6.
+//!     A reader who runs the wide grep must be able to tell which hit is
+//!     which — otherwise a true statement reads as a lie. ★The rule for this is already written at
+//!     the pin itself, near the bottom of this file: "a source pin whose own needles appear in its own source matches
 //!     itself and can only ever fail". This header once said the name "appears NOWHERE in src/", which
 //!     its own text refuted — the same defect the pin's comment warns about, in the same file.
 //!
