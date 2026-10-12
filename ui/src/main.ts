@@ -129,24 +129,6 @@ import {
   type ResetPreview,
   type ResetResult,
 } from "./resetconfirm";
-import {
-  TRASH_ORDER_UNKNOWN,
-  trashAgeLines,
-  trashChips,
-  trashMismatchHint,
-  trashModalLines,
-  trashOrderProgressText,
-  trashOrderSeverity,
-  trashOutcomeText,
-  trashPhraseMatches,
-  trashRefusalText,
-  trashRequiredPhrase,
-  trashSelectable,
-  trashSizeText,
-  trashUnavailableText,
-  type TrashEntry,
-  type TrashOrder,
-} from "./trashconfirm";
 import { ccEffectiveZoom } from "./ccscale";
 import { pickCtx, isHotCtx } from "./ctxpick";
 import {
@@ -539,7 +521,7 @@ let ccUptimeBase = 0;
 let ccUptimeFetchedAt = 0;
 type CcTab =
   | "live" | "eff" | "skills" | "sessions" | "weekly" | "learn"
-  | "board" | "tasks" | "feed" | "alarms" | "trash" | "office";
+  | "board" | "tasks" | "feed" | "alarms" | "office";
 let ccTab: CcTab = "office";
 let ccEffWindow = "today";
 let ccSkillsWindow = "today";
@@ -928,8 +910,6 @@ async function refreshControlCenter() {
   // Tasks 안전망 reconcile: 이벤트 누락·부서 신규 기동을 5초 폴링으로 보정(평시는 이벤트 드리븐).
   if (ccTab === "tasks") refreshTasks();
   if (ccTab === "feed") refreshFeed();
-  // ★m3: 탭 진입(setCcTab)만으로는 목록이 멈춘다 — 다른 탭과 같은 5초 주기로 다시 읽는다.
-  if (ccTab === "trash") void refreshTrash();
   // 보드는 카탈로그 전체 재렌더 없이 최근 실행 카드만 5초 갱신(깜빡임 방지).
   if (ccTab === "board") refreshBoardRuns();
 }
@@ -1012,7 +992,6 @@ function setCcTab(view: CcTab) {
   document.getElementById("cc-view-tasks")!.hidden = view !== "tasks";
   document.getElementById("cc-view-feed")!.hidden = view !== "feed";
   document.getElementById("cc-view-alarms")!.hidden = view !== "alarms";
-  document.getElementById("cc-view-trash")!.hidden = view !== "trash";
   document.getElementById("cc-view-office")!.hidden = view !== "office";
   if (view !== "office") officeStopWatch(); // ★0.14.44 B5 탭을 떠나면 건강 확인을 멈춘다
   // 오피스 탭 전면 모드 — cc-body의 대시보드 폭 상한(780px)을 해제해 3D를 창 크기에 연동(cc-glance 패턴).
@@ -1039,7 +1018,6 @@ function setCcTab(view: CcTab) {
     refreshFeed();
   }
   if (view === "alarms") renderAlarmHistory();
-  if (view === "trash") void refreshTrash();
   if (view === "office") openOfficeView();
 }
 
@@ -1123,398 +1101,6 @@ function openOfficeView() {
   officeWatchSince = Date.now();
   officeRepairOutcome = "none"; // 탭을 다시 열면 처음부터(복구 실패의 잔상을 끌고 가지 않는다)
   void officeWatchTick(officeWatchGen);
-}
-
-// ─── S8-UI 휴지통 탭 (오너 명령 삭제의 화면 절반) ──────────────────────────────────────────────
-// ★이 화면은 **판정하지 않는다**: 무엇을 고를 수 있는가(`deletable`)·왜 거부됐는가(`reason_code`)·
-//   무엇이 지워졌는가(`outcome`)는 전부 데몬이 준 값이고, 문구 조립과 확인 판정은 순수 모듈
-//   trashconfirm.ts(시험으로 잠금)가 한다. 그래서 화면과 데몬의 판정이 갈라질 자리가 없다.
-// ★없는 것 셋(설계 Q1·Q2): '전부 선택'·'오래된 것 전부' 단추가 없고, 항목이 하나여도 확인 문구
-//   타이핑을 요구하며, 거부에 '그래도 지우기' 선택지가 없다.
-// ★데몬이 없거나 낡으면 **빈 휴지통으로 보이지 않는다**(R-7) — 오류를 그대로 적는다.
-let trashSelected = new Set<string>();
-let trashEntries: TrashEntry[] = [];
-let trashOrderGen = 0; // 결과 읽기의 세대 — 새 명령이 뜨면 올라가 낡은 연쇄가 스스로 끝난다
-let trashOrderTimer: number | undefined;
-let trashDeleting = false; // 두 번 누름 방지(데몬도 `busy` 로 거절한다 — 여기선 창의 중복 명령만 막는다)
-const TRASH_POLL_MS = 1000;
-const TRASH_POLL_MAX = 1200; // 20분 — 그 뒤엔 '성공'도 '실패'도 주장하지 않고 원장을 가리킨다
-
-function trashStopPoll() {
-  trashOrderGen++;
-  if (trashOrderTimer !== undefined) {
-    clearTimeout(trashOrderTimer);
-    trashOrderTimer = undefined;
-  }
-}
-
-function trashSetStatus(text: string) {
-  const el = document.getElementById("cc-trash-status");
-  if (el) el.textContent = text;
-}
-
-function trashSetNotice(text: string) {
-  const el = document.getElementById("cc-trash-notice");
-  if (!el) return;
-  el.textContent = text;
-  el.hidden = text === "";
-}
-
-// 오래된 것부터(설계 6.2). 스탬프를 모르는 항목은 끝에 두고, 같은 값끼리는 이름 순 — 결정론 정렬.
-function trashSortedEntries(list: TrashEntry[]): TrashEntry[] {
-  const byName = (a: TrashEntry, b: TrashEntry) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
-  return [...list].sort((a, b) => {
-    if (a.stamp_epoch == null && b.stamp_epoch == null) return byName(a, b);
-    if (a.stamp_epoch == null) return 1;
-    if (b.stamp_epoch == null) return -1;
-    if (a.stamp_epoch !== b.stamp_epoch) return a.stamp_epoch - b.stamp_epoch;
-    return byName(a, b);
-  });
-}
-
-function trashSelectedNames(): string[] {
-  return trashSortedEntries(trashEntries)
-    .filter((e) => trashSelected.has(e.name) && trashSelectable(e))
-    .map((e) => e.name);
-}
-
-function trashSyncDeleteButton(supported: boolean) {
-  const btn = document.getElementById("btn-cc-trash-delete") as HTMLButtonElement | null;
-  if (!btn) return;
-  const n = trashSelectedNames().length;
-  btn.disabled = trashDeleting || !supported || n === 0;
-  btn.textContent = n === 0 ? "고른 항목 삭제" : `고른 항목 삭제 (${n})`;
-}
-
-// 탭 본문 — `trash.list` 응답을 그대로 그린다(이름은 파일 이름이므로 textContent 로만 넣는다).
-function renderTrash(payload: {
-  root?: string;
-  entries?: TrashEntry[];
-  strays?: { name: string; why: string }[];
-  ledger_writable?: boolean;
-  delete_supported?: boolean;
-}) {
-  const host = document.getElementById("cc-trash-list");
-  if (!host) return;
-  const rootEl = document.getElementById("cc-trash-root");
-  if (rootEl) rootEl.textContent = payload.root ?? "";
-  const supported = payload.delete_supported !== false;
-  const notes: string[] = [];
-  if (!supported) notes.push("이 빌드에서는 삭제가 꺼져 있습니다 — 목록과 표시는 그대로 동작합니다.");
-  if (payload.ledger_writable === false)
-    notes.push("기록 파일을 쓸 수 없어 삭제 명령이 진행되지 않습니다 — 기록할 수 없는 삭제는 하지 않습니다.");
-  for (const s of payload.strays ?? []) notes.push(`${s.name}: ${s.why} — 목록에서 다루지 않습니다.`);
-  trashSetNotice(notes.join("\n"));
-
-  host.textContent = "";
-  const entries = trashSortedEntries(payload.entries ?? []);
-  if (entries.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "cc-board-note";
-    empty.textContent = "휴지통이 비어 있습니다.";
-    host.appendChild(empty);
-    trashSyncDeleteButton(supported);
-    return;
-  }
-  const nowEpoch = Date.now() / 1000;
-  for (const e of entries) {
-    const row = document.createElement("div");
-    row.className = "cc-trash-item";
-    const head = document.createElement("div");
-    head.className = "ct-head";
-    if (trashSelectable(e)) {
-      const cb = document.createElement("input");
-      cb.type = "checkbox";
-      cb.checked = trashSelected.has(e.name);
-      cb.addEventListener("change", () => {
-        if (cb.checked) trashSelected.add(e.name);
-        else trashSelected.delete(e.name);
-        trashSyncDeleteButton(supported);
-      });
-      head.appendChild(cb);
-    } else {
-      // 고를 수 없는 항목에는 체크박스를 두지 않는다(설계 6.2) — 사유는 아래 표지가 말한다.
-      const lock = document.createElement("span");
-      lock.className = "ct-lock";
-      lock.textContent = "고를 수 없음";
-      head.appendChild(lock);
-    }
-    const name = document.createElement("span");
-    name.className = "ct-name";
-    name.textContent = e.name;
-    const size = document.createElement("span");
-    size.className = "ct-size";
-    size.textContent = trashSizeText(e.size);
-    head.append(name, size);
-    row.appendChild(head);
-
-    const chips = trashChips(e);
-    if (chips.length) {
-      const chipBox = document.createElement("div");
-      chipBox.className = "ct-chips";
-      for (const c of chips) {
-        const chip = document.createElement("span");
-        chip.className = "cc-chip";
-        chip.textContent = c;
-        chipBox.appendChild(chip);
-      }
-      row.appendChild(chipBox);
-    }
-    for (const line of trashAgeLines(e, nowEpoch)) {
-      const age = document.createElement("div");
-      age.className = "ct-age";
-      age.textContent = line;
-      row.appendChild(age);
-    }
-    const kids = document.createElement("div");
-    kids.className = "ct-kids";
-    const shown = e.children_depth1.slice(0, 50);
-    kids.textContent = `안에 있는 것(첫 단계 ${shown.length}/${e.children_total}): ${shown.join(", ") || "(없음)"}`;
-    row.appendChild(kids);
-    host.appendChild(row);
-  }
-  trashSyncDeleteButton(supported);
-}
-
-function renderTrashUnavailable(text: string) {
-  const host = document.getElementById("cc-trash-list");
-  if (host) host.textContent = "";
-  const rootEl = document.getElementById("cc-trash-root");
-  if (rootEl) rootEl.textContent = "";
-  trashSetNotice(text);
-  trashSyncDeleteButton(false);
-}
-
-// 5초 주기(다른 탭과 같은 타이머)와 탭 진입에서 부른다. ★실패를 '빈 휴지통'으로 접지 않는다.
-async function refreshTrash() {
-  if (!document.getElementById("cc-trash-list")) return;
-  let payload: Parameters<typeof renderTrash>[0];
-  try {
-    payload = (await invoke("trash_list")) as Parameters<typeof renderTrash>[0];
-  } catch (e) {
-    trashEntries = [];
-    trashSelected.clear();
-    renderTrashUnavailable(trashUnavailableText(e));
-    return;
-  }
-  trashEntries = payload?.entries ?? [];
-  // 사라진 항목의 선택은 버린다 — 없는 이름을 미리보기로 보내지 않는다.
-  for (const n of [...trashSelected]) if (!trashEntries.some((e) => e.name === n)) trashSelected.delete(n);
-  renderTrash(payload ?? {});
-}
-
-// 확인 모달 — factoryResetConfirmModal 규약 계승(textContent 주입·자동교정 차단·불일치 사유 표시).
-// ★기본 포커스는 **취소**다(설계 6.2 3항): Enter 한 번이 삭제로 이어지는 길을 두지 않는다.
-// ★`confirm()` 은 이 WebView 에서 억제되므로 DOM 모달만 쓴다(설계 6.3).
-function trashConfirmModal(
-  entries: TrashEntry[],
-  refused: { name: string; reason_code: string; detail: string }[],
-  names: string[],
-): Promise<boolean> {
-  return new Promise((resolve) => {
-    const ov = document.createElement("div");
-    ov.className = "modal-overlay";
-    ov.innerHTML =
-      `<div class="modal"><h3></h3>` +
-      `<p class="modal-label" style="white-space:pre-wrap;max-height:46vh;overflow-y:auto"></p>` +
-      `<input class="modal-input" type="text" />` +
-      `<div class="modal-hint" aria-live="polite"></div>` +
-      `<div class="modal-btns"><button class="modal-no">취소</button>` +
-      `<button class="modal-yes" disabled>삭제</button></div></div>`;
-    (ov.querySelector("h3") as HTMLElement).textContent = "휴지통에서 삭제 — 되돌릴 수 없습니다";
-    const lines = [...trashModalLines(entries, Date.now() / 1000)];
-    if (refused.length) {
-      lines.push("");
-      lines.push("이번에 지우지 않는 것(데몬이 거부했습니다):");
-      for (const r of refused) lines.push(`• ${r.name} — ${trashRefusalText(r.reason_code).text}`);
-    }
-    lines.push("");
-    lines.push(`계속하려면 아래에 그대로 입력하세요: ${trashRequiredPhrase(names)}`);
-    (ov.querySelector(".modal-label") as HTMLElement).textContent = lines.join("\n");
-    const inp = ov.querySelector(".modal-input") as HTMLInputElement;
-    const yes = ov.querySelector(".modal-yes") as HTMLButtonElement;
-    const no = ov.querySelector(".modal-no") as HTMLButtonElement;
-    const hint = ov.querySelector(".modal-hint") as HTMLElement;
-    for (const [k, v] of PURGE_INPUT_GUARDS) inp.setAttribute(k, v);
-    inp.placeholder = trashRequiredPhrase(names);
-    inp.addEventListener("input", () => {
-      yes.disabled = !trashPhraseMatches(inp.value, names);
-      hint.textContent = trashMismatchHint(inp.value, names);
-    });
-    const done = (v: boolean) => {
-      ov.remove();
-      resolve(v);
-    };
-    yes.addEventListener("click", () => {
-      if (!yes.disabled) done(true);
-    });
-    no.addEventListener("click", () => done(false));
-    ov.addEventListener("click", (ev) => {
-      if (ev.target === ov) done(false);
-    });
-    document.body.appendChild(ov);
-    setTimeout(() => no.focus(), 50);
-  });
-}
-
-function renderTrashResult(order: TrashOrder, total: number) {
-  const box = document.getElementById("cc-trash-result");
-  trashSetStatus(trashOrderProgressText(order, total));
-  if (!box) return;
-  box.textContent = "";
-  for (const e of order.per_entry) {
-    const t = trashOutcomeText(e);
-    const row = document.createElement("div");
-    row.className = `ct-outcome ${t.severity}`;
-    row.textContent = t.text;
-    box.appendChild(row);
-  }
-}
-
-// 결과 읽기 — 새 setInterval 을 만들지 않는다(setTimeout 연쇄 · 탭 틱 수 핀 불변).
-// ★탭을 떠나도 멈추지 않는다: 실패를 조용히 흘려보내지 않으려면 결과를 끝까지 읽어야 한다.
-async function trashPollOrder(orderId: string, total: number, gen: number, polls: number) {
-  if (gen !== trashOrderGen) return;
-  let order: TrashOrder | null = null;
-  try {
-    order = (await invoke("trash_order", { orderId })) as TrashOrder;
-  } catch (e) {
-    // 데몬이 다시 뜨면 order 를 잊는다 — 그때는 원장이 정본이라고 말한다(성공 주장 금지).
-    if (gen !== trashOrderGen) return;
-    trashDeleting = false;
-    trashSetStatus(TRASH_ORDER_UNKNOWN);
-    stickyToast("trash-order", "watchdog", "휴지통 삭제 — 결과를 확인할 수 없습니다", `${TRASH_ORDER_UNKNOWN} (${e})`);
-    void refreshTrash();
-    return;
-  }
-  if (gen !== trashOrderGen) return;
-  renderTrashResult(order, total);
-  if (order.finished == null) {
-    if (polls >= TRASH_POLL_MAX) {
-      trashDeleting = false;
-      trashSetStatus(TRASH_ORDER_UNKNOWN);
-      stickyToast("trash-order", "watchdog", "휴지통 삭제 — 아직 끝나지 않았습니다", TRASH_ORDER_UNKNOWN);
-      return;
-    }
-    trashOrderTimer = setTimeout(
-      () => void trashPollOrder(orderId, total, gen, polls + 1),
-      TRASH_POLL_MS,
-    ) as unknown as number;
-    return;
-  }
-  trashDeleting = false;
-  const severity = trashOrderSeverity(order);
-  const detail = order.per_entry.map((e) => trashOutcomeText(e).text).join("\n");
-  // 실패는 소리내어(sticky) — 성공은 사라지는 알림으로 충분하다(설계 6.2 4항).
-  if (severity === "ok") {
-    dismissToast("trash-order");
-    toast("feed", "휴지통 삭제 완료", detail);
-  } else {
-    stickyToast(
-      "trash-order",
-      "watchdog",
-      severity === "fail" ? "휴지통 삭제 — 끝나지 않은 것이 있습니다" : "휴지통 삭제 — 지우지 않은 것이 있습니다",
-      detail,
-    );
-  }
-  trashSelected.clear();
-  await refreshTrash();
-}
-
-// 삭제 흐름: 고른 이름만 미리보기 → 모달(타이핑 확인) → 명령 → 결과 읽기.
-// 데몬이 거부한 이름은 **조용히 빠지지 않고** 모달과 상태줄에 사유가 그대로 적힌다.
-async function trashDeleteFlow() {
-  if (trashDeleting) return;
-  const names = trashSelectedNames();
-  if (names.length === 0) return;
-  trashDeleting = true;
-  trashSyncDeleteButton(true);
-  trashSetStatus("고른 항목을 확인하는 중입니다(크기를 재고 있습니다)…");
-  let prev: {
-    confirm_id?: string | null;
-    digest?: string | null;
-    entries?: { name: string; nodes: number; bytes: number }[];
-    refused?: { name: string; reason_code: string; boundary: string | null; detail: string }[];
-  };
-  try {
-    prev = (await invoke("trash_preview", { names })) as typeof prev;
-  } catch (e) {
-    trashDeleting = false;
-    const code = String(e).split(":")[0];
-    const r = trashRefusalText(code);
-    trashSetStatus(r.text);
-    stickyToast("trash-preview", "watchdog", "휴지통 — 확인하지 못했습니다", `${r.text}\n${e}`);
-    await refreshTrash();
-    return;
-  }
-  dismissToast("trash-preview");
-  const refused = prev?.refused ?? [];
-  const shown = prev?.entries ?? [];
-  if (!prev?.confirm_id || !prev?.digest || shown.length === 0) {
-    // 하나도 확인되지 않았다 — 사유만 적고 멈춘다(모달을 띄우지 않는다).
-    trashDeleting = false;
-    const why = refused.map((r) => `${r.name} — ${trashRefusalText(r.reason_code).text}`).join("\n");
-    trashSetStatus(why || "확인된 항목이 없습니다 — 지우지 않았습니다.");
-    if (why) stickyToast("trash-preview", "watchdog", "휴지통 — 지우지 않았습니다", why);
-    await refreshTrash();
-    return;
-  }
-  // 모달은 **데몬이 확인한 항목만** 보여준다(크기는 그 걷기의 실측값으로 채운다).
-  const confirmNames = shown.map((s) => s.name);
-  const modalEntries: TrashEntry[] = confirmNames.map((n) => {
-    const base = trashEntries.find((x) => x.name === n);
-    const m = shown.find((s) => s.name === n)!;
-    return {
-      ...(base ?? {
-        name: n,
-        interrupted_deleting: false,
-        deletable: true,
-        root_mtime_age_secs: 0,
-        stamp_epoch: null,
-        old_by_stamp: false,
-        children_depth1: [],
-        children_total: 0,
-        sole_copy_advisory: false,
-        producer_chip: "",
-        size: { state: "pending" },
-      }),
-      size: { state: "measured", value: { bytes: m.bytes, nodes: m.nodes } },
-    };
-  });
-  const ok = await trashConfirmModal(modalEntries, refused, confirmNames);
-  if (!ok) {
-    trashDeleting = false;
-    trashSetStatus("취소했습니다 — 아무 것도 지우지 않았습니다.");
-    trashSyncDeleteButton(true);
-    return;
-  }
-  trashSetStatus("삭제 명령을 보냈습니다…");
-  let ordered: { order_id?: string };
-  try {
-    ordered = (await invoke("trash_delete", {
-      confirmId: prev.confirm_id,
-      names: confirmNames,
-      digest: prev.digest,
-    })) as { order_id?: string };
-  } catch (e) {
-    trashDeleting = false;
-    const code = String(e).split(":")[0];
-    const r = trashRefusalText(code);
-    trashSetStatus(r.text);
-    stickyToast("trash-order", "watchdog", "휴지통 삭제 — 지우지 않았습니다", `${r.text}\n${e}`);
-    await refreshTrash();
-    return;
-  }
-  if (!ordered?.order_id) {
-    trashDeleting = false;
-    trashSetStatus(TRASH_ORDER_UNKNOWN);
-    stickyToast("trash-order", "watchdog", "휴지통 삭제 — 결과를 확인할 수 없습니다", TRASH_ORDER_UNKNOWN);
-    return;
-  }
-  trashStopPoll();
-  const box = document.getElementById("cc-trash-result");
-  if (box) box.textContent = "";
-  void trashPollOrder(ordered.order_id, confirmNames.length, trashOrderGen, 0);
 }
 
 // D5: 스킬 버튼 보드 — 카탈로그 큐레이션 렌더 + 일회용 워커 실행 + 산출물 회수(터미널 입력 0회).
@@ -10700,7 +10286,6 @@ function feedbackDeps() {
 document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
   b.addEventListener("click", () => setCcTab((b as HTMLElement).dataset.view as typeof ccTab)),
 );
-document.getElementById("btn-cc-trash-delete")?.addEventListener("click", () => void trashDeleteFlow());
 document.querySelectorAll("#cc-eff-win .cc-win").forEach((b) =>
   b.addEventListener("click", () => {
     ccEffWindow = (b as HTMLElement).dataset.window!;
