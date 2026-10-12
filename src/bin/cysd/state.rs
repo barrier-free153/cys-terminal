@@ -5863,7 +5863,7 @@ impl Daemon {
     /// 여전히 pending" 인데, 핀에서 **그 전제가 참이 아니다** — 상태 변경이 영속보다 **먼저**
     /// 임계영역 안에서 일어난다. pending 이라고 답하는 것은 데몬이 자기 상태에 관해 사실이 아닌
     /// 말을 하는 것이고, 그 답을 받은 호출자의 재시도는 `item already resolved` 로 거부된다.
-    pub fn resolve_feed_item_settled(
+    fn resolve_feed_item_settled(
         &self,
         request_id: &str,
         decision: &str,
@@ -10718,12 +10718,7 @@ mod tests {
         let (snap2, _) = daemon.resolve_feed_item_settled("s7-b", "stale-cleared", None, None, None);
         assert_eq!(snap2.expect("스냅샷").decision_reason, None);
 
-        // ★끝정리는 **관용**으로 둔다(이 파일의 데몬 생성 검체들이 쓰는 꼴 — `let _ =`).
-        //   실측: 엄격한 test_rm_rf 로 두었더니 **전체 스위트에서만** `Directory not empty
-        //   (os error 66)` 으로 깨졌다(단독 실행은 통과). 살아 있는 데몬이 끝정리 중에도 상태
-        //   폴더에 쓰기 때문이고, test_rm_rf 의 문서가 말하는 그대로다 — 끝정리 실패는 이 검체가
-        //   재는 것이 아니다(삭제가 검체의 **단계**인 자리, 즉 위의 고장 제거는 엄격하게 둔다).
-        let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
+        test_rm_rf(tmp.parent().unwrap());
     }
 
     /// ★AT-S7-B2 — 하위호환 성질: 새 필드가 없는 **구판 feed.jsonl 줄도 역직렬화된다**. 깨지면
@@ -10807,12 +10802,7 @@ mod tests {
         let healed = std::fs::read_to_string(&feed_path).expect("회복 뒤 feed.jsonl");
         assert!(healed.contains("s7-f3"));
 
-        // ★끝정리는 **관용**으로 둔다(이 파일의 데몬 생성 검체들이 쓰는 꼴 — `let _ =`).
-        //   실측: 엄격한 test_rm_rf 로 두었더니 **전체 스위트에서만** `Directory not empty
-        //   (os error 66)` 으로 깨졌다(단독 실행은 통과). 살아 있는 데몬이 끝정리 중에도 상태
-        //   폴더에 쓰기 때문이고, test_rm_rf 의 문서가 말하는 그대로다 — 끝정리 실패는 이 검체가
-        //   재는 것이 아니다(삭제가 검체의 **단계**인 자리, 즉 위의 고장 제거는 엄격하게 둔다).
-        let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
+        test_rm_rf(tmp.parent().unwrap());
     }
 
     /// 실제 persist_feed_item을 동시 다발 호출해도(프로덕션 경로) feed.jsonl이 손상되지
