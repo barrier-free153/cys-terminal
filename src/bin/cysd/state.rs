@@ -5441,6 +5441,63 @@ fn wal_write_verdict(
     ))
 }
 
+/// ★★R3-A (0.14.51 · 부서장 티켓 T-S7-R3-FIXES §1) — 기동 압축에서 **빠지는 줄의 보존소**.
+///
+/// 기동 압축은 `unparsed` + 복원된 항목만 다시 쓴다. 그래서 보존 한도(`FEED_RETAIN`)에서 빠진
+/// **종결 항목**과 손상 상한(`FEED_UNPARSED_KEEP`)에서 넘친 **판독 불가 줄**은 종전에 **사라졌다**.
+/// 종결 항목은 [`SettleOutcome::Committed`] 영수증을 받은 기록이므로 그 소멸은 **거짓 영수증**이다
+/// (파일은 완전히 읽을 수 있으니 S7 의 이름 붙은 예외도 아니다) ⇒ 지우지 않고 이 파일로 옮긴다.
+/// 같은 JSONL 이고 줄 단위로 읽힌다.
+///
+/// ★로테이션은 없다 — `approval_audit.jsonl` 과 **같은 선택이고 같은 이유**다(승인은 사람 페이스
+/// 저볼륨 · 그 파일도 v1 로테이션 부재를 명시 수용했다). 자라는 것은 디스크이고 줄이는 것은 약속이다.
+/// 디스크 상한이 필요해지면 그것은 **별도 결정**이며, 그때도 "지우기"가 아니라 "옮기기"여야 한다.
+const FEED_ARCHIVE_FILE: &str = "feed-archive.jsonl";
+
+/// 여러 줄을 **줄 경계를 보장해** append 하고 fsync 한다(보존소 기록 전용).
+///
+/// 빈 목록이면 **파일을 만들지도 않는다** — 버릴 줄이 없는 평시 기동의 동작을 한 바이트도 바꾸지
+/// 않기 위해서다(새 파일이 모든 설치에 생기지 않는다).
+///
+/// 경계 규율은 F-1 과 같다: 꼬리가 개행이 아니거나 **판정할 수 없으면** 분리자를 먼저 쓴다 —
+/// 한 줄에 두 기록이 붙어 둘 다 판독 불가가 되는 것보다 빈 줄 하나가 싸다.
+fn append_lines_durably(path: &std::path::Path, lines: &[String]) -> std::io::Result<()> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(path)?;
+    let needs_separator = match f.metadata() {
+        Ok(m) if m.len() == 0 => false,
+        Ok(m) => match f.seek(SeekFrom::Start(m.len() - 1)) {
+            Ok(_) => {
+                let mut tail = [0u8; 1];
+                match f.read_exact(&mut tail) {
+                    Ok(()) => tail[0] != b'\n',
+                    Err(_) => true,
+                }
+            }
+            Err(_) => true,
+        },
+        Err(_) => true,
+    };
+    let mut payload = String::new();
+    if needs_separator {
+        payload.push('\n');
+    }
+    for l in lines {
+        payload.push_str(l);
+        payload.push('\n');
+    }
+    f.write_all(payload.as_bytes())?;
+    f.sync_all()?;
+    Ok(())
+}
+
 impl Daemon {
     pub fn new(socket_path: PathBuf) -> Arc<Self> {
         let dir = state_dir(&socket_path);
@@ -5485,8 +5542,12 @@ impl Daemon {
                     unparsed.push(line);
                 }
             }
+            // ★★R3-A: 넘치는 줄을 여기서 **버리면** 그것은 압축이 읽을 수 있는 바이트를 줄이는
+            //   것이다. 상한(손상 누적의 유계)은 그대로 두고, 빠지는 줄은 보존소로 **옮긴다**.
+            let mut archived: Vec<String> = Vec::new();
             if unparsed.len() > FEED_UNPARSED_KEEP {
-                unparsed.drain(..unparsed.len() - FEED_UNPARSED_KEEP);
+                let overflow = unparsed.len() - FEED_UNPARSED_KEEP;
+                archived.extend(unparsed.drain(..overflow).map(str::to_string));
             }
             restored = by_id.into_values().collect();
             restored.sort_by(|a, b| {
@@ -5507,15 +5568,28 @@ impl Daemon {
                     rec.stale_restart, rec.expired_notice
                 );
             }
-            // 보존 한도: pending 전부 + 종결 항목 최근 1000건 (메모리·디스크 무한 누적 차단)
+            // 보존 한도: pending 전부 + 종결 항목 최근 1000건 (메모리·live 파일 무한 누적 차단)
+            // ★★R3-A (codex R2 major · 티켓 §1 R3-A): 이 상한에서 빠지는 종결 항목은
+            //   **`Committed` 영수증을 받은 기록**이다. 그것을 압축이 지우면 S7 이 약속한
+            //   *"settled 된 결재는 재생 가능한 내구적 사유를 가진다"* 가 거짓이 된다 — 그리고
+            //   파일은 완전히 읽을 수 있으니 **이름 붙은 예외(판독 불가 파일)가 이 경우를 덮지 않는다.**
+            //   ⇒ 상한은 유지하고(메모리·live 파일은 여전히 유계) 빠지는 줄을 보존소로 **옮긴다**.
             const FEED_RETAIN: usize = 1000;
             let resolved_count = restored.iter().filter(|i| i.status != "pending").count();
             if resolved_count > FEED_RETAIN {
                 let mut drop_n = resolved_count - FEED_RETAIN;
                 restored.retain(|i| {
                     if i.status != "pending" && drop_n > 0 {
-                        drop_n -= 1;
-                        false
+                        match serde_json::to_string(i) {
+                            Ok(line) => {
+                                archived.push(line);
+                                drop_n -= 1;
+                                false
+                            }
+                            // ★옮길 수 없으면 **빼지 않는다** — 직렬화 실패가 기록을 지우는 길이
+                            //   되지 않게(이 항목은 방금 JSON 에서 복원된 것이라 실패는 이론상이다).
+                            Err(_) => true,
+                        }
                     } else {
                         true
                     }
@@ -5540,8 +5614,26 @@ impl Daemon {
                         }
                     }
                 }
+                // ★★R3-A 요구 성질: **압축은 `Committed` 가 약속한 것을 줄일 수 없다.**
+                //   재기록은 `unparsed` + `restored` 만 담으므로, 거기서 빠진 줄이 보존소에
+                //   **내구적으로 들어간 뒤에만** 새 파일을 제자리에 놓는다. 보존소 기록이 실패하면
+                //   압축을 **건너뛴다**: live 파일이 더 자라는 것은 불편이고, 기록이 사라지는 것은
+                //   거짓 영수증이다 ⇒ fail-safe 방향은 **줄이지 않는 쪽**이다.
+                //   ★이 갈래는 어떤 append·해소도 막지 않는다(기동 압축은 서빙 전 1회뿐이다) —
+                //   오너 절대규칙의 "큐 막힘 금지" 쪽을 건드리지 않는다.
                 if ok {
-                    let _ = std::fs::rename(&tmp, &feed_path);
+                    match append_lines_durably(&dir.join(FEED_ARCHIVE_FILE), &archived) {
+                        Ok(()) => {
+                            let _ = std::fs::rename(&tmp, &feed_path);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[cysd] feed 보존소({FEED_ARCHIVE_FILE}) 기록 실패 — 압축을 건너뛴다(빠질 기록 {}건을 줄이지 않는다): {e}",
+                                archived.len()
+                            );
+                            let _ = std::fs::remove_file(&tmp);
+                        }
+                    }
                 }
             }
         }
@@ -6056,7 +6148,13 @@ impl Daemon {
     /// · ★S7 이 약속하는 것과 **약속하지 않는 것**(부서장 Declaration 5 의 문언 그대로):
     ///   *settled 된 결재는 재생 가능한 내구적 사유를 가진다 — **feed 파일이 판독 불가가 되는 경우는
     ///   예외이며, 그때는 다음 부팅에서 모든 pending 항목과 그 기록이 사라지고 S7 은 아무것도
-    ///   약속하지 않는다***. 그 예외의 자리는 이 함수가 아니라 복원 경로의 전부-또는-전무 읽기
+    ///   약속하지 않는다***.
+    /// · ★**R3-A(0.14.51) — 그 "재생 가능"이 **어느 파일**을 뜻하는가**: `feed.jsonl` **또는**
+    ///   [`FEED_ARCHIVE_FILE`] 이다. 기동 압축의 보존 한도(`FEED_RETAIN`)에서 빠지는 종결 기록은
+    ///   **지워지지 않고 보존소로 옮겨지며**, 옮기지 못하면 압축 자체를 건너뛴다. 종전에는 그 기록이
+    ///   **사라졌고**(파일은 완전히 읽을 수 있었다) 영수증은 `Committed` 였다 — 거짓 영수증이다.
+    ///   ★live 파일에서 그 줄이 빠진다는 사실 자체는 바뀌지 않았다: `feed.jsonl` 만 읽는 소비자가
+    ///   보는 내용은 종전과 **같다**(그래서 이 수리는 덧붙이기다). 달라진 것은 **지워지지 않는다**는 것뿐이다. 그 예외의 자리는 이 함수가 아니라 복원 경로의 전부-또는-전무 읽기
     ///   ([`Daemon::new`] 의 `read_to_string` 블록)이고, **E7 의 수리는 이 판 밖**이다(0.14.51 번들
     ///   `E7` = OUT, "OUT MEANS ZERO LINES THIS RELEASE" · 백로그 B-117). 같은 이유로 그 수리를
     ///   게이트하는 `T-r3-7` 도 이 판 밖이며, 여기서 그것을 덮었다고 읽으면 안 된다.
@@ -11096,6 +11194,241 @@ mod tests {
         for line in after.lines() {
             serde_json::from_str::<FeedItem>(line).expect("모든 줄이 파싱돼야 한다");
         }
+        let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
+    }
+
+    /// ★AT-S7-R3A — **압축은 `Committed` 가 약속한 것을 줄일 수 없다**(codex R2 major · 부서장 티켓
+    /// T-S7-R3-FIXES §1 R3-A).
+    ///
+    /// 결함(이 검체가 **고치기 전에는 빨갛다**): 기동 압축은 `unparsed` + 복원된 항목만 다시 쓰고,
+    /// 보존 한도 `FEED_RETAIN`(1000)에서 빠진 **종결 항목**은 그 재기록에 들어가지 않는다 ⇒ 그 줄은
+    /// 재기동 한 번으로 **읽을 수 있는 바이트에서 사라진다**. 그런데 그 기록은 생산 경로에서
+    /// `Committed` 영수증을 받았다. 파일은 **완전히 읽을 수 있는 UTF-8** 이라 S7 의 이름 붙은 예외
+    /// (판독 불가 파일)가 이 경우를 **덮지 않는다** ⇒ 거짓 영수증(S8⒝ 를 철회시킨 그 부류).
+    ///
+    /// ★라벨: 이 상태는 **구성한(constructed)** 것이다 — 1001 건의 종결 기록을 파일에 만들어 상한을
+    /// 넘긴다. 유발(provoked)이 아니다(실사용에서 상한을 넘기려면 종결 결재 1001 건이 필요하다).
+    ///
+    /// 박는 성질: **영수증이 `Committed` 였던 기록은 재기동 뒤에도 읽을 수 있는 파일에서 읽힌다.**
+    /// 수리의 선택은 "지우지 않고 보존소로 옮긴다"이므로, live 파일에서 빠지는 것은 그대로 두고
+    /// (그 동작은 종전과 같다 — `feed.jsonl` 만 읽는 소비자에게는 변화가 없다) **보존소에서 읽힌다**.
+    #[test]
+    fn s7_r3a_compaction_never_erases_a_committed_record() {
+        let tmp = isolated_sock("s7-r3a-compact");
+        let daemon = Daemon::new(tmp.clone());
+        let dir = state_dir(&daemon.socket_path);
+        let feed_path = dir.join("feed.jsonl");
+        let archive_path = dir.join(FEED_ARCHIVE_FILE);
+        let needle = "R3A-NEEDLE-이 사유는 사라져서는 안 된다";
+
+        // ① 종결 기록 1000 건을 구성한다(이 줄들은 상한 안에 남는다 — created_at 이 더 **새롭다**).
+        let base = now_epoch();
+        {
+            let mut bulk = String::new();
+            for n in 0..1000 {
+                let mut it = sample_feed_item(&format!("r3a-bulk-{n}"), "b".into());
+                it.status = "resolved".into();
+                it.decision = Some("allow".into());
+                it.decision_reason = Some(format!("bulk {n}"));
+                it.created_at = base + 10.0 + n as f64;
+                it.resolved_at = Some(base + 10.0 + n as f64);
+                bulk.push_str(&serde_json::to_string(&it).expect("직렬화"));
+                bulk.push('\n');
+            }
+            std::fs::write(&feed_path, bulk).expect("대량 구성");
+        }
+
+        // ② ★needle 은 **생산 경로**로 append 하고 영수증을 관측한다. created_at 을 가장 **오래된**
+        //    값으로 둬서 상한에서 빠지는 쪽(정렬 후 앞)에 놓는다.
+        let mut target = sample_feed_item("r3a-needle", "n".into());
+        target.status = "resolved".into();
+        target.decision = Some("allow".into());
+        target.decision_reason = Some(needle.to_string());
+        target.created_at = base - 1000.0;
+        target.resolved_at = Some(base - 1000.0);
+        let outcome = daemon.persist_feed_item(&target);
+        assert!(
+            outcome.is_committed(),
+            "전제: 생산 경로가 내구 영수증을 줬다 — 아니면 이 검체는 아무것도 재지 않는다: {outcome:?}"
+        );
+        assert!(
+            std::fs::read_to_string(&feed_path).expect("읽기").contains(needle),
+            "전제: 영수증 직후 그 사유는 읽을 수 있는 바이트에 있다"
+        );
+
+        // ③ 재기동 — 압축이 파일을 다시 쓴다(종결 1001 > 1000 이라 가장 오래된 하나가 빠진다).
+        let restarted = Daemon::new(tmp.clone());
+
+        // ④ 상한은 지켜진다(이 수리는 상한을 풀지 않는다 — 메모리·live 파일은 여전히 유계다).
+        let kept = restarted.feed_items.lock().unwrap().len();
+        assert_eq!(kept, 1000, "보존 한도가 깨졌다(수리가 상한을 풀었다): {kept}");
+
+        // ⑤ ★요구 성질 — 그 기록은 **읽을 수 있는 파일에서 여전히 읽힌다.**
+        let live = std::fs::read_to_string(&feed_path).unwrap_or_default();
+        let archive = std::fs::read_to_string(&archive_path).unwrap_or_default();
+        assert!(
+            live.contains(needle) || archive.contains(needle),
+            "거짓 영수증: `Committed` 였던 기록이 재기동 한 번으로 읽을 수 있는 바이트에서 사라졌다 \
+             (live {} B · 보존소 {} B)",
+            live.len(),
+            archive.len()
+        );
+        // ⑥ 이 판에서 고른 수리는 **보존소로 옮기기**다 — 그래서 어느 쪽에 있는지도 박는다.
+        assert!(
+            archive.contains(needle),
+            "보존소에 그 줄이 없다(수리의 선택이 바뀌었으면 ⑤ 만 남기고 이 단언을 고쳐라): {archive:?}"
+        );
+        // ⑦ 보존소의 그 줄은 **온전한 레코드**다(옮기면서 사유가 잘리거나 꼴이 바뀌지 않았다).
+        let moved: Vec<FeedItem> = archive
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<FeedItem>(l).expect("보존소의 모든 줄은 파싱된다"))
+            .collect();
+        let m = moved
+            .iter()
+            .find(|i| i.request_id == "r3a-needle")
+            .expect("보존소에 그 request_id 가 없다");
+        assert_eq!(m.decision_reason.as_deref(), Some(needle), "옮기면서 사유가 바뀌었다");
+        assert_eq!(m.decision.as_deref(), Some("allow"), "옮기면서 결정이 바뀌었다");
+        // ⑧ live 파일에서 빠지는 것 자체는 **종전과 같다**(이 수리는 덧붙이기다).
+        assert!(!live.contains(needle), "전제가 바뀌었다 — 상한이 그 줄을 빼지 않았다");
+        let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
+    }
+
+    /// ★AT-S7-R3A-b — 손상 상한(`FEED_UNPARSED_KEEP`)에서 **넘치는 판독 불가 줄도 지우지 않는다**.
+    ///
+    /// U10 이 약속한 것은 "해석하지 못한 기록을 지우지 않는다"인데, 상한을 넘은 줄은 종전에
+    /// **사라졌다**. 이 줄들은 `Committed` 영수증을 받은 기록일 수도 있다(찢긴 접두에 이어붙은 줄 —
+    /// F-1 이 고친 그 모양이 이미 디스크에 있는 설치본). ⇒ 같은 규율: 상한은 유지하고 옮긴다.
+    /// ★라벨: **구성한** 상태다(판독 불가 줄 201 개를 직접 쓴다).
+    #[test]
+    fn s7_r3a_unparsed_overflow_is_moved_not_dropped() {
+        let tmp = isolated_sock("s7-r3a-unparsed");
+        let daemon = Daemon::new(tmp.clone());
+        let dir = state_dir(&daemon.socket_path);
+        let feed_path = dir.join("feed.jsonl");
+        let needle = "R3A-UNPARSED-NEEDLE";
+
+        // 201 줄: 첫 줄(가장 오래된)이 needle — 상한 200 을 하나 넘겨 그 줄이 빠지게 한다.
+        let mut raw = String::new();
+        raw.push_str(&format!("{{\"broken\": \"{needle}\"\n"));
+        for n in 0..200 {
+            raw.push_str(&format!("{{\"broken\": {n}\n"));
+        }
+        std::fs::write(&feed_path, &raw).expect("구성");
+        assert_eq!(raw.lines().count(), 201, "전제: 201 줄");
+        for l in raw.lines() {
+            assert!(serde_json::from_str::<FeedItem>(l).is_err(), "전제: 모든 줄이 판독 불가다");
+        }
+
+        let _restarted = Daemon::new(tmp.clone());
+        let live = std::fs::read_to_string(&feed_path).unwrap_or_default();
+        let archive = std::fs::read_to_string(dir.join(FEED_ARCHIVE_FILE)).unwrap_or_default();
+        assert!(
+            live.contains(needle) || archive.contains(needle),
+            "상한을 넘은 판독 불가 줄이 압축에서 사라졌다 — U10 의 약속이 거짓이 된다"
+        );
+        assert!(archive.contains(needle), "그 줄이 보존소로 옮겨지지 않았다: {archive:?}");
+        let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
+    }
+
+    /// ★AT-S7-R3A-c — **보존소에 쓸 수 없으면 압축을 건너뛴다**(fail-safe 방향 = 줄이지 않는 쪽).
+    ///
+    /// 보존소 기록이 실패했는데도 재기록을 제자리에 놓으면 그 줄은 사라진다 — 수리가 수리 전과
+    /// 같아진다. 그래서 보존소 append+fsync 가 성공한 **뒤에만** rename 한다.
+    /// ★라벨: 고장은 **구성한** 것이다 — 보존소 이름으로 **디렉터리**를 만들어 open 을 실패시킨다
+    /// (OS 의 쓰기 실패를 결정론적으로 일으킬 다른 방법이 이 리그에 없다).
+    #[test]
+    fn s7_r3a_compaction_is_skipped_when_the_archive_cannot_be_written() {
+        let tmp = isolated_sock("s7-r3a-failclosed");
+        let daemon = Daemon::new(tmp.clone());
+        let dir = state_dir(&daemon.socket_path);
+        let feed_path = dir.join("feed.jsonl");
+        let needle = "R3A-FAILCLOSED-NEEDLE";
+
+        // 보존소 자리를 **디렉터리**로 막는다 ⇒ append 용 open 이 실패한다.
+        std::fs::create_dir_all(dir.join(FEED_ARCHIVE_FILE)).expect("보존소 자리 막기");
+
+        let base = now_epoch();
+        let mut bulk = String::new();
+        for n in 0..1000 {
+            let mut it = sample_feed_item(&format!("r3a-fc-bulk-{n}"), "b".into());
+            it.status = "resolved".into();
+            it.decision = Some("allow".into());
+            it.created_at = base + 10.0 + n as f64;
+            bulk.push_str(&serde_json::to_string(&it).expect("직렬화"));
+            bulk.push('\n');
+        }
+        std::fs::write(&feed_path, bulk).expect("대량 구성");
+
+        let mut target = sample_feed_item("r3a-fc-needle", "n".into());
+        target.status = "resolved".into();
+        target.decision = Some("allow".into());
+        target.decision_reason = Some(needle.to_string());
+        target.created_at = base - 1000.0;
+        assert!(daemon.persist_feed_item(&target).is_committed(), "전제: 내구 영수증");
+
+        let _restarted = Daemon::new(tmp.clone());
+        let live = std::fs::read_to_string(&feed_path).expect("live 읽기");
+        assert!(
+            live.contains(needle),
+            "보존소에 쓸 수 없는데 압축이 진행돼 기록이 사라졌다(fail-safe 방향이 뒤집혔다)"
+        );
+        // 그리고 남은 임시 파일이 제자리에 놓이지 않았다(치워졌거나 없다).
+        assert!(
+            !dir.join("feed.jsonl.tmp").exists(),
+            "건너뛴 압축의 임시 파일이 남았다"
+        );
+        let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
+    }
+
+    /// ★AT-S7-R3A-d — **평시 기동은 보존소 파일을 만들지도 않는다**(이 수리가 덧붙이기라는 근거의 검체).
+    ///
+    /// 내가 적은 정당화 하나가 "빠질 줄이 없으면 파일을 만들지 않으므로 모든 설치의 동작이 그대로다"
+    /// 였다. ★그 정당화를 **반증할 변이**는 `append_lines_durably` 의 빈 목록 조기 반환을 지우는 것이고,
+    /// 그때 빨개질 검체가 없으면 그 정당화는 측정이 아니라 독해다(부서장 §3 변이 기준) ⇒ 이 검체다.
+    #[test]
+    fn s7_r3a_a_quiet_boot_creates_no_archive_file() {
+        let tmp = isolated_sock("s7-r3a-quiet");
+        let daemon = Daemon::new(tmp.clone());
+        let dir = state_dir(&daemon.socket_path);
+        assert!(daemon
+            .persist_feed_item(&sample_feed_item("r3a-quiet-A", "a".into()))
+            .is_committed());
+        let _restarted = Daemon::new(tmp.clone());
+        assert!(
+            !dir.join(FEED_ARCHIVE_FILE).exists(),
+            "버릴 줄이 없는 기동이 보존소 파일을 만들었다 — 모든 설치에 새 파일이 생긴다"
+        );
+        let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
+    }
+
+    /// ★AT-S7-R3A-e — 보존소 append 도 **줄 경계를 보장한다**(F-1 과 같은 규율을 같은 파일 꼴에 적용).
+    ///
+    /// 보존소에 이미 **개행 없는 접두**가 있으면, 옮기는 줄이 그 접두에 이어붙어 **둘 다 판독 불가**가
+    /// 된다 — 지우지 않으려고 옮긴 줄을 옮기면서 못 읽게 만드는 셈이다. 그래서 분리자를 먼저 쓴다.
+    /// ★라벨: 접두는 **구성한** 것이다.
+    #[test]
+    fn s7_r3a_archive_append_keeps_line_boundaries() {
+        let tmp = isolated_sock("s7-r3a-boundary");
+        let daemon = Daemon::new(tmp.clone());
+        let dir = state_dir(&daemon.socket_path);
+        let archive_path = dir.join(FEED_ARCHIVE_FILE);
+        let needle = "R3A-BOUNDARY-NEEDLE";
+
+        // 보존소에 개행 없는 접두를 구성한다.
+        let prefix = "{\"partial\": \"torn";
+        std::fs::write(&archive_path, prefix).expect("접두 구성");
+
+        let moved = vec![format!("{{\"request_id\":\"{needle}\"}}")];
+        append_lines_durably(&archive_path, &moved).expect("보존소 append");
+
+        let got = std::fs::read_to_string(&archive_path).expect("읽기");
+        assert!(got.starts_with(prefix), "접두 바이트를 지웠다(되돌림 금지)");
+        assert!(
+            got.lines().any(|l| l.trim() == moved[0]),
+            "옮긴 줄이 자기 줄에 있지 않다(접두에 이어붙었다): {got:?}"
+        );
         let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
     }
 
