@@ -652,7 +652,7 @@ describe("locateStarvedSeat — 눌렀을 때 갈 좌석 확정(다른 데몬의
   });
 });
 
-describe("main.ts 배선 — queue.starved 분기(name-우선 · 끝의 return · 누를 때만 이동)", () => {
+describe("main.ts 배선 — queue.starved 분기 (S5 CHANGE-1 · CHANGE-4: 렌더링 0 · 조기 return · 외부 상태 무변경)", () => {
   const src = read("./main.ts");
   // 줄 머리 주석·꼬리 주석을 걷은 본문(usagewiring.test.ts 와 같은 규칙) — 설명문이 낱말을 언급해도 핀이 깨지지 않는다.
   const stripComments = (s: string): string =>
@@ -685,53 +685,36 @@ describe("main.ts 배선 — queue.starved 분기(name-우선 · 끝의 return �
     const chain = handler.indexOf('if (category === "health") {');
     expect({ 분기: at >= 0, 폴백_사슬: chain >= 0, 분기가_앞: at >= 0 && chain > at }).toEqual({ 분기: true, 폴백_사슬: true, 분기가_앞: true });
   });
-  it("starvedNotice 로 문구·등급을 만들고 stickyToast(id, level, 제목, 상세, …) 로 올린다 — 같은 제목의 calm 은 이력만 갱신된다", () => {
+  it("S5 CHANGE-1: queue.starved 분기에서 stickyToast, osBanner, recordAlarm 호출 0 — 오너 화면에 나타나지 않는다", () => {
     const b = branch("queue.starved");
-    expect(b).toContain("const starved = starvedNotice(payload, event.socket_slug);");
-    expect(b).toContain("stickyToast(starved.id, starved.level, starved.title, starved.detail, ");
-    expect(b).toContain("if (starvedShouldPop(starvedLastKey.get(starved.id), starved, lastPopAt === undefined ? undefined : starvedPopAgeMs(Date.now(), lastPopAt.wall, performance.now(), lastPopAt.mono))) {");
-    expect(b).toContain("recordAlarm(starved.level, starved.title, starved.detail, starved.id);");
-    expect(b).toContain("starvedLastKey.set(starved.id, starved.stateKey);");
-    expect(b.split("stickyToast(").length - 1).toBe(1);
-    expect(/(^|[^A-Za-z])toast\(/.test(b)).toBe(false); // 일회성 toast( 를 따로 부르지 않는다(같은 좌석의 토스트가 쌓이지 않는다)
+    expect(b).not.toContain("stickyToast(");
+    expect(b).not.toContain("osBanner(");
+    expect(b).not.toContain("recordAlarm(");
+    expect(b).not.toContain("toast(");
   });
-  it("OS 배너는 humanNeeded 일 때만 · 같은 제목·상세로 — 데몬 쿨다운이 빈도를 묶는다(GUI 쪽 타이머 0)", () => {
-    const b = branch("queue.starved");
-    expect(b).toContain("if (starved.humanNeeded) osBanner(starved.title, starved.detail);");
-    expect(b.split("osBanner(").length - 1).toBe(1);
-    // ★F1-R(0.14.48): 시계 읽기(Date.now)는 억제 상한(STARVED_REPOP_MS)이 쓴다 — 타이머(예약 실행)는 여전히 0 이다.
-    for (const timer of ["setTimeout", "setInterval"]) expect({ 금지: timer, 있음: b.includes(timer) }).toEqual({ 금지: timer, 있음: false });
-  });
-  it("★분기는 return 으로 끝난다 — 폴백 레인을 타지 않는다(이중 표시 금지)", () => {
+  it("S5 CHANGE-1: ★분기는 return 으로 끝난다 — 폴백 레인을 타지 않는다(이중 표시 및 오너 노출 방지)", () => {
     const b = branch("queue.starved");
     expect(/\n    return;\n  \}\n$/.test(b)).toBe(true);
-    // 새 payload 가 null 이어도(잘못된 payload) return 은 if (starved) 밖에 있다 — 폴백으로 새지 않는다
-    expect(b.indexOf("return;") > b.indexOf("if (starved) {")).toBe(true);
-    expect(/if \(starved\) \{[\s\S]*?\n    \}\n    return;/.test(b)).toBe(true);
   });
-  it("★포커스는 클릭 처리기 안에서만 — 이벤트가 올 때 좌석·탭·패널을 건드리는 코드가 분기에 없다(포커스 강탈 금지)", () => {
+  it("S5 CHANGE-4: 포커스 강탈·피드·배지 변경 금지 — 화면·상태 조작 코드가 분기에 없다", () => {
     const b = branch("queue.starved");
-    expect(b.split("focusStarvedSeat(").length - 1).toBe(1);
-    expect(b).toContain("() => void focusStarvedSeat(slug, seat)");
-    for (const direct of ["jumpToSurface(", "setFocus(", "render(", "renderWsTabs(", "openFeed(", "setCcOpen(", "switchToWorkspaceBySocket(", "activeWs", "scrollIntoView", ".focus("])
+    for (const direct of ["focusStarvedSeat", "jumpToSurface(", "setFocus(", "render(", "renderWsTabs(", "openFeed(", "setCcOpen(", "switchToWorkspaceBySocket(", "activeWs", "scrollIntoView", ".focus(", "refreshFeed(", "refreshSidebarStatus("])
       expect({ 금지: direct, 있음: b.includes(direct) }).toEqual({ 금지: direct, 있음: false });
   });
-  it("누를 좌석을 못 정하면(번호 해석 불가) 클릭 처리기를 달지 않는다 · slug 가 문자열이 아니면 빈 값(= 본부)", () => {
-    const b = branch("queue.starved");
-    expect(b).toContain("seat === null ? undefined : ");
-    expect(b).toContain("const seat = surfaceIdOfRef(payload.surface_ref);");
-    expect(b).toContain('const slug = typeof event.socket_slug === "string" ? event.socket_slug : "";');
-  });
-  it("화면 문자열은 textContent 경로(stickyToast)로만 — 분기·도우미 함수에 innerHTML 0", () => {
-    for (const part of [branch("queue.starved"), branch("queue.delivered"), fnBody("dismissStarvedToast"), fnBody("focusStarvedSeat")])
-      expect(part.includes("innerHTML")).toBe(false);
-  });
-  it("starvednotice 의 도우미를 import 한다", () => {
-    expect(code).toContain('import { starvedNotice, starvedShouldPop, starvedKeyHasHead, starvedPopAgeMs, starvedDismissId, surfaceIdOfRef, locateStarvedSeat } from "./starvednotice";');
+  it("S5 CHANGE-2 (s5_no_starved_ui_state_remains): starvednotice 모듈 import 제거 및 억제 상태 미존재", () => {
+    expect(code).not.toContain('from "./starvednotice"');
+    expect(code).not.toContain("starvedNotice");
+    expect(code).not.toContain("starvedLastKey");
+    expect(code).not.toContain("starvedLastPopAt");
+    expect(code).not.toContain("dismissStarvedToast");
+    expect(code).not.toContain("forgetStarvedHead");
+    expect(code).not.toContain("focusStarvedSeat");
+    expect(code).not.toContain("surfaceIdOfRef");
+    expect(code).not.toContain("locateStarvedSeat");
   });
 });
 
-describe("main.ts 배선 — 풀림(queue.delivered)·좌석 종료가 토스트를 거둔다", () => {
+describe("main.ts 배선 — 풀림(queue.delivered)·좌석 종료 (S5 CHANGE-2: dismissStarvedToast 제거)", () => {
   const src = read("./main.ts");
   const stripComments = (s: string): string =>
     s
@@ -747,31 +730,28 @@ describe("main.ts 배선 — 풀림(queue.delivered)·좌석 종료가 토스트
   };
   const handler = fnBody("onDaemonEvent");
 
-  it("queue.delivered: 같은 좌석의 토스트를 거두고 return(다른 처리 없음)", () => {
+  it("queue.delivered: 억제 상태가 제거되어 dismissStarvedToast 를 부르지 않고 return 만 수행한다", () => {
     expect(code.split('name === "queue.delivered"').length - 1).toBe(1);
     const i = handler.indexOf('if (name === "queue.delivered") {');
     expect(i).toBeGreaterThan(0);
     const b = handler.slice(i, handler.indexOf("\n  }\n", i) + 5);
-    expect(b).toContain("dismissStarvedToast(event.socket_slug, sid);");
+    expect(b).not.toContain("dismissStarvedToast");
     expect(/\n    return;\n  \}\n$/.test(b)).toBe(true);
     for (const other of ["toast(", "stickyToast(", "osBanner(", "refreshFeed(", "refreshSidebarStatus("])
       expect({ 금지: other, 있음: b.includes(other) }).toEqual({ 금지: other, 있음: false });
     expect(handler.indexOf('if (name === "queue.delivered") {')).toBeLessThan(handler.indexOf('if (category === "health") {'));
   });
-  it("surface.exited·closed·reaped: 기존 분기의 맨 앞(slug 미해석 조기 return 보다 앞)에서 거둔다 — 기존 줄은 그대로", () => {
+  it("surface.exited·closed·reaped: dismissStarvedToast 호출 없이 기존 deadPane 제거 로직만 보존된다", () => {
     const iExit = handler.indexOf('} else if (name === "surface.exited" || name === "surface.closed" || name === "surface.reaped") {');
     expect(iExit).toBeGreaterThan(0);
-    const iDismiss = handler.indexOf("dismissStarvedToast(event.socket_slug, sid);", iExit);
-    const iGuard = handler.indexOf("if (event.socket_slug && !sock) return;", iExit);
-    const iRemove = handler.indexOf('removeDeadPane(Number(sid), sock, name !== "surface.closed" && !isClosingSid(Number(sid), sock));', iExit);
-    expect({ 거둠: iDismiss > iExit, 조기_return_앞: iDismiss < iGuard, 제거_앞: iDismiss < iRemove }).toEqual({ 거둠: true, 조기_return_앞: true, 제거_앞: true });
+    const exitBlock = handler.slice(iExit, handler.indexOf("\n  }", iExit));
+    expect(exitBlock).not.toContain("dismissStarvedToast");
+    expect(exitBlock).toContain("removeDeadPane");
   });
-  it("dismissStarvedToast 는 starvednotice 가 정한 id 로 기존 dismissToast 를 부른다(id 모양의 진실원은 한 곳)", () => {
-    const b = fnBody("dismissStarvedToast");
-    expect(b).toContain("starvedDismissId(socketSlug, surfaceId)");
-    expect(b).toContain("if (id) { dismissToast(id); starvedLastKey.delete(id); starvedLastPopAt.delete(id); }");
-    expect(code.includes("`starved:")).toBe(false); // main.ts 가 id 모양을 따로 만들지 않는다
-    expect(code.includes('"starved:')).toBe(false);
+  it("dismissStarvedToast, forgetStarvedHead, focusStarvedSeat 함수 정의가 main.ts 에 존재하지 않는다", () => {
+    expect(code).not.toContain("function dismissStarvedToast");
+    expect(code).not.toContain("function forgetStarvedHead");
+    expect(code).not.toContain("function focusStarvedSeat");
   });
   it("백엔드 계약 — isBaseSlug 가 기대는 사실: attach_surface 의 이벤트 이름에 소켓 slug 가 들어 있고, 모든 이벤트의 socket_slug 는 같은 sock_slug 가 만든다(본부 포워더도 같다)", () => {
     const rs = read("../../src-tauri/src/main.rs");
@@ -785,26 +765,11 @@ describe("main.ts 배선 — 풀림(queue.delivered)·좌석 종료가 토스트
     const fwd = rs.slice(f, rs.indexOf("\n}\n", f));
     expect(fwd).toContain("let slug = sock_slug(&socket);");
     expect(fwd).toContain('obj.insert("socket_slug".into(), json!(slug));');
-    // 본부(기본) 소켓도 같은 포워더를 쓴다 — 그래서 본부 이벤트에도 slug 가 실리지만 socketForSlug(부서만 등록)에는 없다
     expect(rs).toContain("spawn_event_forwarder(handle.clone(), default_socket());");
-  });
-  it("focusStarvedSeat: 좌석 확정(locateStarvedSeat)이 없으면 return · 확정되면 jumpToSurface(그 소켓) — 호출 지점은 클릭 처리기 하나", () => {
-    const b = fnBody("focusStarvedSeat");
-    expect(b).toContain("await locateStarvedSeat(socketSlug, sid, {");
-    expect(b).toContain("deptSocket: (slug) => socketForSlug.get(slug),");
-    expect(b).toContain('invoke("attach_surface", { socket: null, surfaceId: id })');
-    expect(b).toContain("ev.output_event.includes(slug)");
-    expect(b).toContain("!w.pending && (w.socket ?? undefined) === socket && collectSids(w.tree).includes(id)");
-    const iNone = b.indexOf("if (!seat) return;");
-    const iCc = b.indexOf("if (ccOpen) setCcOpen(false);");
-    const iJump = b.indexOf("jumpToSurface(sid, seat.socket);");
-    expect({ 없으면_return: iNone > 0, 패널_닫기: iCc > iNone, 이동: iJump > iCc }).toEqual({ 없으면_return: true, 패널_닫기: true, 이동: true });
-    expect(b.split("jumpToSurface(").length - 1).toBe(1); // 번호만으로 고르는 다른 이동 경로 없음
-    expect(code.split("focusStarvedSeat(").length - 1).toBe(2); // 정의 1 + 클릭 처리기 1
   });
 });
 
-describe("main.ts 배선 — 이벤트 분기의 실제 본문을 대역 위에서 실행(문자열 핀을 우회하는 변형 차단)", () => {
+describe("main.ts 배선 — 이벤트 분기의 실제 본문을 대역 위에서 실행 (s5_queue_starved_renders_nothing)", () => {
   const src = read("./main.ts");
   const stripComments = (s: string): string =>
     s
@@ -819,7 +784,7 @@ describe("main.ts 배선 — 이벤트 분기의 실제 본문을 대역 위에�
   };
   type Call = { fn: string; args: unknown[] };
   /** 분기 본문을 그대로 실행한다 — 분기가 return 하면 undefined, 안 하고 지나가면 "fell-through". */
-  function run(evName: string, event: Record<string, unknown>, p: unknown, starvedLastKey = new Map<string, string>()): { ret: unknown; calls: Call[] } {
+  function run(evName: string, event: Record<string, unknown>, p: unknown): { ret: unknown; calls: Call[] } {
     const calls: Call[] = [];
     const rec = (fn: string) => (...args: unknown[]) => {
       calls.push({ fn, args });
@@ -827,11 +792,6 @@ describe("main.ts 배선 — 이벤트 분기의 실제 본문을 대역 위에�
     const deps = {
       starvedNotice,
       starvedShouldPop,
-      starvedLastKey,
-      starvedLastPopAt: new Map<string, { wall: number; mono: number }>(),
-      starvedPopAgeMs,
-      Date: { now: () => 0 },
-      performance: { now: () => 0 },
       surfaceIdOfRef,
       stickyToast: rec("stickyToast"),
       recordAlarm: rec("recordAlarm"),
@@ -847,74 +807,41 @@ describe("main.ts 배선 — 이벤트 분기의 실제 본문을 대역 위에�
     return { ret, calls };
   }
 
-  it("queue.starved(사람 조치 필요): stickyToast 1회(health·제목·상세) + OS 배너 1회(같은 제목·상세) · return · 이벤트 시점에 포커스 이동 0", () => {
+  it("queue.starved(사람 조치 필요): stickyToast 0회, osBanner 0회, recordAlarm 0회 · return 유지 · 포커스 이동 0", () => {
     const ev = { name: "queue.starved", socket_slug: "abc", surface_id: 12 };
     const { ret, calls } = run("queue.starved", ev, payload());
     expect(ret).toBeUndefined();
-    const n = starvedNotice(payload(), "abc")!;
-    expect(calls.map((c) => c.fn)).toEqual(["stickyToast", "osBanner"]);
-    expect(calls[0].args.slice(0, 4)).toEqual([n.id, "health", n.title, n.detail]);
-    expect(calls[1].args).toEqual([n.title, n.detail]);
-    expect(calls.filter((c) => c.fn === "focusStarvedSeat")).toEqual([]); // 자동 전환·포커스 강탈 없음
+    expect(calls).toEqual([]);
   });
-  it("누르면 그 좌석으로 — 클릭 처리기가 (slug, 번호) 로 focusStarvedSeat 를 부른다(클릭 전에는 0회)", () => {
-    const { calls } = run("queue.starved", { name: "queue.starved", socket_slug: "abc", surface_id: 12 }, payload());
-    const onClick = calls[0].args[4] as (() => void) | undefined;
-    expect(typeof onClick).toBe("function");
-    expect(calls.filter((c) => c.fn === "focusStarvedSeat").length).toBe(0);
-    (onClick as () => void)();
-    expect(calls.filter((c) => c.fn === "focusStarvedSeat").map((c) => c.args)).toEqual([["abc", 12]]);
-  });
-  it("calm 사유(approval·paused·wait): idle 토스트는 같은 제목의 구간당 1회, 이후 이력만 — OS 배너 0", () => {
+  it("calm 사유(approval·paused·wait): stickyToast 0회, recordAlarm 0회, osBanner 0회 · return 유지", () => {
     for (const code of ["approval", "paused", "wait"]) {
-      const starvedLastKey = new Map<string, string>();
       const ev = { name: "queue.starved", socket_slug: "abc", surface_id: 12 };
       const p = payload({ remedy_code: code });
-      const n = starvedNotice(p, "abc")!;
-      const { ret, calls } = run("queue.starved", ev, p, starvedLastKey);
-      expect({ 코드: code, 호출: calls.map((c) => c.fn), ret }).toEqual({ 코드: code, 호출: ["stickyToast"], ret: undefined });
-      expect(calls[0].args.slice(0, 4)).toEqual([n.id, "idle", n.title, n.detail]);
-      const again = run("queue.starved", ev, p, starvedLastKey);
-      expect({ 코드: code, 호출: again.calls.map((c) => c.fn), ret: again.ret }).toEqual({ 코드: code, 호출: ["recordAlarm"], ret: undefined });
-      expect(again.calls[0].args).toEqual(["idle", n.title, n.detail, n.id]);
+      const { ret, calls } = run("queue.starved", ev, p);
+      expect({ 코드: code, 호출: calls, ret }).toEqual({ 코드: code, 호출: [], ret: undefined });
     }
   });
-  // ★R2F-UI(A3 m1): 이름·기대를 고쳤다 — 종전 「구버전 payload(remedy_code 없음): 토스트 + OS 배너(모르면 알린다)」 는 기본 legacyPayload(blocked_by=`busy`)로 배너를 기대했다. 코드가 없는 payload 는 이제
-  //   막힘 사유로 가른다 — 스스로 풀리는 사유(busy)는 토스트만 · 사람 조치 사유(입력줄)는 종전처럼 토스트 + OS 배너.
-  it("구버전 payload(remedy_code 없음) · 사람 조치 사유(입력줄): 토스트 + OS 배너(모르면 알린다)", () => {
-    const { calls } = run("queue.starved", { name: "queue.starved", surface_id: 3 }, legacyPayload({ blocked_by: "input_pending(입력줄에 미제출 입력)" }));
-    expect(calls.map((c) => c.fn)).toEqual(["stickyToast", "osBanner"]);
-    expect(calls[0].args[0]).toBe("starved:base:surface:3"); // socket_slug 없음 → base
-    expect(calls[0].args[3]).toBe("10분째 · 막힘 사유: input_pending(입력줄에 미제출 입력)");
+  it("구버전 payload(remedy_code 없음) · 사람 조치 사유: stickyToast 0회, osBanner 0회 · return 유지", () => {
+    const { ret, calls } = run("queue.starved", { name: "queue.starved", surface_id: 3 }, legacyPayload({ blocked_by: "input_pending(입력줄에 미제출 입력)" }));
+    expect(ret).toBeUndefined();
+    expect(calls).toEqual([]);
   });
-  it("★R2F-UI(A3 m1) 구버전 payload(remedy_code 없음) · 스스로 풀리는 사유(busy)·승인 대기·일시정지: 토스트만 — OS 배너 0(좌석당 5분 간격 배너가 고우선 통로를 묽히던 것)", () => {
+  it("구버전 payload(remedy_code 없음) · 스스로 풀리는 사유(busy): stickyToast 0회, osBanner 0회 · return 유지", () => {
     for (const reason of ["busy", "busy(출력 중)", "approval_pending(승인·관문 대기)", "queue_paused(헬스 조치)", "paused(kill-switch 동결)", "human_typing(사람이 입력 중)"]) {
       const { ret, calls } = run("queue.starved", { name: "queue.starved", surface_id: 3 }, legacyPayload({ blocked_by: reason }));
-      expect({ 사유: reason, 호출: calls.map((c) => c.fn), ret }).toEqual({ 사유: reason, 호출: ["stickyToast"], ret: undefined });
-      expect(calls[0].args[1]).toBe("idle");
-      expect(calls[0].args[3]).toBe(`10분째 · 대기 사유: ${reason}`); // 구간의 첫 대기 토스트
+      expect({ 사유: reason, 호출: calls, ret }).toEqual({ 사유: reason, 호출: [], ret: undefined });
     }
   });
-  it("socket_slug 가 문자열이 아니면 클릭 처리기는 빈 slug(= 본부)로 부른다", () => {
-    const { calls } = run("queue.starved", { name: "queue.starved", socket_slug: 77, surface_id: 3 }, legacyPayload());
-    (calls[0].args[4] as () => void)();
-    expect(calls.filter((c) => c.fn === "focusStarvedSeat").map((c) => c.args)).toEqual([["", 3]]);
-  });
-  it("잘못된 payload: 아무것도 띄우지 않지만 분기는 return 한다(폴백으로 새지 않는다)", () => {
+  it("잘못된 payload: 아무것도 띄우지 않고 분기는 return 한다", () => {
     for (const bad of [null, undefined, "x", 7, [], {}, { surface_ref: "surface:abc" }, { surface_ref: 12 }]) {
       const { ret, calls } = run("queue.starved", { name: "queue.starved", socket_slug: "abc", surface_id: 12 }, bad);
       expect({ payload: JSON.stringify(bad) ?? "undefined", 호출: calls.length, ret }).toEqual({ payload: JSON.stringify(bad) ?? "undefined", 호출: 0, ret: undefined });
     }
   });
-  it("번호를 정수로 못 읽는 surface_ref(20자리)는 토스트는 띄우되 클릭 처리기를 달지 않는다", () => {
-    const { calls } = run("queue.starved", { name: "queue.starved", socket_slug: "abc" }, payload({ surface_ref: "surface:" + "9".repeat(20) }));
-    expect(calls[0].fn).toBe("stickyToast");
-    expect(calls[0].args[4]).toBeUndefined();
-  });
-  it("queue.delivered: (slug, 좌석 번호)로 거두고 return — 토스트·배너를 새로 띄우지 않는다", () => {
+  it("queue.delivered: return 유지 — 토스트·배너를 새로 띄우지 않고 dismissStarvedToast 호출 0", () => {
     const { ret, calls } = run("queue.delivered", { name: "queue.delivered", socket_slug: "abc", surface_id: 12 }, { surface_ref: "surface:12" });
     expect(ret).toBeUndefined();
-    expect(calls).toEqual([{ fn: "dismissStarvedToast", args: ["abc", 12] }]);
+    expect(calls).toEqual([]);
   });
 });
 

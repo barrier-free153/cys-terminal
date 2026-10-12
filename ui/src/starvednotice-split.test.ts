@@ -190,7 +190,7 @@ describe("0.14.48 D — starvedShouldPop(구간당 1회) 순수 표", () => {
   });
 });
 
-describe("0.14.48 D — main.ts 배선: 분기 인자 실행 검증(판정 조건 ①~⑥)", () => {
+describe("S5 CHANGE-1 · CHANGE-2 — main.ts 배선 (s5_queue_starved_renders_nothing · s5_no_starved_ui_state_remains)", () => {
   const src = read("./main.ts");
   const strip = (s: string): string => s.split("\n").map((l) => (l.trimStart().startsWith("//") ? "" : l.replace(/\s\/\/.*$/, ""))).join("\n");
   const code = strip(src);
@@ -199,344 +199,100 @@ describe("0.14.48 D — main.ts 배선: 분기 인자 실행 검증(판정 조�
     expect(i >= 0).toBe(true);
     return code.slice(i, code.indexOf("\n  }\n", i) + 5);
   })();
-  const dismissFn = (() => {
-    const i = code.indexOf("function dismissStarvedToast(");
-    expect(i >= 0).toBe(true);
-    // new Function 은 JS 만 받으므로 타입 표기(: unknown / : void)만 걷어 낸다 — 본문은 한 글자도 안 바꾼다.
-    return code.slice(i, code.indexOf("\n}\n", i) + 3).replace("(socketSlug: unknown, surfaceId: unknown): void", "(socketSlug, surfaceId)");
-  })();
+
   type Call = { fn: string; args: unknown[] };
-  /** 한 시나리오 = 하나의 맵·호출 기록. fire = queue.starved 분기 실행, delivered = queue.delivered/좌석 종료가 부르는 dismissStarvedToast 실행. */
   function scenario() {
     const calls: Call[] = [];
     const rec = (fn: string) => (...args: unknown[]) => void calls.push({ fn, args });
-    const starvedLastKey = new Map<string, string>();
     const deps = {
-      starvedNotice, surfaceIdOfRef, starvedShouldPop, starvedLastKey, starvedLastPopAt: new Map<string, { wall: number; mono: number }>(), starvedPopAgeMs, Date: { now: () => 0 }, performance: { now: () => 0 }, starvedDismissId,
-      stickyToast: rec("stickyToast"), osBanner: rec("osBanner"), recordAlarm: rec("recordAlarm"), focusStarvedSeat: rec("focusStarvedSeat"), dismissToast: rec("dismissToast"),
+      stickyToast: rec("stickyToast"),
+      osBanner: rec("osBanner"),
+      recordAlarm: rec("recordAlarm"),
+      toast: rec("toast"),
+      focusStarvedSeat: rec("focusStarvedSeat"),
+      dismissToast: rec("dismissToast"),
     };
     const fireFn = new Function("deps", "name", "event", "payload", "sid", `with (deps) {\n${branch}\n}\nreturn "fell-through";`) as (...a: unknown[]) => unknown;
-    const dismissRun = new Function("deps", "slug", "sid", `with (deps) {\n${dismissFn}\n dismissStarvedToast(slug, sid);\n}`) as (...a: unknown[]) => unknown;
     return {
-      calls, starvedLastKey,
-      fire: (p: unknown, slug = "abc") => { expect(fireFn(deps, "queue.starved", { name: "queue.starved", socket_slug: slug, surface_id: 12 }, p, 12)).toBeUndefined(); },
-      delivered: (slug = "abc", sid = 12) => dismissRun(deps, slug, sid),
+      calls,
+      fire: (p: unknown, slug = "abc", sid = 12) => fireFn(deps, "queue.starved", { name: "queue.starved", socket_slug: slug, surface_id: sid }, p, sid),
       count: (fn: string) => calls.filter((c) => c.fn === fn).length,
-      last: (fn: string) => calls.filter((c) => c.fn === fn).slice(-1)[0],
     };
   }
 
-  it("소스 핀: 분기에 「health」 리터럴 0 · 배너 줄은 원문 그대로 · 마지막 제목 맵 사용 · return 으로 끝남", () => {
-    expect(branch).not.toContain('"health"');
-    expect(branch).toContain("if (starved.humanNeeded) osBanner(starved.title, starved.detail);");
-    expect(branch).toContain("starvedLastKey");
-    expect(branch).toContain("starvedShouldPop(");
-    expect(branch).toContain("recordAlarm(");
+  it("s5_no_starved_ui_state_remains: CHANGE-2 식별자 0건 · module import 부재", () => {
+    // CHANGE-2 식별자 목록 (08-removal-ripple.md O1-O3)
+    const forbidden = [
+      'from "./starvednotice"',
+      "starvedLastKey",
+      "starvedLastPopAt",
+      "dismissStarvedToast",
+      "forgetStarvedHead",
+      "focusStarvedSeat",
+      "starvedNotice",
+      "starvedShouldPop",
+      "starvedKeyHasHead",
+      "starvedPopAgeMs",
+      "starvedDismissId",
+      "surfaceIdOfRef",
+      "locateStarvedSeat",
+    ];
+    for (const id of forbidden) {
+      expect({ id, exists: code.includes(id) }).toEqual({ id, exists: false });
+    }
+  });
+
+  it("소스 핀: queue.starved 분기에서 stickyToast, osBanner, recordAlarm 0건 · return 으로 끝남", () => {
+    expect(branch).not.toContain("stickyToast");
+    expect(branch).not.toContain("osBanner");
+    expect(branch).not.toContain("recordAlarm");
+    expect(branch).not.toContain("toast");
     expect(/\n    return;\n  \}\n$/.test(branch)).toBe(true);
-    expect(dismissFn).toContain("starvedLastKey.delete(");
   });
-  it("③ 같은 기다림 2회: 팝업 1회 + 이력 직접 기록 1회, 구간 끝(delivered) 뒤 다시 1회 팝업", () => {
-    const s = scenario();
-    s.fire(mk("wait")); s.fire(mk("wait", { waited_secs: 1020 }));
-    expect({ 팝업: s.count("stickyToast"), 이력직접: s.count("recordAlarm"), 배너: s.count("osBanner") }).toEqual({ 팝업: 1, 이력직접: 1, 배너: 0 });
-    s.delivered();
-    s.fire(mk("wait", { waited_secs: 1320 }));
-    expect(s.count("stickyToast")).toBe(2);
-    expect(s.last("stickyToast")!.args.slice(1, 3)).toEqual(["idle", T_WAIT]);
-  });
-  it("④ 알람 이력은 발화마다: 기다림 5회 = (팝업 1회 안의 기록) + 직접 기록 4회 — 조용해지는 것은 팝업뿐", () => {
-    const s = scenario();
-    for (let k = 0; k < 5; k++) s.fire(mk("wait", { waited_secs: 600 + 300 * k }));
-    expect({ 팝업: s.count("stickyToast"), 직접기록: s.count("recordAlarm") }).toEqual({ 팝업: 1, 직접기록: 4 });
-    const lastRec = s.last("recordAlarm")!.args;
-    expect(lastRec[0]).toBe("idle");
-    expect(lastRec[1]).toBe(T_WAIT);
-    expect(String(lastRec[2])).toContain("분째");
-    expect(lastRec[3]).toBe("starved:abc:surface:12");
-  });
-  it("① 기다림 → 사람 손(stale_screen 승격 포함): 그 즉시 빨강 팝업 + OS 배너 — 억제가 삼키지 않는다", () => {
-    for (const humanCode of [...STARVED_HUMAN_CODES]) {
+
+  it("s5_queue_starved_renders_nothing: 사람 손 11종 payload 에서 렌더링 0건 · return", () => {
+    for (const code of STARVED_HUMAN_CODES) {
       const s = scenario();
-      s.fire(mk("wait")); s.fire(mk("wait", { waited_secs: 900 }));
-      const before = s.count("stickyToast");
-      s.fire(mk(humanCode, { waited_secs: 1200 }));
-      expect({ 코드: humanCode, 팝업증가: s.count("stickyToast") - before, 배너: s.count("osBanner") }).toEqual({ 코드: humanCode, 팝업증가: 1, 배너: 1 });
-      expect(s.last("stickyToast")!.args.slice(1, 3)).toEqual(["health", HUMAN_TITLE]);
+      const ret = s.fire(mk(code, { waited_secs: 1200 }));
+      expect({ code, ret, calls: s.calls.length }).toEqual({ code, ret: undefined, calls: 0 });
     }
-    const s = scenario(); // stale_screen 승격 모양(busy 정적) — 코드 stale_screen
-    s.fire(mk("wait")); s.fire(mk("stale_screen", { blocked_by: "busy(출력 중)" }));
-    expect(s.last("stickyToast")!.args.slice(1, 3)).toEqual(["health", HUMAN_TITLE]);
-    expect(s.count("osBanner")).toBe(1);
   });
-  it("② 사람 손 → 기다림: 같은 id 로 회색 1회(빨강을 대체) · 배너 추가 0", () => {
-    const s = scenario();
-    s.fire(mk("answer_modal"));
-    expect({ 팝업: s.count("stickyToast"), 배너: s.count("osBanner") }).toEqual({ 팝업: 1, 배너: 1 });
-    s.fire(mk("wait", { waited_secs: 900 }));
-    expect({ 팝업: s.count("stickyToast"), 배너: s.count("osBanner") }).toEqual({ 팝업: 2, 배너: 1 });
-    const a = s.last("stickyToast")!.args;
-    expect(a[0]).toBe("starved:abc:surface:12");
-    expect(a.slice(1, 3)).toEqual(["idle", T_WAIT]);
-    s.fire(mk("wait", { waited_secs: 1200 })); // 이어서 같은 기다림은 다시 억제
-    expect(s.count("stickyToast")).toBe(2);
-  });
-  it("기다림 종류가 바뀌면(wait → approval → paused) 제목이 달라 매번 1회 팝업", () => {
-    const s = scenario();
-    s.fire(mk("wait")); s.fire(mk("approval", { waited_secs: 900 })); s.fire(mk("paused", { waited_secs: 1200 })); s.fire(mk("paused", { waited_secs: 1500 }));
-    expect(s.calls.filter((c) => c.fn === "stickyToast").map((c) => c.args[2])).toEqual([T_WAIT, T_APPROVAL, T_PAUSED]);
-    expect(s.count("recordAlarm")).toBe(1);
-  });
-  it("⑤ 사람 손 11종 × 연속 3회: 매번 빨강 팝업 + 배너(5분 재팝업 무변경)", () => {
-    for (const humanCode of STARVED_HUMAN_CODES) {
+
+  it("s5_queue_starved_renders_nothing: calm 3종 payload 에서 렌더링 0건 · return", () => {
+    for (const code of STARVED_CALM_CODES) {
       const s = scenario();
-      for (let k = 0; k < 3; k++) s.fire(mk(humanCode, { waited_secs: 600 + 300 * k }));
-      expect({ 코드: humanCode, 팝업: s.count("stickyToast"), 배너: s.count("osBanner"), 직접이력: s.count("recordAlarm") }).toEqual({ 코드: humanCode, 팝업: 3, 배너: 3, 직접이력: 0 });
-      expect(s.calls.filter((c) => c.fn === "stickyToast").every((c) => c.args[1] === "health" && c.args[2] === HUMAN_TITLE)).toBe(true);
+      const ret = s.fire(mk(code, { waited_secs: 1800 }));
+      expect({ code, ret, calls: s.calls.length }).toEqual({ code, ret: undefined, calls: 0 });
     }
   });
-  it("⑥ CEO 실제 표본 — surface:72 · modal_pending · 3,921초(answer_modal): 12회 발화 전부 빨강 팝업 + 배너, 수정 전과 같은 제목", () => {
+
+  it("s5_queue_starved_renders_nothing: 반복 발화 5회에서도 렌더링 0건 · return", () => {
     const s = scenario();
-    const secs = Array.from({ length: 11 }, (_, k) => 600 + 300 * k).concat([3921]); // 600…3600(11회) + 3921 = 12회
-    expect(secs.length).toBe(12);
-    for (const w of secs) {
-      s.fire({ surface_ref: "surface:72", role: "worker", head_entry_id: "q-72", waited_secs: w, depth: 2, blocked_by: "modal_pending(모달·선택기 전경)", remedy_code: "answer_modal", remedy: "질문·선택 창이 떠 있다 — 사람이 답한다" + TAIL });
+    for (let k = 0; k < 5; k++) {
+      const ret = s.fire(mk("wait", { waited_secs: 600 + 300 * k }));
+      expect(ret).toBeUndefined();
     }
-    expect({ 팝업: s.count("stickyToast"), 배너: s.count("osBanner"), 직접이력: s.count("recordAlarm") }).toEqual({ 팝업: 12, 배너: 12, 직접이력: 0 });
-    for (const c of s.calls.filter((c) => c.fn === "stickyToast")) {
-      expect(c.args[0]).toBe("starved:abc:surface:72");
-      expect(c.args[1]).toBe("health");
-      expect(c.args[2]).toBe("⏳ 큐 막힘 — worker surface:72");
-    }
-    expect(s.last("stickyToast")!.args[3]).toBe("66분째 · 질문·선택 창이 떠 있다 — 사람이 답한다"); // v0.14.47 실출력
-  });
-  it("두 데몬(slug)의 같은 번호 좌석은 구간이 독립이다 — 한쪽 억제가 다른 쪽 첫 팝업을 막지 않는다", () => {
-    const s = scenario();
-    s.fire(mk("wait"), "abc"); s.fire(mk("wait"), "xyz");
-    expect(s.count("stickyToast")).toBe(2);
-    s.fire(mk("wait", { waited_secs: 900 }), "abc"); s.fire(mk("wait", { waited_secs: 900 }), "xyz");
-    expect({ 팝업: s.count("stickyToast"), 직접이력: s.count("recordAlarm") }).toEqual({ 팝업: 2, 직접이력: 2 });
-    s.delivered("abc");
-    s.fire(mk("wait", { waited_secs: 1200 }), "abc"); s.fire(mk("wait", { waited_secs: 1200 }), "xyz");
-    expect(s.count("stickyToast")).toBe(3); // abc 만 새 구간
-  });
-  it("좌석 종료(surface.exited/closed)도 같은 dismissStarvedToast 를 부른다 — 소스 핀", () => {
-    const exits = code.match(/dismissStarvedToast\(event\.socket_slug, sid\);/g) ?? [];
-    expect(exits.length).toBeGreaterThanOrEqual(2); // queue.delivered 분기 + 좌석 종료 분기
-  });
-  it("잘못된 payload 는 아무것도 부르지 않지만 분기는 return 한다", () => {
-    const s = scenario();
-    for (const bad of [null, undefined, "x", 7, [], {}, { surface_ref: "surface:abc" }]) s.fire(bad);
     expect(s.calls.length).toBe(0);
   });
 
-// ★0.14.48 D F1(REFLECT-D-impl-3): 구간의 정체 = (제목, head_entry_id). 배달 없이 끝난 구간(dropped·expired·clear·이벤트 유실) 뒤의 새 머리는 새 구간이다.
-describe("0.14.48 D F1 — 머리 항목(head_entry_id)으로 구간을 가른다", () => {
-  const h = (id: unknown, o: Record<string, unknown> = {}) => mk("wait", { head_entry_id: id, ...o });
-  it("① 머리가 X→Y 로 바뀌면(종료 이벤트 없이도) 새 구간 — 첫 팝업 다시 1회", () => {
+  it("s5_queue_starved_renders_nothing: CEO 실제 표본(12회 발화 modal_pending)에서도 렌더링 0건", () => {
     const s = scenario();
-    s.fire(h("q-1")); s.fire(h("q-2"));
-    expect(s.count("stickyToast")).toBe(2);
-    expect(s.count("recordAlarm")).toBe(0);
-  });
-  it("② 같은 머리의 반복은 계속 억제 — 3회 = 팝업 1 + 직접 기록 2", () => {
-    const s = scenario();
-    for (let k = 0; k < 3; k++) s.fire(h("q-1", { waited_secs: 700 + 300 * k }));
-    expect({ 팝업: s.count("stickyToast"), 직접기록: s.count("recordAlarm") }).toEqual({ 팝업: 1, 직접기록: 2 });
-  });
-  it("③ 꼬리 항목 폐기 대조군: 머리가 그대로면(depth 만 줄어도) 억제 유지 — 좌석 단위 reset 이 아니다", () => {
-    const s = scenario();
-    s.fire(h("q-1", { depth: 3 })); s.fire(h("q-1", { depth: 2, waited_secs: 1020 }));
-    expect({ 팝업: s.count("stickyToast"), 직접기록: s.count("recordAlarm") }).toEqual({ 팝업: 1, 직접기록: 1 });
-  });
-  it("④ 머리가 없는 구판 payload 끼리는 기존 동작(제목 비교) — 반복 억제", () => {
-    const s = scenario();
-    s.fire(mk("wait")); s.fire(mk("wait", { waited_secs: 1020 }));
-    expect(s.count("stickyToast")).toBe(1);
-  });
-  it("⑤ 머리 유무가 섞이면(못 가르면) 다시 띄운다 — 양방향", () => {
-    const a = scenario();
-    a.fire(mk("wait")); a.fire(h("q-1"));
-    expect(a.count("stickyToast")).toBe(2);
-    const b = scenario();
-    b.fire(h("q-1")); b.fire(mk("wait"));
-    expect(b.count("stickyToast")).toBe(2);
-  });
-  it("⑥ 쓸 수 없는 머리 값(빈 문자열·숫자·객체·null)은 없는 것으로 본다", () => {
-    for (const bad of ["", "   ", 7, {}, [], null]) {
-      const n = starvedNotice(h(bad), "abc")!;
-      expect({ bad, key: n.stateKey }).toEqual({ bad, key: n.title });
+    const secs = Array.from({ length: 11 }, (_, k) => 600 + 300 * k).concat([3921]);
+    for (const w of secs) {
+      const ret = s.fire({ surface_ref: "surface:72", role: "worker", head_entry_id: "q-72", waited_secs: w, depth: 2, blocked_by: "modal_pending(모달·선택기 전경)", remedy_code: "answer_modal", remedy: "질문·선택 창이 떠 있다 — 사람이 답한다" + TAIL });
+      expect(ret).toBeUndefined();
     }
-    expect(starvedNotice(h("q-1"), "abc")!.stateKey).not.toBe(starvedNotice(h("q-2"), "abc")!.stateKey);
+    expect(s.calls.length).toBe(0);
   });
-  it("⑦ 사람 손은 머리와 무관하게 매번 팝업+배너 — 11종 약화 없음", () => {
-    const s = scenario();
-    s.fire(mk("stale_screen", { head_entry_id: "q-1" })); s.fire(mk("stale_screen", { head_entry_id: "q-1" }));
-    expect({ 팝업: s.count("stickyToast"), 배너: s.count("osBanner") }).toEqual({ 팝업: 2, 배너: 2 });
-  });
-  it("⑧ 배달(delivered) 뒤 같은 머리 id 가 다시 와도 새 구간 1회 — 기존 종료 규칙 유지", () => {
-    const s = scenario();
-    s.fire(h("q-1")); s.delivered(); s.fire(h("q-1"));
-    expect(s.count("stickyToast")).toBe(2);
-  });
-  it("⑨ 소스 핀: 맵에는 제목이 아니라 stateKey 를 넣는다", () => {
-    expect(read("./main.ts")).toContain("starvedLastKey.set(starved.id, starved.stateKey);");
-  });
-});
 
-// ★0.14.48 D F1-R(REFLECT-D-impl-4, reviewer-codex r2): 같은 id 가 만료 → 되살림으로 다시 활성이 되는 경우의 새 구간 + 이벤트 유실 상한.
-describe("0.14.48 D F1-R — 만료·되살림(같은 머리 id)과 억제 상한", () => {
-  const MIN = 60_000;
-  const forgetFn = (() => {
-    const i = code.indexOf("function forgetStarvedHead(");
-    if (i < 0) return "";
-    return code.slice(i, code.indexOf("\n}\n", i) + 3).replace("(socketSlug: unknown, surfaceId: unknown, entryId: unknown): void", "(socketSlug, surfaceId, entryId)");
-  })();
-  const evBranch = (() => {
-    const i = code.indexOf('  if (name === "queue.expired" || name === "queue.revived") {');
-    return i < 0 ? "" : code.slice(i, code.indexOf("\n  }\n", i) + 5);
-  })();
-  /** 앱 한 개: 맵 둘 + 시계. starved/expired/revived/dropped 이벤트를 앱 분기 본문으로 흘린다(분기가 소스에 없으면 그 이벤트는 무시 = 지금의 앱). */
-  function app() {
-    const calls: Call[] = [];
-    const rec = (fn: string) => (...args: unknown[]) => void calls.push({ fn, args });
-    const starvedLastKey = new Map<string, string>();
-    const starvedLastPopAt = new Map<string, number>();
-    let wall = 1_000_000; // 벽시계(Date.now) — 조정·절전으로 뛰거나 거꾸로 갈 수 있다
-    let mono = 5_000; // 단조 시계(performance.now) — 벽시계 조정의 영향을 받지 않는다
-    const deps = {
-      starvedNotice, surfaceIdOfRef, starvedShouldPop, starvedKeyHasHead, starvedPopAgeMs, starvedLastKey, starvedLastPopAt, starvedDismissId,
-      Date: { now: () => wall }, performance: { now: () => mono },
-      stickyToast: rec("stickyToast"), osBanner: rec("osBanner"), recordAlarm: rec("recordAlarm"), focusStarvedSeat: rec("focusStarvedSeat"), dismissToast: rec("dismissToast"),
-    };
-    const run = (src: string, name: string, event: unknown, payload: unknown, sid: number) =>
-      new Function("deps", "name", "event", "payload", "sid", `with (deps) {\n${forgetFn}\n${dismissFn}\n${src}\n}\nreturn "fell-through";`)(deps, name, event, payload, sid);
-    const send = (name: string, payload: Record<string, unknown>, slug = "abc", sid = 12) => {
-      const event = { name, socket_slug: slug, surface_id: sid };
-      if (name === "queue.starved") run(branch, name, event, payload, sid);
-      else if ((name === "queue.expired" || name === "queue.revived") && evBranch) run(evBranch, name, event, payload, sid);
-    };
-    return {
-      calls, starvedLastKey, starvedLastPopAt,
-      at: (ms: number) => { wall = 1_000_000 + ms; mono = 5_000 + ms; },
-      /** 시계를 따로 움직인다: 벽시계·단조 시계가 처음(at(0))보다 각각 몇 ms 뒤인가(음수 = 벽시계 역행). */
-      clocks: (wallMs: number, monoMs: number) => { wall = 1_000_000 + wallMs; mono = 5_000 + monoMs; },
-      wait: (id: unknown, slug = "abc") => send("queue.starved", mk("wait", { head_entry_id: id }), slug),
-      expired: (id: string, slug = "abc") => send("queue.expired", { surface_ref: "surface:12", queue_entry_id: id }, slug),
-      revived: (id: string, slug = "abc") => send("queue.revived", { surface_ref: "surface:12", queue_entry_id: id, already_active: false }, slug),
-      dropped: (ids: string[], slug = "abc") => send("queue.dropped", { reason: "cleared", queue_entry_ids: ids }, slug),
-      human: (id: unknown, slug = "abc") => send("queue.starved", mk("stale_screen", { head_entry_id: id }), slug),
-      pops: () => calls.filter((c) => c.fn === "stickyToast").length,
-      banners: () => calls.filter((c) => c.fn === "osBanner").length,
-    };
-  }
-  it("① wait(X) → expired(X) → revived(X) → wait(X): 새 활성 구간이라 첫 팝업 다시 1회(codex 가 돌린 순서 그대로)", () => {
-    const a = app();
-    a.wait("q-1"); a.expired("q-1"); a.revived("q-1"); a.wait("q-1");
-    expect(a.pops()).toBe(2);
+  it("s5_queue_starved_renders_nothing: 잘못된 payload 에서도 조기 return", () => {
+    for (const bad of [null, undefined, "x", 7, [], {}, { surface_ref: "surface:abc" }]) {
+      const s = scenario();
+      const ret = s.fire(bad);
+      expect(ret).toBeUndefined();
+      expect(s.calls.length).toBe(0);
+    }
   });
-  it("② expired(X) 만으로도 그 머리의 기억이 지워지고, revived(X) 만으로도(만료 이벤트를 잃은 경우) 지워진다", () => {
-    const a = app();
-    a.wait("q-1");
-    expect(a.starvedLastKey.size).toBe(1);
-    a.expired("q-1");
-    expect(a.starvedLastKey.size).toBe(0);
-    const b = app();
-    b.wait("q-1"); b.revived("q-1"); b.wait("q-1");
-    expect(b.pops()).toBe(2);
-  });
-  it("③ 대조군: 꼬리 Z 폐기(queue.dropped)·다른 항목 Z 의 만료/되살림은 머리 X 의 기억을 지우지 않는다 — 팝업 1회", () => {
-    const a = app();
-    a.wait("q-1"); a.dropped(["q-9"]); a.expired("q-9"); a.revived("q-9"); a.wait("q-1");
-    expect(a.pops()).toBe(1);
-  });
-  it("④ 다른 소켓(부서)·다른 좌석의 같은 id 사건은 건드리지 않는다", () => {
-    const a = app();
-    a.wait("q-1"); a.expired("q-1", "zzz"); a.wait("q-1");
-    expect(a.pops()).toBe(1);
-  });
-  it("⑤ 이벤트를 모두 잃어도 상한이 있다: 마지막 팝업 뒤 59분 59초는 억제 · 60분부터는 다시 띄운다(조용해지는 쪽으로 무한히 떨어지지 않는다)", () => {
-    const a = app();
-    a.wait("q-1");
-    a.at(60 * MIN - 1000); a.wait("q-1");
-    expect(a.pops()).toBe(1);
-    a.at(60 * MIN); a.wait("q-1");
-    expect(a.pops()).toBe(2);
-    a.at(60 * MIN + 5000); a.wait("q-1"); // 다시 띄운 시각이 새 기준이다
-    expect(a.pops()).toBe(2);
-  });
-  it("⑥ 억제된 갱신은 팝업 시각을 갱신하지 않는다(상한이 흘러간다) · 사람 손은 머리·시계와 무관하게 매번 팝업+배너", () => {
-    const a = app();
-    a.wait("q-1");
-    a.at(30 * MIN); a.wait("q-1");
-    expect(a.starvedLastPopAt.get("starved:abc:surface:12")).toEqual({ wall: 1_000_000, mono: 5_000 });
-    const h = app();
-    h.wait("q-1");
-    for (let k = 1; k <= 3; k++) { h.at(k * 1000); h.human("q-1"); }
-    expect({ 팝업: h.pops(), 배너: h.banners() }).toEqual({ 팝업: 4, 배너: 3 });
-  });
-  it("⑦ 순수: starvedShouldPop(키, 알림, 나이) 표 · starvedKeyHasHead", () => {
-    const n = starvedNotice(mk("wait", { head_entry_id: "q-1" }), "abc")!;
-    expect(starvedShouldPop(n.stateKey, n)).toBe(false);
-    expect(starvedShouldPop(n.stateKey, n, 0)).toBe(false);
-    expect(starvedShouldPop(n.stateKey, n, STARVED_REPOP_MS - 1)).toBe(false);
-    expect(starvedShouldPop(n.stateKey, n, STARVED_REPOP_MS)).toBe(true);
-    const hum = starvedNotice(mk("stale_screen", { head_entry_id: "q-1" }), "abc")!;
-    expect(starvedShouldPop(hum.stateKey, hum, 0)).toBe(true);
-    expect(starvedKeyHasHead(n.stateKey, "q-1")).toBe(true);
-    expect(starvedKeyHasHead(n.stateKey, "q-2")).toBe(false);
-    expect(starvedKeyHasHead(n.stateKey, "q-")).toBe(false);
-    expect(starvedKeyHasHead(undefined, "q-1")).toBe(false);
-    expect(starvedKeyHasHead(n.stateKey, 7)).toBe(false);
-    expect(starvedKeyHasHead(n.stateKey, "")).toBe(false);
-    const noHead = starvedNotice(mk("wait"), "abc")!;
-    expect(starvedKeyHasHead(noHead.stateKey, "q-1")).toBe(false);
-  });
-  it("⑧ 소스 핀: 만료·되살림 분기는 return 하지 않고(다른 처리 보존) forgetStarvedHead 만 부른다", () => {
-    expect(evBranch).toContain("forgetStarvedHead(event.socket_slug, sid, payload.queue_entry_id);");
-    expect(/\n    return;\n  \}\n$/.test(evBranch)).toBe(false);
-  });
-  // ── F1-T (reviewer-codex r3): 상한은 벽시계만 믿지 않는다 ──
-  it("F1-T ① 벽시계가 20분 거꾸로 간 뒤에도 상한은 실제 60분: 실제 59분(벽 39분)은 억제 · 실제 60분(벽 40분)은 다시 띄움", () => {
-    const a = app();
-    a.wait("q-1");
-    a.clocks(-20 * MIN + 59 * MIN, 59 * MIN); a.wait("q-1");
-    expect(a.pops()).toBe(1);
-    a.clocks(-20 * MIN + 60 * MIN, 60 * MIN); a.wait("q-1");
-    expect(a.pops()).toBe(2);
-  });
-  it("F1-T ② 지금이 마지막 팝업 시각보다 과거이면(벽 역행이 팝업 시각 아래로 내려감) 상한에 닿은 것으로 본다 — 모르면 다시 띄운다", () => {
-    const a = app();
-    a.at(10 * MIN); a.wait("q-1");
-    a.clocks(5 * MIN, 12 * MIN); a.wait("q-1"); // 벽시계 5분 < 팝업 때 10분, 단조는 2분만 지남
-    expect(a.pops()).toBe(2);
-  });
-  it("F1-T ③ 절전에서 깨어나 벽시계만 크게 앞으로 뛰어도(단조 시계는 거의 안 감) 상한 도달로 처리한다", () => {
-    const a = app();
-    a.wait("q-1");
-    a.clocks(3 * 60 * MIN, 5 * MIN); a.wait("q-1");
-    expect(a.pops()).toBe(2);
-  });
-  it("F1-T ④ 두 시계가 함께 정상이면 59분은 억제 · 같은 구간의 갱신은 그대로 이력만", () => {
-    const a = app();
-    a.wait("q-1");
-    a.at(59 * MIN); a.wait("q-1");
-    expect(a.pops()).toBe(1);
-  });
-  it("F1-T ⑤ 순수: starvedPopAgeMs — 정상이면 두 경과 중 큰 쪽 · 어느 한쪽이 음수이거나 숫자가 아니면 무한대(다시 띄운다)", () => {
-    expect(starvedPopAgeMs(1_000 + 30, 1_000, 5_000 + 10, 5_000)).toBe(30);
-    expect(starvedPopAgeMs(1_000 + 10, 1_000, 5_000 + 30, 5_000)).toBe(30);
-    expect(starvedPopAgeMs(900, 1_000, 5_010, 5_000)).toBe(Infinity);
-    expect(starvedPopAgeMs(1_010, 1_000, 4_900, 5_000)).toBe(Infinity);
-    expect(starvedPopAgeMs(NaN, 1_000, 5_010, 5_000)).toBe(Infinity);
-    expect(starvedPopAgeMs(1_010, 1_000, 5_010, undefined as unknown as number)).toBe(Infinity);
-  });
-  it("F1-T ⑥ 사람 손 11종은 시계와 무관하게 매번 팝업+배너(상한 변경이 건드리지 않는다)", () => {
-    const h = app();
-    h.wait("q-1");
-    h.clocks(-30 * MIN, 1000); h.human("q-1"); h.clocks(5 * MIN, 2000); h.human("q-1");
-    expect({ 팝업: h.pops(), 배너: h.banners() }).toEqual({ 팝업: 3, 배너: 2 });
-  });
-});
 });
 
 describe("0.14.48 D — 등급은 기존 토스트 등급 중 하나", () => {
