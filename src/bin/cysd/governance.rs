@@ -159,6 +159,9 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
         let mut queue_starve_alerted: HashMap<u64, f64> = HashMap::new();
         // ★(0.14.42 · 설계 H1) quiescing 상한 초과 통지 래치 — (좌석 → 통지한 updated_at). 같은 규율(태스크 로컬).
         let mut queue_quiesce_stale: HashMap<u64, f64> = HashMap::new();
+        // ★(S2) 저장된 quiescing 창의 상한 초과 통지 래치 — (좌석 → 통지한 since). 위 큐 접촉 통지와
+        // **별 축**이다(이쪽은 큐가 비어도 난다 · 형제 맵들과 같은 규약: watchdog 태스크 로컬 = 단일 writer).
+        let mut quiescing_stale_seen: HashMap<u64, f64> = HashMap::new();
         // ★G2(W3-A): role 데드맨 상태 — watchdog 태스크 로컬(단일 writer). 구 단일 f64
         // 디바운스에서 role별 {misses·last_ok·death/idle 디바운스·좌석 점유 관측} 맵으로 승격.
         let mut deadman = DeadmanTracker::default();
@@ -212,6 +215,10 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 reap_zombie_surfaces(&daemon, &sys, &mut zombie_miss);
                 check_agent_death(&daemon, &sys, &mut restart_counts, &mut agent_strict_proof);
                 check_surface_crash(&daemon);
+                // ★(S2) 라벨만 보는 상한 초과 판독 통지 — 읽기 전용이라 위 4단 순서
+                //   (refresh_seat_cache → deliver_queued → check_agent_death → check_role_deadman)의
+                //   어느 재료도 건드리지 않는다(그 순서 밖·뒤에 둔다).
+                check_quiescing_stale(&daemon, &mut quiescing_stale_seen);
                 check_feed_aging(&daemon, &mut feed_reminded);
                 check_feed_backlog(&daemon, &mut feed_backlog_alerted);
                 check_approval_stall(&daemon, &mut approval_stall_fired);
@@ -250,6 +257,7 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 queue_depth_alerted.retain(|sid, _| live_surface_ids.contains(sid));
                 queue_starve_alerted.retain(|sid, _| live_surface_ids.contains(sid));
                 queue_quiesce_stale.retain(|sid, _| live_surface_ids.contains(sid));
+                quiescing_stale_seen.retain(|sid, _| live_surface_ids.contains(sid));
                 // ★(U-16) 관문 스캔의 좌석 키 맵도 같은 규약으로 솎는다.
                 scan_caches.prune_surfaces(&live_surface_ids);
                 learn_stuck_debounce.retain(|sid, _| live_surface_ids.contains(sid));
@@ -407,6 +415,44 @@ fn check_surface_crash(daemon: &Arc<Daemon>) {
         );
     }
     CRASH_HANDLER_ACTIVE.store(false, Ordering::Release);
+}
+
+/// ★(S2) 저장된 quiescing 창이 보류 상한을 넘겼음을 (좌석, 창) 1회 알린다 — **읽기 전용**이다.
+///
+/// 【기존과 다른 점】 형제 통지 `queue.quiesce_stale`(큐 틱 안)은 **큐 접촉**이 있어야 난다 — 그 좌석 큐가
+/// 비어 있으면 상한을 넘긴 창이 아무 소리도 내지 않았다. 이 검사는 큐와 무관하게 **라벨만 보고** 낸다.
+/// 기존 통지는 **대체·이동·변경하지 않는다**(둘 다 난다 · 이름이 다르다).
+///
+/// 【쓰지 않는다】 [`quiescing_window_peek`] 만 부르고 라벨·소유자 기록·가드에 **아무것도 쓰지 않는다**.
+/// 해제는 종전 경로(큐 틱 접촉 시의 게으른 해제)의 몫이다 — 여기서 창을 끝내면 쓸기가 된다.
+///
+/// 【1회】 `(좌석, since)` 디바운스. 새 창은 새 `since` 라 한 번 더 나고, 데몬 재시작은 맵을 잃어(태스크 로컬)
+/// 아직 도는 좌석에 한 번 더 날 수 있다 — 설계가 받아들이는 값이다.
+fn check_quiescing_stale(daemon: &Arc<Daemon>, stale_seen: &mut HashMap<u64, f64>) {
+    let surfaces: Vec<Arc<crate::state::Surface>> =
+        daemon.surfaces.lock().unwrap().values().cloned().collect();
+    for s in surfaces {
+        let Some(w) = quiescing_window_peek(daemon, &s) else {
+            continue;
+        };
+        // 자격 = 판독과 같은 술어다(노브 0 이면 축이 꺼져 통지도 없다 — 종전 동작).
+        if w.hold_secs == 0 || !w.queue_gate_open {
+            continue;
+        }
+        if stale_seen.get(&s.id) == Some(&w.since) {
+            continue;
+        }
+        stale_seen.insert(s.id, w.since);
+        daemon.bus.publish(
+            "surface.quiescing_stale",
+            "watchdog",
+            Some(s.id),
+            json!({"surface_id": s.id, "age_secs": w.age_secs.round(), "hold_secs": w.hold_secs,
+                   "owner": w.owner, "channel_hold": w.channel_hold, "guard_phase": w.guard_phase,
+                   "note": "저장된 quiescing 창이 보류 상한을 넘겼다(큐 접촉과 무관하게 라벨만 보고 알린다) — \
+                            관측일 뿐이다: 데몬은 이 통지로 창을 풀지 않는다"}),
+        );
+    }
 }
 
 /// T4-5B 좀비 하트비트 임계: 연속 N회 ping 미스 시 좀비 surface로 판정·강제정리.
@@ -6655,6 +6701,125 @@ pub(crate) fn release_quiescing(daemon: &Arc<Daemon>, s: &crate::state::Surface,
         crate::handlers::publish_ctx_guard(daemon, s, out, "cycle-marker", None);
     }
     released
+}
+
+/// ★(S2) 저장된 quiescing 창의 **판독** — [`quiescing_window_peek`] 의 산출. 출력 전용이다: 어느 소비자도
+/// 이 값으로 배달·보류·해제를 바꾸지 않는다(판정은 종전 경로 그대로다 · 새 게이트가 아니다).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct QuiescingWindow {
+    /// 창의 신원 = 저장된 `agent_status.updated_at` **생값**(소유자 기록의 세대 표지와 같은 자).
+    pub(crate) since: f64,
+    /// 실효 나이(초) — 세대가 맞는 묶인 소유자면 데몬 **단조** 시계, 아니면 벽시계. 상태행의 `age_secs`
+    /// (벽시계 전용)와 다른 자다 — 그 값을 재사용하지 않는다.
+    pub(crate) age_secs: f64,
+    /// quiescing 보류 상한(초) — [`queue_quiesce_hold_secs`]. 0 = 축 끔.
+    pub(crate) hold_secs: u64,
+    /// `alive`·`dead` 는 **세대가 맞는 묶인 소유자**에 한한다(pid 생존) · 그 밖은 `unknown`.
+    pub(crate) owner: &'static str,
+    /// `bound-owner`(세대 일치) · `unbound-or-self-report`. 저장소는 수동 `surface.quiesce on` 과
+    /// `status.set quiescing` 자기보고를 구별하지 못하므로 둘을 합친다(저장소가 아는 것만 말한다).
+    pub(crate) source: &'static str,
+    /// 큐 **틱** 게이트가 열려 있는가 = `!quiesce_hold_active(Some(age), hold)` — 그 함수를 **부른다**(복사 금지).
+    pub(crate) queue_gate_open: bool,
+    /// 채널(`deliverable_master`)이 아직 붙잡는가 — 세대가 맞는 죽은 소유자만 다음 접촉에서 풀린다.
+    pub(crate) channel_hold: bool,
+    /// clear 가드 단계(`free|awaiting|cycling|measuring`).
+    pub(crate) guard_phase: &'static str,
+    /// 판독 분류(우선순위 고정) — `orphan-owner-dead` > `queue-axis-off` > `stale-queue-resumed` >
+    /// `guard-disagrees` > `active`.
+    pub(crate) reading: &'static str,
+}
+
+impl QuiescingWindow {
+    /// `org.status` 좌석 행의 `status.window` 로 나가는 모양 — **설계가 열거한 8키 그대로**(`age_secs`
+    /// `hold_secs` `source` `owner` `queue_gate_open` `channel_hold` `guard_phase` `reading`).
+    /// ★`since`(창 신원)는 **싣지 않는다** — 설계 §5.1 의 열거에 없다. 구현 중에 쓸모가 보여도 소비자가
+    /// 의존할 수 있는 기계 필드를 설계 밖에서 늘리지 않는다(동결 설계를 '개량'하지 않는다는 티켓 조건).
+    /// 구조체에는 남겨 둔다 — 틱의 `(좌석, 창)` 디바운스가 그 자를 쓴다(내부용).
+    /// 나이는 형제 통지(`queue.quiesce_stale`)와 같은 `round()` 모양이고, 유한하지 않은 나이는 serde 가
+    /// `null` 로 싣는다(판정은 생 f64 로 이미 끝났다 · 실어 나르는 모양이 판정을 바꾸지 않는다).
+    pub(crate) fn to_wire(&self) -> serde_json::Value {
+        json!({"age_secs": self.age_secs.round(), "hold_secs": self.hold_secs,
+               "owner": self.owner, "source": self.source, "queue_gate_open": self.queue_gate_open,
+               "channel_hold": self.channel_hold, "guard_phase": self.guard_phase, "reading": self.reading})
+    }
+}
+
+/// ★(S2) quiescing 창의 **순수 판독**(peek) — 저장된 생값과 소유자 기록만 읽고 **아무것도 쓰지 않는다**.
+///
+/// 【왜 별 함수인가】 기존 판독기 [`effective_quiescing_since`] 는 세대가 맞는 죽은 소유자를 보면 그 자리에서
+/// [`release_quiescing`] 으로 **푼다**(해제·이벤트·가드 `cycle_off`). 틱이나 내보내기가 그것을 부르면 쓸기가 된다 —
+/// 그래서 이 함수는 그 셋 중 **어느 것도 부르지 않고** 같은 재료(`agent_status` 생값 · `quiesce_owner`)로
+/// 같은 판정을 다시 센다. 종전 경로(큐 틱 접촉 시의 게으른 해제)는 **무변경**이다.
+///
+/// 【락】 세 락을 **차례로 하나씩** 잡고 곧바로 놓는다(중첩 없음 · 발행 없음): `agent_status` → `quiesce_owner`
+/// → `ctx_loop_guard`. 형제 판독기와 같은 순서다.
+///
+/// 【없음】 저장된 상태가 `quiescing` 이 아니면 `None` — 내보내기에서 키가 **없다**(null 아님).
+pub(crate) fn quiescing_window_peek(
+    daemon: &Arc<Daemon>,
+    s: &crate::state::Surface,
+) -> Option<QuiescingWindow> {
+    let since = s
+        .agent_status
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|st| st.state == "quiescing")
+        .map(|st| st.updated_at)?;
+    // 세대 일치 = 기존 판독기가 쓰는 바로 그 비교(`at == since`) — 다른 세대의 기록은 이 창의 것이 아니다.
+    let bound = match *s.quiesce_owner.lock().unwrap_or_else(|e| e.into_inner()) {
+        Some((pid, at, mono)) if at == since => Some((pid, mono)),
+        _ => None,
+    };
+    // 묶인 창은 단조 시계로, 묶지 않은 창은 벽시계로 — `quiescing_since_and_age` 와 같은 규칙(해제 호출만 뺐다).
+    let age = match bound {
+        Some((_, mono)) => (crate::usage::ctx_guard_now(daemon) - mono).max(0.0),
+        None => now_epoch() - since,
+    };
+    let hold = queue_quiesce_hold_secs();
+    let owner = match bound {
+        Some((pid, _)) => {
+            if crate::state::pid_alive(pid) {
+                "alive"
+            } else {
+                "dead"
+            }
+        }
+        None => "unknown",
+    };
+    let source = if bound.is_some() { "bound-owner" } else { "unbound-or-self-report" };
+    let queue_gate_open = !quiesce_hold_active(Some(age), hold);
+    let guard_phase = s
+        .ctx_loop_guard
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .phase
+        .as_str();
+    let reading = if owner == "dead" {
+        "orphan-owner-dead"
+    } else if hold == 0 {
+        "queue-axis-off"
+    } else if queue_gate_open {
+        "stale-queue-resumed"
+    } else if guard_phase != "cycling" {
+        "guard-disagrees"
+    } else {
+        "active"
+    };
+    Some(QuiescingWindow {
+        since,
+        age_secs: age,
+        hold_secs: hold,
+        owner,
+        source,
+        queue_gate_open,
+        // 살아있는·알 수 없는 소유자는 나이와 무관하게 채널이 붙잡는다(종전 무기한 판정) — 세대가 맞는
+        // 죽은 소유자만 `deliverable_master` 가 다음 접촉에서 푼다.
+        channel_hold: owner != "dead",
+        guard_phase,
+        reading,
+    })
 }
 
 fn machine_hold_probe(
@@ -29776,6 +29941,380 @@ mod h1_queue_quiesce_tests {
         assert!(s.pending_queue.lock().unwrap().is_empty(), "해제 뒤 RESUME 이 나가지 않았다(교착)");
         let delivered = d.bus.tail(100).iter().filter(|ev| ev["name"] == "queue.delivered").count();
         assert_eq!(delivered, 1, "RESUME 정확히 1회");
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    // ─────────────────────────────── S2 (quiescing 창 판독) ───────────────────────────────
+    // 아래 다섯은 S2 인수검체다(AT-R2-1·2·3·4·5). 좌석·데몬 조립은 이 묶음의 `rig`/`set_state`/`quiet`/
+    // `dead_pid`/`rpc` 를 그대로 쓴다(새 하네스를 만들지 않는다).
+
+    /// S2 검체의 소유자 기록 종류 — 설계가 세는 네 가지.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum S2Owner {
+        /// 기록 없음(수동 `cys quiesce` · `status.set quiescing` 자기보고).
+        Unbound,
+        /// 세대가 맞는 살아있는 소유자.
+        Alive,
+        /// 세대가 맞는 죽은 소유자(고아 창).
+        Dead,
+        /// 기록은 있으나 **표지가 다른 세대**(그 뒤 창을 다시 세웠다) — 이 창의 소유자가 아니다.
+        StaleGen,
+    }
+
+    // 죽은 pid 공급 — 유닉스 전용 `dead_pid` 를 cfg 로 감싸, 검체 자체는 양 OS 에서 **컴파일·실행**된다
+    // (윈도우에서는 죽은 소유자 칸만 건너뛴다 · `#[cfg(unix)]` 로 검체를 빼지 않는다).
+    #[cfg(unix)]
+    fn s2_maybe_dead_pid() -> Option<u32> {
+        Some(dead_pid())
+    }
+    #[cfg(not(unix))]
+    fn s2_maybe_dead_pid() -> Option<u32> {
+        None
+    }
+
+    /// 세대 어긋남 표지 — 창의 `since`(epoch 초 · ±inf·NaN 칸 포함) 와 **반드시 다른** 상수.
+    const S2_STALE_AT: f64 = 1.0;
+
+    /// 라벨과 소유자 기록을 심는다. `age` 는 **요청한** 나이고, 묶인 창은 단조 시각으로 환산한다(실효 나이는
+    /// 피크가 다시 센다 — 검체는 그 값에 대한 **자기정합**을 본다). 심을 수 없는 종류면 `false`(윈도우의 죽은 pid).
+    fn s2_arm(d: &Arc<Daemon>, s: &Arc<crate::state::Surface>, kind: S2Owner, age: f64) -> bool {
+        set_state(s, "quiescing", age);
+        let since = s
+            .agent_status
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|st| st.updated_at)
+            .expect("방금 심은 라벨");
+        let mono = crate::usage::ctx_guard_now(d) - age;
+        let owner = match kind {
+            S2Owner::Unbound => None,
+            S2Owner::Alive => Some((std::process::id(), since, mono)),
+            S2Owner::Dead => match s2_maybe_dead_pid() {
+                Some(pid) => Some((pid, since, mono)),
+                None => return false,
+            },
+            S2Owner::StaleGen => match s2_maybe_dead_pid() {
+                Some(pid) => {
+                    assert!(since != S2_STALE_AT, "세대 어긋남 상수가 창 표지와 같아졌다");
+                    Some((pid, S2_STALE_AT, mono))
+                }
+                None => return false,
+            },
+        };
+        *s.quiesce_owner.lock().unwrap() = owner;
+        true
+    }
+
+    /// 저장 상태의 **바이트 지문** — 라벨·소유자 기록·clear 가드 전체(`ClearGuard` 는 `Debug` 파생)·큐.
+    /// 가드 전체를 넣는 이유: `cycle_off` 가 불리면 단계뿐 아니라 사이클 원장도 바뀌므로 이 지문이 깨진다.
+    fn s2_snapshot(s: &Arc<crate::state::Surface>) -> String {
+        let label = s.agent_status.lock().unwrap().clone();
+        let owner = *s.quiesce_owner.lock().unwrap();
+        let guard = format!("{:?}", *s.ctx_loop_guard.lock().unwrap());
+        let queue: Vec<crate::state::QueueEntry> = s.pending_queue.lock().unwrap().iter().cloned().collect();
+        let blocked = s.queue_blocked.lock().unwrap().clone();
+        format!("label={label:?} owner={owner:?} guard={guard} queue={queue:?} blocked={blocked:?}")
+    }
+
+    /// 이 묶음의 `events` 는 tail(300) 이라 격자 검체(수백 틱)에서 창이 밀린다 — 링 용량(4096)까지 본다.
+    fn s2_events(d: &Arc<Daemon>, name: &str) -> usize {
+        d.bus.tail(4096).iter().filter(|ev| ev["name"] == name).count()
+    }
+
+    /// 가드 단계를 `cycling` 으로 두거나 `free` 로 되돌린다(검체 쪽 쓰기 — 생산 코드는 가드를 건드리지 않는다).
+    fn s2_guard(d: &Arc<Daemon>, s: &Arc<crate::state::Surface>, cycling: bool) {
+        let mut g = s.ctx_loop_guard.lock().unwrap();
+        *g = crate::usage::clear_guard::ClearGuard::default();
+        if cycling {
+            let _ = g.cycle_on(crate::usage::ctx_guard_now(d), false);
+        }
+        assert_eq!(g.phase.as_str(), if cycling { "cycling" } else { "free" });
+    }
+
+    /// ★AT-R2-1 — 새 틱 검사와 새 판독은 **아무것도 쓰지 않는다**. 소유자 종류 네 가지 × 보류 안/밖 나이 ×
+    /// 다섯 틱 동안 라벨·소유자 기록·가드·큐의 지문이 **바이트 동일**하고, 해제 이벤트(`surface.quiescing` —
+    /// `release_quiescing` 은 풀 때마다 반드시 1건 낸다)가 한 건도 늘지 않는다. 고아(죽은 소유자) 칸이
+    /// 핵심이다: 기존 판독기(`effective_quiescing_since`)라면 바로 여기서 풀었을 창이다.
+    #[test]
+    fn s2_at_r2_1_tick_and_reading_never_write_or_release() {
+        let _k = HKnobGuard::set(&[("CYS_QUEUE_QUIESCE_HOLD_SECS", "20")]);
+        let (d, s) = rig("s2-nowrite");
+        let mut armed = 0usize;
+        for kind in [S2Owner::Unbound, S2Owner::Alive, S2Owner::Dead, S2Owner::StaleGen] {
+            for age in [5.0_f64, 700.0_f64] {
+                for cycling in [false, true] {
+                    s2_guard(&d, &s, cycling);
+                    if !s2_arm(&d, &s, kind, age) {
+                        continue;
+                    }
+                    armed += 1;
+                    let cell = format!("{kind:?}/age={age}/cycling={cycling}");
+                    let before = s2_snapshot(&s);
+                    let released_before = s2_events(&d, "surface.quiescing");
+                    let mut seen = HashMap::new();
+                    for _ in 0..5 {
+                        // 판독만(내보내기가 하는 일) · 그리고 새 틱 검사.
+                        let w = quiescing_window_peek(&d, &s).expect("quiescing 라벨이 있다");
+                        assert!(!w.reading.is_empty());
+                        let _ = w.to_wire();
+                        check_quiescing_stale(&d, &mut seen);
+                    }
+                    assert_eq!(before, s2_snapshot(&s), "{cell}: 틱·판독이 저장 상태를 바꿨다");
+                    assert_eq!(
+                        s2_events(&d, "surface.quiescing"),
+                        released_before,
+                        "{cell}: 해제 이벤트가 늘었다 — release_quiescing 이 불렸다"
+                    );
+                }
+            }
+        }
+        if cfg!(unix) {
+            assert_eq!(armed, 16, "소유자 네 종류 × 나이 둘 × 가드 둘 = 16칸이 모두 돌아야 한다");
+        } else {
+            assert_eq!(armed, 8, "윈도우에서는 죽은 pid 칸(죽은·세대어긋남)을 건너뛴다");
+        }
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// ★AT-R2-2 — 소스 핀. 새 판독(`quiescing_window_peek`)과 새 틱 검사(`check_quiescing_stale`)의
+    /// **본문**에 금지된 세 호출(`release_quiescing` · `effective_quiescing_since` ·
+    /// `quiescing_since_and_age`)이 하나도 없다. 형제 핀(`r1f_in_reset_path_census_source_pin`)과 같은
+    /// `include_str!` + 생산구간 슬라이스 방식이고, 주석 줄은 뺀다(설명이 그 이름을 적는 것은 자유).
+    #[test]
+    fn s2_at_r2_2_new_peek_and_tick_bodies_call_none_of_the_three() {
+        const FORBIDDEN: [&str; 3] =
+            ["release_quiescing(", "effective_quiescing_since(", "quiescing_since_and_age("];
+        let src = include_str!("governance.rs");
+        let end = src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .or_else(|| src.find("#[cfg(test)]"))
+            .expect("테스트 모듈 앵커");
+        let prod = &src[..end];
+        // 핀 자체가 공허하지 않음을 먼저 증명한다 — 세 이름은 생산 구간에 **실재**한다(종전 경로는 무변경).
+        for n in FORBIDDEN {
+            assert!(prod.contains(n), "핀의 바늘 `{n}` 이 생산 구간에서 사라졌다 — 바늘을 고쳐라");
+        }
+        // 서명에서 시작해 중괄호 짝으로 본문만 베낸다(문서 주석은 `{` 앞이라 들어오지 않는다).
+        fn body<'a>(src: &'a str, sig: &str) -> &'a str {
+            let at = src.find(sig).unwrap_or_else(|| panic!("생산 구간에 `{sig}` 가 없다"));
+            let open = at + src[at..].find('{').expect("본문 여는 중괄호");
+            let b = src.as_bytes();
+            let mut depth = 0i32;
+            for i in open..b.len() {
+                match b[i] {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &src[open..=i];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("`{sig}` 본문이 닫히지 않았다")
+        }
+        fn code_only(body: &str) -> String {
+            body.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+        }
+        let peek = code_only(body(prod, "pub(crate) fn quiescing_window_peek("));
+        let tick = code_only(body(prod, "fn check_quiescing_stale("));
+        // 슬라이스가 비지 않았음을 고정한다(이름이 바뀌어 빈 본문을 보며 초록이 되는 것을 막는다).
+        assert!(peek.contains("quiesce_hold_active(") && peek.contains("ctx_guard_now("), "판독 본문 슬라이스가 어긋났다: {peek}");
+        assert!(tick.contains("quiescing_window_peek(") && tick.contains("surface.quiescing_stale"), "틱 본문 슬라이스가 어긋났다: {tick}");
+        for (what, code) in [("quiescing_window_peek", &peek), ("check_quiescing_stale", &tick)] {
+            for n in FORBIDDEN {
+                assert_eq!(code.matches(n).count(), 0, "{what} 본문이 금지된 `{n}` 을 부른다 — 그것은 쓸기다");
+            }
+        }
+    }
+
+    /// ★AT-R2-3 + ★AT-R2-5 — 격자. 소유자 종류 4 × 나이 7(−700 · −1 · 0 · 5 · 700 · ∞ · NaN) ×
+    /// 상한 3(0 · 20 · 600) × 가드 2 에서 ① 게이트 판독은 `quiesce_hold_active` 를 **불러** 얻은 진실과
+    /// 같고 ② `source`·`owner` 는 저장소가 아는 것(세대 일치)만 말하며 ③ 판독 분류는 동결 모델의 우선순위와
+    /// 같고 ④ 이벤트 자격(`hold>0 && !hold_active`)과 **실제 발행 수**가 일치하고 ⑤ 같은 창에 두 번 알리지
+    /// 않는다. (⑤의 예외: `since` 가 NaN 인 합성 칸 — `Some(&NaN) != Some(&NaN)` 이라 디바운스가 안 걸린다.
+    /// 형제 통지 `queue.quiesce_stale` 도 같은 성질이고, 어떤 writer 도 NaN 표지를 저장하지 않는다.)
+    #[test]
+    fn s2_at_r2_3_gate_reading_and_event_eligibility_agree_on_the_grid() {
+        let (d, s) = rig("s2-grid");
+        let mut cells = 0usize;
+        for hold in ["0", "20", "600"] {
+            let _k = HKnobGuard::set(&[("CYS_QUEUE_QUIESCE_HOLD_SECS", hold)]);
+            for kind in [S2Owner::Unbound, S2Owner::Alive, S2Owner::Dead, S2Owner::StaleGen] {
+                for age in [-700.0_f64, -1.0, 0.0, 5.0, 700.0, f64::INFINITY, f64::NAN] {
+                    for cycling in [false, true] {
+                        s2_guard(&d, &s, cycling);
+                        if !s2_arm(&d, &s, kind, age) {
+                            continue;
+                        }
+                        cells += 1;
+                        let cell = format!("hold={hold}/{kind:?}/age={age}/cycling={cycling}");
+                        let w = quiescing_window_peek(&d, &s).expect("quiescing 라벨이 있다");
+                        // ① 게이트 진실 — 복사가 아니라 그 함수를 부른다.
+                        assert_eq!(
+                            w.queue_gate_open,
+                            !quiesce_hold_active(Some(w.age_secs), w.hold_secs),
+                            "{cell}: 게이트 판독이 판정 함수와 어긋났다"
+                        );
+                        assert_eq!(w.hold_secs.to_string(), hold, "{cell}: 상한 노브를 다른 자로 읽었다");
+                        // ② AT-R2-5 — 세대 일치를 저장소에서 **독립으로** 다시 센다.
+                        let gen_match =
+                            s.quiesce_owner.lock().unwrap().is_some_and(|(_, at, _)| at == w.since);
+                        assert_eq!(
+                            w.source,
+                            if gen_match { "bound-owner" } else { "unbound-or-self-report" },
+                            "{cell}: source 가 저장소가 아는 것보다 많이 말했다"
+                        );
+                        assert_eq!(gen_match, w.owner != "unknown", "{cell}: 세대 불일치인데 소유자 생존을 단정했다");
+                        assert!(
+                            ["alive", "dead", "unknown"].contains(&w.owner) && w.channel_hold == (w.owner != "dead"),
+                            "{cell}: owner/channel_hold 가 규약 밖이다 ({}, {})",
+                            w.owner,
+                            w.channel_hold
+                        );
+                        // ③ 판독 분류 = 동결 모델 reading() 의 우선순위.
+                        let want = if w.owner == "dead" {
+                            "orphan-owner-dead"
+                        } else if w.hold_secs == 0 {
+                            "queue-axis-off"
+                        } else if w.queue_gate_open {
+                            "stale-queue-resumed"
+                        } else if w.guard_phase != "cycling" {
+                            "guard-disagrees"
+                        } else {
+                            "active"
+                        };
+                        assert_eq!(w.reading, want, "{cell}");
+                        assert_eq!(w.guard_phase, if cycling { "cycling" } else { "free" }, "{cell}");
+                        // ④ 이벤트 자격과 실제 발행이 일치한다.
+                        let eligible = w.hold_secs > 0 && w.queue_gate_open;
+                        let before = s2_events(&d, "surface.quiescing_stale");
+                        let mut seen = HashMap::new();
+                        check_quiescing_stale(&d, &mut seen);
+                        assert_eq!(
+                            s2_events(&d, "surface.quiescing_stale") - before,
+                            usize::from(eligible),
+                            "{cell}: 자격과 발행이 어긋났다"
+                        );
+                        // ⑤ (좌석, 창) 디바운스 — 유한한 표지에 한한다(위 문서 주석의 NaN 예외).
+                        if w.since.is_finite() {
+                            let twice = s2_events(&d, "surface.quiescing_stale");
+                            check_quiescing_stale(&d, &mut seen);
+                            assert_eq!(s2_events(&d, "surface.quiescing_stale"), twice, "{cell}: 같은 창에 두 번 알렸다");
+                        }
+                    }
+                }
+            }
+        }
+        if cfg!(unix) {
+            assert_eq!(cells, 168, "격자 = 상한 3 × 소유자 4 × 나이 7 × 가드 2");
+        } else {
+            assert_eq!(cells, 84, "윈도우에서는 죽은 pid 칸을 건너뛴다");
+        }
+        // 판독이 끝난 뒤에도 라벨은 그대로다(격자 전체가 읽기 전용이었다).
+        assert_eq!(
+            s.agent_status.lock().unwrap().as_ref().map(|st| st.state.clone()).as_deref(),
+            Some("quiescing"),
+            "격자가 라벨을 풀었다"
+        );
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// ★AT-R2-4 — **종전 경로 무변경** 핀. 고아 창(세대가 맞는 죽은 소유자) + 큐 항목 하나는 종전처럼
+    /// **큐 접촉 때 게으르게 풀린다**(`surface.quiescing{reason:"owner_exited"}` · 그 틱에 배달). 새 틱 검사를
+    /// 먼저 다섯 번 돌려도 풀리지 않는다는 음성 대조를 같은 검체에서 붙여, 해제 책임이 종전 경로에 그대로
+    /// 남았음을 한 자리에서 읽게 한다.
+    #[cfg(unix)]
+    #[test]
+    fn s2_at_r2_4_dead_owner_window_is_still_released_at_queue_contact() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ReapEnvGuard::set(&[
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+            ("CYS_QUEUE_MIN_INTERVAL_SECS", "0"),
+        ]);
+        let _k = HKnobGuard::set(&[("CYS_QUEUE_QUIESCE_HOLD_SECS", "600")]);
+        let (d, s) = rig("s2-lazy");
+        let mut depth = HashMap::new();
+        let mut starve = HashMap::new();
+        let mut stale = HashMap::new();
+        // 상한(600s) 안의 신선한 고아 창 — 풀리는 유일한 사유는 '소유자 사망' 이다.
+        assert!(s2_arm(&d, &s, S2Owner::Dead, 5.0), "유닉스에서 죽은 pid 는 심을 수 있다");
+        let w = quiescing_window_peek(&d, &s).expect("창");
+        assert_eq!((w.owner, w.source, w.reading), ("dead", "bound-owner", "orphan-owner-dead"), "전제: 고아 창");
+        assert!(!w.queue_gate_open && !w.channel_hold, "전제: 상한 안이고 채널은 이 창을 놓는다");
+        // 음성 대조 — 새 틱 검사는 다섯 번 돌아도 풀지 않는다.
+        let mut seen = HashMap::new();
+        for _ in 0..5 {
+            check_quiescing_stale(&d, &mut seen);
+        }
+        assert_eq!(
+            s.agent_status.lock().unwrap().as_ref().map(|st| st.state.clone()).as_deref(),
+            Some("quiescing"),
+            "새 틱 검사가 창을 풀었다 — 그것은 쓸기다"
+        );
+        assert!(s.quiesce_owner.lock().unwrap().is_some(), "새 틱 검사가 소유자 기록을 지웠다");
+        // 종전 경로: 큐 접촉에서 게으르게 푼다.
+        s.pending_queue.lock().unwrap().push_back(d.next_queue_entry("고아 창 뒤 항목".into(), None, "test"));
+        quiet(&s);
+        deliver_queued(&d, &mut depth, &mut starve, &mut stale);
+        assert!(
+            d.bus.tail(300).iter().any(|e| e["name"] == "surface.quiescing"
+                && e["payload"]["reason"] == "owner_exited"),
+            "종전 게으른 해제가 사라졌다(큐 접촉에서 풀리지 않았다)"
+        );
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "해제 뒤에도 항목이 큐에 남았다");
+        assert_eq!(
+            s.agent_status.lock().unwrap().as_ref().map(|st| st.state.clone()).as_deref(),
+            Some("working"),
+            "해제가 라벨을 working 으로 바꾸지 않았다"
+        );
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// ★AT-R2-5 — `source` 는 저장소가 아는 것만 말한다. 네 종류를 한 자리에서 읽는다: 기록 없음·세대
+    /// 어긋남은 `unbound-or-self-report` + `owner=unknown`(죽은 pid 가 기록돼 있어도 **이 창의 것이 아니다**),
+    /// 세대가 맞는 기록만 `bound-owner` 이고 그때만 `alive`/`dead` 를 단정한다.
+    #[test]
+    fn s2_at_r2_5_source_never_claims_bound_owner_without_a_generation_match() {
+        let _k = HKnobGuard::set(&[("CYS_QUEUE_QUIESCE_HOLD_SECS", "600")]);
+        let (d, s) = rig("s2-source");
+        for (kind, want_source, want_owner) in [
+            (S2Owner::Unbound, "unbound-or-self-report", "unknown"),
+            (S2Owner::StaleGen, "unbound-or-self-report", "unknown"),
+            (S2Owner::Alive, "bound-owner", "alive"),
+            (S2Owner::Dead, "bound-owner", "dead"),
+        ] {
+            if !s2_arm(&d, &s, kind, 5.0) {
+                continue;
+            }
+            let w = quiescing_window_peek(&d, &s).expect("창");
+            assert_eq!((w.source, w.owner), (want_source, want_owner), "{kind:?}");
+            // 저장소에서 독립으로 센 세대 일치와 같아야 한다.
+            let gen_match = s.quiesce_owner.lock().unwrap().is_some_and(|(_, at, _)| at == w.since);
+            assert_eq!(w.source == "bound-owner", gen_match, "{kind:?}");
+            // 내보내기 모양에도 같은 사실만 실린다(9키 고정).
+            let wire = w.to_wire();
+            assert_eq!(wire["source"], json!(want_source));
+            assert_eq!(wire["owner"], json!(want_owner));
+            let keys: Vec<&str> = wire.as_object().expect("객체").keys().map(String::as_str).collect();
+            assert_eq!(
+                keys,
+                vec![
+                    "age_secs",
+                    "channel_hold",
+                    "guard_phase",
+                    "hold_secs",
+                    "owner",
+                    "queue_gate_open",
+                    "reading",
+                    "source"
+                ],
+                "window 키 집합이 바뀌었다(소비자 계약) — 설계 §5.1 이 열거한 8키 그대로여야 한다. \
+                 `since` 는 내부 신원이라 싣지 않는다(틱 디바운스 전용)"
+            );
+        }
         let _ = s.child.lock().unwrap().kill();
     }
 }

@@ -20046,6 +20046,34 @@ fn ctx_cell(s: &serde_json::Value) -> String {
     }
 }
 
+/// ★(0.14.51 · S2 §5.4) 상태 칸 — `cys status` 표에 찍는 낱말. **표시 전용**(판정·상태 변경 없음).
+/// 종료·에이전트 부재가 먼저이고, 그 밖에는 상태행의 `state` 를 그대로 쓴다. 단 **묵은 사이클 창**
+/// (`status.window` 가 있고 보류 상한이 지났다)은 맨낱말 `quiescing` 대신 `quiescing (stale Ns)` 로 찍는다 —
+/// 라벨이 설명하는 것보다 오래 살아 있다는 사실이 사람 눈에 보이지 않는 것이 S2 가 없애려는 침묵이다.
+/// 【묵음의 판정】 데몬이 **같은 술어로 이미 계산해 보낸** `window.queue_gate_open`(= `quiesce_hold_active` 의 부정)을
+/// 쓴다 — CLI 가 나이·상한으로 다시 유도하면 술어가 둘이 된다(델타 §5.2 m2 '복사 아닌 호출'과 같은 이유).
+/// 상한 0(축 끔)은 묵음이 아니다(`queue-axis-off` 가 그 사실을 싣는다 · 기존 데몬 동작과 같다).
+/// 【구 데몬】 `window` 가 없으면 종전 그대로 맨낱말이다(가산 키 부재 = 모름).
+fn state_cell(s: &serde_json::Value) -> String {
+    if s["exited"].as_bool().unwrap_or(false) {
+        return "exited!".to_string();
+    }
+    if s["agent_alive"].as_bool() == Some(false) {
+        return "agent✗".to_string();
+    }
+    let state = s["status"]["state"].as_str().unwrap_or("-");
+    let w = &s["status"]["window"];
+    if state == "quiescing"
+        && w["queue_gate_open"].as_bool() == Some(true)
+        && w["hold_secs"].as_u64().is_some_and(|h| h > 0)
+    {
+        if let Some(age) = w["age_secs"].as_f64() {
+            return format!("quiescing (stale {}s)", age.max(0.0).round() as u64);
+        }
+    }
+    state.to_string()
+}
+
 /// Tasks Control Center(CLI) — depts.json을 읽어 본부+각 부서 소켓에 org.status를 순회 집계한다.
 /// master 능동 모니터링: 모든 부서의 모든 노드가 지금 하는 업무를 1콜로 본다. 도달불가 부서는 표기.
 fn run_fleet(as_json: bool) -> i32 {
@@ -20166,14 +20194,7 @@ fn run_status(as_json: bool) -> i32 {
     );
     println!("{header}");
     for s in r["surfaces"].as_array().cloned().unwrap_or_default() {
-        let exited = s["exited"].as_bool().unwrap_or(false);
-        let state = if exited {
-            "exited!".to_string()
-        } else if s["agent_alive"].as_bool() == Some(false) {
-            "agent✗".to_string()
-        } else {
-            s["status"]["state"].as_str().unwrap_or("-").to_string()
-        };
+        let state = state_cell(&s);
         let ctx = ctx_cell(&s);
         let task = s["status"]["task"]
             .as_str()
@@ -41219,6 +41240,48 @@ mod tests {
     /// 실패 방향: 실측이 없고 자기보고가 낡거나 `age_secs` 가 결측이면 `?`(판정 불가)로
     /// 무너진다 — 값 쪽으로 접히면 낡은 추정이 60% 임계 판정의 입력이 된다(그것이 이 검체가 막는 사고).
     /// ⑦(0.14.31 감사): 종료 좌석(`exited=true`)의 동결 실측은 값이 아니라 `?` 다 — 데몬은 exited
+    /// ★(0.14.51 · S2 §5.4) 표 상태 칸 — 묵은 사이클 창은 맨낱말이 아니라 `quiescing (stale Ns)` 로 보인다.
+    /// 판정은 데몬이 보낸 `window.queue_gate_open`(같은 술어)로만 하고 CLI 는 나이·상한을 다시 유도하지 않는다.
+    /// 표시 전용이므로 이 함수는 아무것도 바꾸지 않는다(순수 — 입력 Value 하나).
+    #[test]
+    fn state_cell_marks_a_stale_quiescing_window_and_leaves_everything_else() {
+        // ⓐ 묵은 창(상한 지남 = 게이트 열림) → 표식 + 나이
+        let stale = json!({"status": {"state": "quiescing",
+            "window": {"queue_gate_open": true, "hold_secs": 600, "age_secs": 72.4}}});
+        assert_eq!(state_cell(&stale), "quiescing (stale 72s)");
+        // ⓑ 산 창(상한 안 = 게이트 닫힘) → 맨낱말 그대로
+        let live = json!({"status": {"state": "quiescing",
+            "window": {"queue_gate_open": false, "hold_secs": 600, "age_secs": 5.0}}});
+        assert_eq!(state_cell(&live), "quiescing");
+        // ⓒ 축 끔(상한 0)은 묵음이 아니다 — 맨낱말(그 사실은 reading=queue-axis-off 가 싣는다)
+        let off = json!({"status": {"state": "quiescing",
+            "window": {"queue_gate_open": true, "hold_secs": 0, "age_secs": 999.0}}});
+        assert_eq!(state_cell(&off), "quiescing");
+        // ⓓ 구 데몬(window 부재) → 종전 그대로 맨낱말
+        let old = json!({"status": {"state": "quiescing"}});
+        assert_eq!(state_cell(&old), "quiescing");
+        // ⓔ 나이 결측은 "방금"이 아니다 — 표식을 붙이지 않는다(모름 방향)
+        let noage = json!({"status": {"state": "quiescing",
+            "window": {"queue_gate_open": true, "hold_secs": 600}}});
+        assert_eq!(state_cell(&noage), "quiescing");
+        // ⓕ 음수 나이(시계 역행)는 0 으로 접어 찍는다 — 술어는 이미 절댓값으로 판정했다
+        let back = json!({"status": {"state": "quiescing",
+            "window": {"queue_gate_open": true, "hold_secs": 600, "age_secs": -700.0}}});
+        assert_eq!(state_cell(&back), "quiescing (stale 0s)");
+        // ⓖ 종료·에이전트 부재가 상태보다 먼저다(종전 순서 보존)
+        assert_eq!(state_cell(&json!({"exited": true, "status": {"state": "quiescing"}})), "exited!");
+        assert_eq!(
+            state_cell(&json!({"agent_alive": false, "status": {"state": "quiescing"}})),
+            "agent✗"
+        );
+        // ⓗ quiescing 이 아닌 상태는 window 가 있어도 손대지 않는다
+        let working = json!({"status": {"state": "working",
+            "window": {"queue_gate_open": true, "hold_secs": 600, "age_secs": 900.0}}});
+        assert_eq!(state_cell(&working), "working");
+        // ⓘ 상태행 결측
+        assert_eq!(state_cell(&json!({})), "-");
+    }
+
     /// 좌석의 usage 를 지우지 않는다(collect_tick 건너뜀). 값 쪽으로 접히면 죽은 좌석이 60% 목록에 남는다.
     #[test]
     fn ctx_cell_prefers_measured_and_degrades_stale_self_report() {
