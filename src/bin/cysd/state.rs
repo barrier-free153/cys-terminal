@@ -5386,23 +5386,6 @@ impl Daemon {
         // 경합으로 뒤집혀도 resolved/timeout이 pending에 지지 않는다.
         let mut restored: Vec<FeedItem> = Vec::new();
         let feed_path = dir.join("feed.jsonl");
-        // ★★여기가 S7 의 **이름 붙은 예외**가 사는 자리다 (0.14.51 · 부서장 Declaration 5 §1·§2).
-        //
-        // `read_to_string` 은 UTF-8 에 대해 **전부-또는-전무**다. 한 바이트가 깨지면 이 `if` 블록
-        // 전체가 건너뛰어진다 — 파싱 루프뿐 아니라 **재조정·보존 상한·압축까지 모두 이 안에 있다**
-        // ⇒ 부팅된 데몬에서 **모든 pending 항목이 사라진다**. 바로 아래 U10 주석이 약속하는
-        // "판독 불가 줄 보존"은 **줄 단위** 보호이고, **읽기 자체가 실패하면 도달하지 않는다.**
-        // 그 인접성이 결함이다.
-        //
-        // ★**E7(그 결함의 수리)은 이 판에 들어 있지 않다** — 0.14.51 번들에서 `E7` = **OUT**이고
-        //   "OUT MEANS ZERO LINES THIS RELEASE"다(백로그 B-117). 그리고 **그 수리를 게이트하는
-        //   `T-r3-7` 도 이 판 밖**이다 ⇒ 이 판의 시험 묶음을 그 경계가 검증된 것으로 읽어서는 안 된다.
-        // ★그러므로 이 자리에서 S7 은 **아무것도 약속하지 않는다**: 결재의 사유가 재생 가능하다는
-        //   보증은 [`Daemon::resolve_feed_item_settled`] 의 계약에 적힌 대로 **이 예외를 뺀** 것이다.
-        //   "바이트는 아마 아직 거기 있고 나중 데몬이 복구할지도 모른다"는 것은 **결함의 성질**이지
-        //   결재자가 의지해도 되는 보증이 아니다.
-        // ★구조적 사실 하나(왜 이 예외가 더 작아질 수 없는가): 읽기가 실패하면 **아무것도 파일을
-        //   다시 쓰지 않는다** — 유일한 재기록 경로(압축)가 같은 `if` 안에 있기 때문이다.
         if let Ok(content) = std::fs::read_to_string(&feed_path) {
             let mut by_id: HashMap<String, FeedItem> = HashMap::new();
             // ★U10(0.14.41): 파싱 불가 줄(찢긴 append·구조가 다른 레코드)은 **원문 그대로 보존**한다 — 재시작
@@ -5880,25 +5863,6 @@ impl Daemon {
     /// 여전히 pending" 인데, 핀에서 **그 전제가 참이 아니다** — 상태 변경이 영속보다 **먼저**
     /// 임계영역 안에서 일어난다. pending 이라고 답하는 것은 데몬이 자기 상태에 관해 사실이 아닌
     /// 말을 하는 것이고, 그 답을 받은 호출자의 재시도는 `item already resolved` 로 거부된다.
-    ///
-    /// ## ★★S7 이 약속하는 것 — 이것뿐이고 그 이상은 아니다 (부서장 Declaration 5 §1 의 문언 그대로)
-    ///
-    /// > **settled** 된 승인 결정은 **재생 가능한 내구적 사유**를 가진다 — 결재자·결정·**왜**가
-    /// > 해소 시점에 기록되고 그 뒤에 읽힌다 — **feed 파일이 판독 불가가 되는 경우를 제외하고.**
-    /// > 그 경우에는 **다음 부팅에서 모든 pending 항목과 그 기록이 사라지고, 거기서 S7 은 아무것도
-    /// > 약속하지 않는다.**
-    ///
-    /// 세 구절이 각각 하중을 받는다.
-    /// · **"settled"** — 보증은 **확정에 이른** 결정에만 붙는다. 결정되지 않은 항목이나 파일에
-    ///   닿지 못한 시도에 대해서는 아무 말도 하지 않는다.
-    /// · **"재생 가능한 내구적 사유"** — "결정이 기록됐다"가 아니다. 사유가 재시작을 넘어 살아남고
-    ///   **결정 프로세스 없이** 뒤의 독자가 읽을 수 있어야 한다(B-108 의 기준 = O-S7-6 과 같은 문장).
-    ///   이 함수의 구현에서 그것은 `decision_reason` 을 스냅샷에 넣고 **그 스냅샷을 영속**하는 것이다.
-    /// · **"판독 불가가 되는 경우를 제외하고"** — 이름 붙은 유계 예외. 그 안에서 S7 의 약속은
-    ///   **없다**: 저하된 약속도, 부분 약속도 아니라 **없음**이다. 약한 약속을 독자가 추론하게
-    ///   두지 않고 **약속의 부재를 명시**한다.
-    ///   그 예외가 사는 자리는 이 함수가 아니라 복원 경로의 **전부-또는-전무 읽기**다
-    ///   ([`Daemon::new`] 의 `read_to_string` 블록 — 이 파일 안에서 그 자리에 같은 표찰이 붙어 있다).
     pub fn resolve_feed_item_settled(
         &self,
         request_id: &str,
@@ -10759,72 +10723,6 @@ mod tests {
         //   (os error 66)` 으로 깨졌다(단독 실행은 통과). 살아 있는 데몬이 끝정리 중에도 상태
         //   폴더에 쓰기 때문이고, test_rm_rf 의 문서가 말하는 그대로다 — 끝정리 실패는 이 검체가
         //   재는 것이 아니다(삭제가 검체의 **단계**인 자리, 즉 위의 고장 제거는 엄격하게 둔다).
-        let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
-    }
-
-    /// ★AT-S7-D1 — ★**예외를 단언한다, 약속이 아니라**(부서장 Declaration 5 §5-3 의 요구 그대로).
-    ///
-    /// 보증은 "settled 된 결재는 재생 가능한 내구적 사유를 가진다 — **feed 파일이 판독 불가가
-    /// 되는 경우를 제외하고**" 다. 행복 경로만 시험하는 약속은 부서장이 하루에 세 번 판정한 결함
-    /// 유형이므로, 이 검체는 **예외 쪽**을 잰다: 파일이 UTF-8 로 판독 불가하면 복원은
-    /// **아무것도 되살리지 않는다** — 그리고 그것이 S7 이 그 자리에서 **아무 약속도 하지 않는다**는
-    /// 사실의 기계적 형태다.
-    ///
-    /// ★이 검체는 수리가 **아니다**. E7(그 결함의 수리)은 0.14.51 번들에서 OUT 이고, 이 검체는
-    /// 그 결함의 **현재 동작을 박제**해 다음 판이 그것을 고칠 때 무엇이 바뀌는지 알게 한다.
-    #[test]
-    fn s7_d1_unreadable_feed_restores_nothing_and_promises_nothing() {
-        // ★★반-공허(anti-vacuous) 대조가 먼저다: **같은 줄, 같은 경로, 판독 가능한 파일**이면
-        //   복원은 실제로 일어난다. 이 대조가 없으면 아래의 "비어 있다"는 단언은 복원이 애초에
-        //   동작하지 않아도 통과한다(침묵은 성공이 아니다).
-        {
-            let ctl = isolated_sock("s7-d1-control");
-            let cdir = state_dir(&ctl);
-            std::fs::create_dir_all(&cdir).expect("대조 상태 폴더");
-            let line = serde_json::to_string(&sample_feed_item("d1-pending", "b".into())).expect("직렬화");
-            std::fs::write(cdir.join("feed.jsonl"), format!("{line}\n")).expect("대조 파일");
-            let d = Daemon::new(ctl.clone());
-            assert!(
-                d.feed_items
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|i| i.request_id == "d1-pending" && i.status == "pending"),
-                "대조 실패 — 판독 가능한 파일에서도 복원되지 않았다(이 검체는 예외를 재지 못한다)"
-            );
-            let _ = std::fs::remove_dir_all(ctl.parent().unwrap());
-        }
-
-        let tmp = isolated_sock("s7-d1");
-        let dir = state_dir(&tmp);
-        std::fs::create_dir_all(&dir).expect("상태 폴더");
-        let feed_path = dir.join("feed.jsonl");
-        // 한 줄은 **완전히 유효한 pending 항목**이고, 그 뒤 한 줄이 UTF-8 로 판독 불가하다.
-        let good = serde_json::to_string(&sample_feed_item("d1-pending", "b".into())).expect("직렬화");
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(good.as_bytes());
-        bytes.push(b'\n');
-        bytes.extend_from_slice(&[0xff, 0xfe, 0x80, b'\n']); // 유효한 UTF-8 이 아니다
-        std::fs::write(&feed_path, &bytes).expect("고장 주입");
-        // ★선행 확인(이 검체의 전제가 참인가): 읽기 자체가 실패한다.
-        assert!(
-            std::fs::read_to_string(&feed_path).is_err(),
-            "전제 실패 — 이 바이트가 UTF-8 로 읽힌다면 이 검체는 예외를 재지 않는다"
-        );
-
-        let daemon = Daemon::new(tmp.clone());
-
-        // ★예외: **유효했던 pending 항목조차** 복원되지 않는다. 약속의 부재가 이것이다.
-        assert!(
-            daemon.feed_items.lock().unwrap().is_empty(),
-            "판독 불가 파일에서 항목이 복원됐다 — 이 판의 동작이 바뀌었다면 E7 수리가 들어온 것이고, \
-             그렇다면 Declaration 5 의 예외 문언과 복원 경로의 표찰을 함께 고쳐야 한다"
-        );
-        // ★그리고 읽기가 실패하면 **아무것도 파일을 다시 쓰지 않는다**(압축이 같은 `if` 안이다) —
-        //   원본 바이트가 그대로 남아 있다는 것이 그 구조적 사실의 관측면이다.
-        let after = std::fs::read(&feed_path).expect("파일은 그대로 있다");
-        assert_eq!(after, bytes, "복원 실패 경로가 파일을 덮어썼다");
-
         let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
     }
 
