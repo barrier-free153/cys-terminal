@@ -2020,6 +2020,32 @@ struct GateSeatState {
     count: u32,
     /// 창이 닫힌 뒤 pending 항목을 이미 정리했는가 — 매 틱 feed 락을 다시 잡지 않기 위한 래치.
     cleaned: bool,
+    /// ★S7 (0.14.51 · 설계 §2.1 row 2): 영속이 확정되지 않아 래치를 **일부러 걸지 않은** 횟수.
+    /// 이 칸이 있어야 재시도가 **양방향으로** 묶인다 — 영원히 재시도하면 폭주 쪽이고, 한 번에
+    /// 래치하면 항목이 영구 pending 으로 남아 큐를 막는 정지 쪽이다(오너의 한 쌍 규칙).
+    uncertain_closes: u32,
+}
+
+/// ★S7 row 2 의 재시도 상한 — 이 횟수의 틱을 넘기면 경고 한 줄을 남기고 래치를 걸어 루프를
+/// 멈춘다. 값의 근거: 틱은 15초이므로 세 번이면 약 45초 — 일시적 저장 오류는 지나가고,
+/// 지속되는 오류는 사람이 읽을 경고로 승격된다.
+const GATE_CLOSE_UNCERTAIN_MAX: u32 = 3;
+
+/// ★S7 row 2 의 래치 판정 — **순수 함수**로 뽑아 둔 이유: 이 한 줄이 오너의 한 쌍 규칙이
+/// 코드에서 만나는 자리라서, 양쪽 방향을 **시험으로** 박아야 한다. 같은 파일의
+/// `gate_scan_observe_open`·`gate_scan_open` 과 같은 꼴이다.
+///
+/// 입력: `prior` = 이 좌석의 미기록 종결 누계 · `not_durable` = 이번 틱에서 기록이 확정되지
+/// 않은 종결 수. 출력: (래치를 걸까, 새 누계).
+///
+/// | 경우 | 래치 | 왜 |
+/// |---|---|---|
+/// | 이번 틱 전부 기록됨 | **걸린다** | 할 일이 끝났다(종전 동작과 동일) |
+/// | 일부 미기록 · 누계 < 상한 | **걸지 않는다** | 다음 틱이 자연히 재시도한다(정지 쪽 방지) |
+/// | 일부 미기록 · 누계 ≥ 상한 | **걸린다** | 영원한 재시도는 폭주 쪽이다 |
+fn gate_close_latch(prior: u32, not_durable: u32) -> (bool, u32) {
+    let tally = prior.saturating_add(not_durable);
+    (not_durable == 0 || tally >= GATE_CLOSE_UNCERTAIN_MAX, tally)
 }
 
 /// ★틱마다 재컴파일·재해소하지 않기 위한 스캔 캐시. watchdog 태스크 로컬 = **단일 writer**
@@ -2202,12 +2228,35 @@ pub(crate) fn sweep_orphan_daemon_approvals_inner(daemon: &Arc<Daemon>) -> usize
     }
     // ③ 닫는다(기존 해소 함수 — 멱등 · 다른 잠금을 쥔 채 부르지 않는다).
     let mut closed = 0usize;
+    // ★S7 설계 §2.1 row 5 = **LEARN**: 종전 판정은 `.is_some()` 이었고 그것은 "그 항목이
+    //   있었다"는 뜻일 뿐 "닫힌 것이 기록됐다"는 뜻이 아니었다. 이제 **내구적으로 닫힌 것만**
+    //   닫힌 것으로 센다.
+    // ★그런데 상한(SWEEP_CAP)은 **틱 시간의 한도**다. 그래서 상한에는 *시도* 를 세고 반환값에는
+    //   *내구적 성공* 을 센다 — 둘을 한 칸으로 합치면, 저장이 계속 실패할 때 상한이 올라가지
+    //   않아 한 틱에 모든 후보를 해소하게 된다(상한이 사문이 되는 폭주 쪽 퇴행).
+    let mut attempted = 0usize;
     for (rid, sid) in candidates {
-        if closed >= SWEEP_CAP {
+        if attempted >= SWEEP_CAP {
             break;
         }
-        if dead.get(&sid).copied().unwrap_or(false) && daemon.resolve_feed_item(&rid, "stale-cleared").is_some() {
-            closed += 1;
+        if dead.get(&sid).copied().unwrap_or(false) {
+            let attempt = daemon.resolve_feed_item(&rid, "stale-cleared");
+            match attempt {
+                crate::state::SettleAttempt::Attempted(ref outcome) => {
+                    attempted += 1;
+                    if outcome.is_committed() {
+                        closed += 1;
+                    } else {
+                        eprintln!(
+                            "cysd: 고아 승인 쓸기 {rid} — 해소는 적용됐으나 기록이 {} ({})",
+                            outcome.durability(),
+                            outcome.detail()
+                        );
+                    }
+                }
+                // 시도 없음(그 사이 사라졌거나 이미 해소) — 상한도 쓰지 않는다.
+                crate::state::SettleAttempt::NoItem | crate::state::SettleAttempt::NotPending => {}
+            }
         }
     }
     closed
@@ -2282,13 +2331,40 @@ fn check_approvals(
             // **관측 자체가 닫힌** 좌석(각성 ack·생애 창 초과·롤백·미선언)만 종결한다. 그
             // 좌석은 화면을 더 보지 않으므로 배지를 살려 두면 영구 pending 으로 남는다.
             // 천장으로 닫힌 좌석은 여기 오지 않는다 — 그것이 이 수리의 전부다.
+            // ★S7 설계 §2.1 row 2 = **MOVE + LEARN**. 종전에는 반환을 버리고 `cleaned: true` 를
+            //   **무조건** 적었다 — 그 한 줄이 `!seat.cleaned` 가드를 영구히 끄므로, 기록되지 않은
+            //   종결은 다시 시도되지 않고 항목은 영구 pending 으로 남아 큐를 막았다.
+            let mut not_durable = 0u32;
             for rid in pending_gate_items(daemon, s.id) {
-                daemon.resolve_feed_item(&rid, "gate-window-closed");
+                let attempt = daemon.resolve_feed_item(&rid, "gate-window-closed");
+                if let crate::state::SettleAttempt::Attempted(ref outcome) = attempt {
+                    if !outcome.is_committed() {
+                        not_durable += 1;
+                        eprintln!(
+                            "cysd: 관문 창 종결 {rid} — 적용됐으나 기록이 {} ({})",
+                            outcome.durability(),
+                            outcome.detail()
+                        );
+                    }
+                }
+            }
+            // ★양방향 상한: 기록이 확정되지 않으면 래치를 걸지 않아 다음 틱이 자연히 다시
+            //   시도하고(이 루프는 이미 멱등 — 해소된 항목은 NotPending 으로 돌아온다),
+            //   상한에 닿으면 경고 한 줄을 남기고 래치를 걸어 루프를 멈춘다.
+            let (latch, tally) = gate_close_latch(seat.uncertain_closes, not_durable);
+            let bounded_out = latch && not_durable > 0;
+            if bounded_out {
+                eprintln!(
+                    "cysd: 관문 창 종결 재시도 상한({GATE_CLOSE_UNCERTAIN_MAX}) 도달 — \
+                     좌석 {} 의 래치를 걸어 루프를 멈춘다(미기록 종결 누계 {tally})",
+                    s.id
+                );
             }
             caches.gate_escalations.insert(
                 s.id,
                 GateSeatState {
-                    cleaned: true,
+                    cleaned: latch,
+                    uncertain_closes: tally,
                     ..seat
                 },
             );
@@ -2366,7 +2442,15 @@ fn check_approvals(
         // 봉인하고, 데몬 재시작 고아 백로그도 같은 경로로 청소된다.
         if !any_match && !patterns.is_empty() {
             for rid in daemon.pending_daemon_approvals(s.id) {
-                daemon.resolve_feed_item(&rid, "stale-cleared");
+                // ★S7 설계 §2.1 row 3 = **LEARN(로그만)**: 이 루프에는 완료 래치가 없어 다음
+                //   pass 가 구조적으로 다시 시도한다 — 새 상태를 만들지 않는 것이 처방이다.
+                let attempt = daemon.resolve_feed_item(&rid, "stale-cleared");
+                if !attempt.settled_durably() && !matches!(attempt, crate::state::SettleAttempt::NoItem | crate::state::SettleAttempt::NotPending) {
+                    eprintln!(
+                        "cysd: 승인 stale-clear {rid} — 적용됐으나 기록이 {}",
+                        attempt.label()
+                    );
+                }
             }
         }
         // ─────────────────────────────────────────────────────────────────────
@@ -2431,7 +2515,17 @@ fn scan_first_run_gate(cx: &GateScanCtx, seat: GateSeatState, caches: &mut ScanC
         // 화면에서 관문이 사라졌다 = 사람이 통과시켰다 → pending 항목 종결(생명주기).
         if seat.count > 0 {
             for rid in pending_gate_items(daemon, sid) {
-                daemon.resolve_feed_item(&rid, "stale-cleared");
+                // ★S7 설계 §2.1 row 4 = **LEARN**: 로그만 남기고 다음 pass 가 다시 시도한다.
+                //   ★이 자리는 `first_run_gate` — 오너가 지목한 온보딩 위험이라 설계는 여기에
+                //   부트 체인 시험(T-r3-5)을 요구한다. 그 시험은 **이 판에서 돌지 않은 출하
+                //   게이트**이며(O-S7-5), 여기서 그것이 통과했다고 읽어서는 안 된다.
+                let attempt = daemon.resolve_feed_item(&rid, "stale-cleared");
+                if !attempt.settled_durably() && !matches!(attempt, crate::state::SettleAttempt::NoItem | crate::state::SettleAttempt::NotPending) {
+                    eprintln!(
+                        "cysd: 첫기동 관문 종결 {rid} — 적용됐으나 기록이 {}",
+                        attempt.label()
+                    );
+                }
             }
         }
         return;
@@ -2462,6 +2556,10 @@ fn scan_first_run_gate(cx: &GateScanCtx, seat: GateSeatState, caches: &mut ScanC
         GateSeatState {
             count: seat.count + 1,
             cleaned: false,
+            // ★S7 row 2: 미기록 종결 누계는 **이어받는다**(count 와 같은 이유로 단조다). 저장이
+            //   회복되면 그 틱의 종결이 Committed 로 와서 `not_durable == 0` 으로 래치가 걸리므로,
+            //   이어받기가 조기 래치를 만들지 않는다 — 누계는 **계속 실패하는** 경우에만 쓰인다.
+            uncertain_closes: seat.uncertain_closes,
         },
     );
     let role = cx.surface.role.lock().unwrap().clone();
@@ -12155,8 +12253,9 @@ impl Drop for ReapEnvGuard {
 mod tests {
     use super::{
         approval_wakeup_suppressed, check_surfaces, collect_descendants, endpoint_key,
-        is_node_owned, kill_pid, learn_stuck_candidates, merged_approval_patterns,
-        plan_duplicate_alerts, plan_duplicate_kills, wakeup_entry_ids, ProcObs,
+        gate_close_latch, is_node_owned, kill_pid, learn_stuck_candidates,
+        merged_approval_patterns, plan_duplicate_alerts, plan_duplicate_kills, wakeup_entry_ids,
+        ProcObs,
     };
 
     /// 시험 편의 — 결과만(소스 핀 시험이 `#[cfg(test)]` 앞까지만 읽으므로 본문 쪽에는 cfg(test) 항목을 두지 않는다).
@@ -13695,10 +13794,15 @@ mod tests {
 
         let ids = daemon.pending_daemon_approvals(7);
         assert_eq!(ids.len(), 1);
-        assert!(daemon.resolve_feed_item(&ids[0], "stale-cleared").is_some());
+        assert!(daemon
+            .resolve_feed_item(&ids[0], "stale-cleared")
+            .settled_durably());
         assert!(!daemon.has_pending_daemon_approval(7), "해소 후 pending 소거");
         assert!(
-            daemon.resolve_feed_item(&ids[0], "stale-cleared").is_none(),
+            matches!(
+                daemon.resolve_feed_item(&ids[0], "stale-cleared"),
+                crate::state::SettleAttempt::NotPending
+            ),
             "중복 해소=None(멱등)"
         );
 
@@ -13738,7 +13842,7 @@ mod tests {
         assert_eq!(stalled_events, 1, "항목당 1회만 발화");
         // 해소 후 fired 집합 회수
         let rid = daemon.pending_daemon_approvals(sid).pop().unwrap();
-        daemon.resolve_feed_item(&rid, "allow");
+        assert!(daemon.resolve_feed_item(&rid, "allow").settled_durably());
         super::check_approval_stall(&daemon, &mut fired);
         assert!(fired.is_empty(), "해소 항목 키 회수");
         let _ = std::fs::remove_dir_all(&dir);
@@ -21738,6 +21842,7 @@ mod tests {
             surface_id: Some(s.id),
             status: "pending".into(),
             decision: None,
+            decision_reason: None, // ★S7: 생성 시점엔 사유가 없다(대입처 = 해소 경로 하나).
             created_at: now_epoch(),
             resolved_at: None,
             tier: None,
@@ -25218,6 +25323,7 @@ mod tests {
         let at_ceiling = GateSeatState {
             count: GATE_SCAN_MAX_ESCALATIONS,
             cleaned: false,
+            uncertain_closes: 0,
         };
         let mut caches = ScanCaches::default();
 
@@ -25290,6 +25396,24 @@ mod tests {
         );
     }
 
+    /// ★S7 row 2 — 래치 판정의 **양방향** 상한. 한쪽만 재면 이 수리가 바로 다른 결함이 된다:
+    /// 미기록인데 래치를 걸면 항목이 영구 pending(정지 쪽), 영원히 걸지 않으면 매 틱 재시도(폭주 쪽).
+    #[test]
+    fn s7_gate_close_latch_is_bounded_in_both_directions() {
+        // ⓐ 전부 기록됨 → 래치(종전 동작) · 누계는 늘지 않는다.
+        assert_eq!(gate_close_latch(0, 0), (true, 0));
+        // ⓑ 미기록 1건, 누계 아래 → 래치를 걸지 않는다(다음 틱이 재시도).
+        assert_eq!(gate_close_latch(0, 1), (false, 1));
+        assert_eq!(gate_close_latch(1, 1), (false, 2));
+        // ⓒ 상한 도달 → 래치를 걸어 루프를 멈춘다.
+        assert_eq!(gate_close_latch(2, 1), (true, 3));
+        assert_eq!(gate_close_latch(3, 1), (true, 4));
+        // ⓓ 상한을 넘겨도 기록이 **회복되면** 래치는 '할 일이 끝나서' 걸린다(조기 래치 아님).
+        assert_eq!(gate_close_latch(9, 0), (true, 9));
+        // ⓔ 누계는 넘치지 않는다(단조·포화).
+        assert_eq!(gate_close_latch(u32::MAX, 1), (true, u32::MAX));
+    }
+
     /// ★배선 핀 — 배지 종결은 **관측** 술어가, 발행은 **천장** 술어가 지배한다.
     ///
     /// 순수 술어만 갈라 두고 호출부가 여전히 한 축을 쓰면 위 검체는 전부 무의미해진다.
@@ -25355,7 +25479,9 @@ mod tests {
         assert!(pending_gate_items(&daemon, 8).is_empty(), "타 surface 독립");
 
         let ids = pending_gate_items(&daemon, 7);
-        assert!(daemon.resolve_feed_item(&ids[0], "stale-cleared").is_some());
+        assert!(daemon
+            .resolve_feed_item(&ids[0], "stale-cleared")
+            .settled_durably());
         assert!(pending_gate_items(&daemon, 7).is_empty());
         assert!(
             daemon.has_pending_daemon_approval(7),

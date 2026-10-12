@@ -758,6 +758,7 @@ fn push_daemon_approval(fx: &Fx, sid: u64, n: u32) {
         surface_id: Some(sid),
         status: "pending".into(),
         decision: None,
+        decision_reason: None, // ★S7: 생성 시점엔 사유가 없다(대입처 = 해소 경로 하나).
         created_at: crate::state::now_epoch(),
         resolved_at: None,
         tier: None,
@@ -931,6 +932,7 @@ fn push_gate_feed(fx: &Fx, sid: u64, n: u32) {
         surface_id: Some(sid),
         status: "pending".into(),
         decision: None,
+        decision_reason: None, // ★S7: 생성 시점엔 사유가 없다(대입처 = 해소 경로 하나).
         created_at: crate::state::now_epoch(),
         resolved_at: None,
         tier: None,

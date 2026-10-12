@@ -3374,7 +3374,23 @@ async fn handle_connection_capped(
                                 })
                         };
                         if let Some(s) = &snapshot {
-                            daemon.persist_feed_item(s);
+                            // ★S7 설계 §2.1 row 9 = **EXCLUDE, 이유를 적어서**: 이 경로의 목적은
+                            //   이미 끊긴 연결을 정리하는 것이다. 여기서 실패를 치명으로 만들면
+                            //   저장 결함이 **멈춘 RPC** 로 바뀐다(금지된 방향). 그래서 최선노력을
+                            //   유지하되 결과는 버리지 않고 로그로 남긴다.
+                            //   ★이 호출자는 설계 §2.1 표가 **행으로는 열거했지만**(row 9, 줄 번호로)
+                            //   호출자 **수** 에서는 빠진 자리다 — 보고서에 한 줄로 따로 적는다.
+                            //   ★여기서 메모리는 persist **전에** 이미 timeout 으로 바뀐다 — 그래서
+                            //   기록이 불확실할 때 메모리와 파일이 어긋날 수 있다. 허용되는 유일한
+                            //   이유는 **아무에게도 무엇도 말하지 않기 때문**이다(발행자는 이미 사라진다).
+                            let outcome = daemon.persist_feed_item(s);
+                            if !outcome.is_committed() {
+                                eprintln!(
+                                    "cysd: feed timeout {request_id} 영속 {} ({}) — 최선노력 유지(§2.1 row 9)",
+                                    outcome.durability(),
+                                    outcome.detail()
+                                );
+                            }
                             daemon.bus.publish(
                                 "feed.item.timeout",
                                 "feed",

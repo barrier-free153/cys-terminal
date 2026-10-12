@@ -1445,8 +1445,12 @@ fn verify_interaction(daemon: &Arc<Daemon>, conn: &Connection, channel: &str, pa
         return soft_deny("nonce_race"); // 동시 소각 레이스 — 창은 valid였음(비계수).
     }
     // ⑥ 기존 feed reply 경로로 해소(pending→resolved·대기 pusher wake·feed.item.resolved).
+    // ★S7 (0.14.51): 반환이 SettleAttempt 로 바뀌었다. ★이 걸음에서는 **순서를 바꾸지 않았다** —
+    //   설계 §2.1 row 6 의 MOVE(소각을 `Committed` 뒤로)는 O-S7-2 와 **함께만** 착지한다(부서장
+    //   판정: 단독 착지 금지). 그래서 지금은 오늘의 동작을 그대로 번역한다: 시도가 있었으면 성공
+    //   경로, 시도 자체가 없었으면(항목 소실·이미 해소) 종전과 같은 `feed_gone`.
     match daemon.resolve_feed_item(&feed_id, &decision) {
-        Some(_) => {
+        crate::state::SettleAttempt::Attempted(_) => {
             // 성공 = brute 의심 해제 → V4 카운터 리셋. allow면 V7 일일 상한 +1(소각~bump 사이 동시
             // allow 경합의 off-by-one 초과는 허용 — 상한은 soft 폭발반경 제한이라 정밀 원자성 불요).
             reset_attempt(conn, channel, &sender_id, now_ts);
@@ -1462,7 +1466,9 @@ fn verify_interaction(daemon: &Arc<Daemon>, conn: &Connection, channel: &str, pa
             ok_response(id, json!({"action": "approval_resolved", "feed_id": feed_id, "decision": decision}))
         }
         // 소각~해소 사이 레이스로 feed가 사라짐(다른 경로가 해소) — nonce는 이미 태워 안전(비계수).
-        None => soft_deny("feed_gone"),
+        crate::state::SettleAttempt::NoItem | crate::state::SettleAttempt::NotPending => {
+            soft_deny("feed_gone")
+        }
     }
 }
 
@@ -2922,6 +2928,7 @@ mod tests {
             surface_id: None,
             status: "pending".into(),
             decision: None,
+            decision_reason: None, // ★S7: 생성 시점엔 사유가 없다(대입처 = 해소 경로 하나).
             created_at: now(),
             resolved_at: None,
             tier: Some("c".into()),
@@ -2954,7 +2961,10 @@ mod tests {
             "sent approval(feed pending) 재조정 포함: {reg}"
         );
         // feed 해소 → 재조정 제외.
-        d.resolve_feed_item("F1", "allow");
+        assert!(
+            d.resolve_feed_item("F1", "allow").settled_durably(),
+            "시험 환경의 해소는 내구적으로 기록돼야 한다"
+        );
         let reg2 = call(&d, "register", json!({"channel": "slack", "token": "t"}), own_pid());
         let pend2 = reg2["result"]["pending"].as_array().unwrap();
         assert!(
@@ -3542,6 +3552,7 @@ mod tests {
             surface_id: None,
             status: "pending".into(),
             decision: None,
+            decision_reason: None, // ★S7: 생성 시점엔 사유가 없다(대입처 = 해소 경로 하나).
             created_at: now(),
             resolved_at: None,
             tier: Some("c".into()),
