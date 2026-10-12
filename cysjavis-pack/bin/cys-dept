@@ -226,6 +226,53 @@ formation_ensure_async(){
   echo "[cys-dept] $name 상비편성 ensure 착수(백그라운드·fail-open · cwd=${cwd:-호출자} · $lpnote) — 로그: $log" >&2
 }
 
+# ─── S8 M3: `.producer` 표식 쓰기 — "이 격리는 지금 진행 중이다"를 디스크에 남긴다 ──────────────
+# 읽는 쪽은 데몬(`trash.rs` producer_state)이고 규칙은 설계 r2 §3.4 다: open+살아 있는 pid → 삭제
+# 거부 · open+죽은 pid → "생산자가 끝내지 못함" 표지와 함께 삭제 가능 · complete|aborted → 보통 항목 ·
+# 표식 없음 → "생산자 알 수 없음"(구 버전과 동일).
+# ★절대 규칙: **표식이 격리를 실패·지연·재배열시키지 않는다** — 모든 실패는 stderr 한 줄이고 이
+#   함수는 언제나 0 으로 돌아온다(호출부는 반환값을 보지 않는다).
+# ★한 격리 폴더에 생산자가 둘(이 스크립트와 javis_org.py)이라 표식 파일도 하나다 — 다른 pid 의
+#   `open` 은 덮지 않고, 닫는 것도 내 pid 의 표식만 닫는다.
+# $1=격리 폴더 · $2=open|complete|aborted · $3=1 이면 폴더가 없을 때 만든다(닫을 때는 쓰지 않는다)
+producer_mark(){
+  local d="${1%/}" st="$2" create="${3:-0}" f mine cur_pid cur_state tok tmp
+  [ -n "$d" ] || return 0
+  if [ "$create" = 1 ] && [ ! -d "$d" ]; then mkdir -p "$d" 2>/dev/null || true; fi
+  [ -d "$d" ] || return 0
+  f="$d/.producer"; mine=$$
+  # ★표식 자리가 디렉터리면 쓰지 않는다. `mv -f tmp dir` 는 **디렉터리 안으로 옮기고 성공으로 끝나서**
+  #   표식은 안 써지고 쓰레기 파일만 남는다(python os.replace·rust rename 은 그냥 실패한다 — bash 만
+  #   다른 자리다). 판독기는 이 상태를 '판정 불가 = 살아 있는 쪽'으로 읽어 삭제를 막는다(fail closed).
+  if [ -d "$f" ]; then
+    echo "[cys-dept] .producer 표식 기록 실패(격리는 그대로 계속한다): $f 가 디렉터리다" >&2
+    return 0
+  fi
+  if [ -f "$f" ]; then
+    cur_pid="$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
+    cur_state="$(sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' "$f" 2>/dev/null | head -1)"
+    if [ -n "$cur_pid" ] && [ "$cur_pid" != "$mine" ]; then
+      if [ "$st" = open ] && [ "$cur_state" = open ]; then return 0; fi   # 더 넓은 창이 이긴다
+      if [ "$st" != open ]; then return 0; fi                             # 남의 표식은 닫지 않는다
+    fi
+  fi
+  # 프로세스 시작 토큰(pid 재사용 구별용) — Linux /proc 에서만. ★현재 판독기는 대조하지 않는다.
+  tok=""
+  if [ -r "/proc/$$/stat" ]; then
+    tok="$(sed 's/.*) //' "/proc/$$/stat" 2>/dev/null | awk '{print $20}' 2>/dev/null)"
+  fi
+  tmp="$f.tmp-$mine"
+  if printf '{"v":1,"state":"%s","producer":"cys-dept purge-state","pid":%s,"start_token":"%s","ts":%s}\n' \
+       "$st" "$mine" "$tok" "$(date +%s 2>/dev/null || echo 0)" > "$tmp" 2>/dev/null \
+     && mv -f "$tmp" "$f" 2>/dev/null; then
+    :
+  else
+    rm -f "$tmp" 2>/dev/null
+    echo "[cys-dept] .producer 표식 기록 실패(격리는 그대로 계속한다): $f" >&2
+  fi
+  return 0
+}
+
 # ★기능2 프리미티브: 부서 state 디렉토리(대화기억 transcripts.db) 격리(mv→trash). down 기본 체인 뒤
 # --purge-state에서만 호출. 삭제(rm) 아닌 격리라 왕복 복원 가능(mv 역방향). 반환 0=격리 완료 또는
 # 대상 없음(우아·no-op), 비0=부적격명·경로 불일치·사용 중·mv 실패·잔존(강행 금지). preflight stop-and-report 내장.
@@ -271,6 +318,9 @@ dept_purge_state(){
   ts="${CYS_TRASH_STAMP:-$(date +%s)}"
   trash="$TRASH_ROOT/$name-$ts"
   mkdir -p "$trash" || { echo "[cys-dept] purge-state: trash 생성 실패($trash)" >&2; return 5; }
+  # ★S8 M3: 내가 옮기는 동안을 표식으로 알린다. 아래 실패 경로(5·6)에서는 창을 **열어 둔 채** 끝나고,
+  #   그것이 설계가 말하는 "생산자가 끝내지 못함(중단)" 표지다 — 조용히 보통 항목으로 보이지 않는다.
+  producer_mark "$trash" open
   if ! mv "$rp" "$trash/state" 2>/dev/null; then
     echo "[cys-dept] purge-state: 격리 mv 실패($rp → $trash/state)" >&2
     return 5
@@ -279,6 +329,7 @@ dept_purge_state(){
     echo "[cys-dept] purge-state: 원위치 잔존($sd) — 격리 미완(FAIL)" >&2
     return 6
   fi
+  producer_mark "$trash" complete
   echo "[cys-dept] purge-state: $name state 격리 완료 → $trash/state (복구=mv 역방향·${CYS_TRASH_TTL_DAYS:-14}일 후 reap 소거)"
   return 0
 }
