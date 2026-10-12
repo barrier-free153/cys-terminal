@@ -1,7 +1,23 @@
 //! S5 — the queue-block warning leaves the owner's sight. The carrier that would take a person-remedy
-//! block to a person is DEFINED in this file and nothing calls it: measured at this head, `s5_escalation::`
-//! appears NOWHERE in `src/` (0 path references), and `select_carrier`, `IncidentStore`, `record_unanswered`,
-//! `may_reapproach` and `Incident::owner_text` have no caller outside this file - only its own unit tests.
+//! block to a person is DEFINED in this file, and no code outside this file calls it. A wide `grep -rn
+//! s5_escalation src/` returns **3 hits**, and they are three different kinds of thing — so the four
+//! facts are separated here, each saying what was counted (measured at this head):
+//!  1. **The module is declared and compiled into the binary** — `main.rs:52` holds `mod s5_escalation;`
+//!     (hit 1 of 3). This file is built; it is not excluded from the binary.
+//!  2. **Lines outside this file that USE the `s5_escalation::` path: 0** (counted: `grep -rn` hits for
+//!     that path in `src/`, excluding this file and comment lines).
+//!  3. **Callers outside this file: 0** for `select_carrier`, `IncidentStore`, `record_unanswered`,
+//!     `may_reapproach` and `Incident::owner_text` (counted: `grep -rn` hits in `src/` outside this
+//!     file). Superficial hits belong to other code: `owner_text` also names a different function in
+//!     `teamtoken.rs`, and `eligible(` matches `alert_eligible`, `external_eligible` and
+//!     `quarantine_eligible`. What exercises these items is this file's own unit tests.
+//!  4. ★**The name also appears twice INSIDE this file, and neither occurrence is a use** (hits 2 and 3
+//!     of 3): this sentence itself, and the self source pin `include_str!("s5_escalation.rs")` at the
+//!     bottom of this file. A reader who runs the wide grep sees 3 and must be able to tell which is
+//!     which — otherwise a true statement reads as a lie. ★The rule for this is already written 600
+//!     lines below, at the pin itself: "a source pin whose own needles appear in its own source matches
+//!     itself and can only ever fail". This header once said the name "appears NOWHERE in src/", which
+//!     its own text refuted — the same defect the pin's comment warns about, in the same file.
 //!
 //! ## IMPLEMENTATION CONTRACT (read this before changing anything below)
 //!
