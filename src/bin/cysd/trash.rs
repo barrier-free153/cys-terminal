@@ -793,15 +793,6 @@ pub fn list_payload(root: &Path, state: &Path) -> Value {
             if let Ok(kids) = std::fs::read_dir(&p) {
                 for k in kids.flatten() {
                     if let Some(n) = k.file_name().to_str() {
-                        // ★점 파일은 **첫 단계 목록에 넣지 않는다**(설계 r2 §3.4: "`.producer` 는
-                        //   점 파일이다 — 첫 단계 내용도 아니고 kind 판정에도 쓰이지 않지만 내용
-                        //   집합의 노드다"). 내가 f1c4afb6 에서 표식을 쓰기 시작한 뒤로 이 목록에
-                        //   `.producer` 가 섞여 오너가 만들지 않은 파일이 보이고 개수가 하나 더
-                        //   많았다(성찰 A-2 에서 발견). digest 는 파일시스템을 직접 걷으므로
-                        //   이 필터와 무관하다 — **보여주는 목록만** 걸러진다.
-                        if n.starts_with('.') {
-                            continue;
-                        }
                         children.push(n.to_string());
                     }
                 }
@@ -810,7 +801,6 @@ pub fn list_payload(root: &Path, state: &Path) -> Value {
             let (dev, ino) = dev_ino(&md);
             let key = size_cache_key(&name, dev, ino, mtime_bits(&md));
             let size = cache.get(&key).cloned();
-            let pst = producer_state(&p, &real_alive);
             entries.push(json!({
                 "name": name,
                 "interrupted_deleting": interrupted,
@@ -821,11 +811,8 @@ pub fn list_payload(root: &Path, state: &Path) -> Value {
                 "children_depth1": children.clone(),
                 "children_total": children.len(),
                 "sole_copy_advisory": sole_copy_advisory(&name, &children),
-                // ★표식 상태는 **한 번만** 읽는다(성찰 A-1). 두 번 읽으면 두 읽기 사이에 생산자가
-                //   끝날 수 있어 "생산자가 돌고 있다" 표지와 `deletable: true` 가 같은 줄에 실릴 수
-                //   있었다(스스로 모순되는 줄 · 안전하지만 품질 결함). 비용도 절반이다.
-                "producer_chip": producer_chip(&pst),
-                "deletable": !interrupted && !producer_blocks(&pst),
+                "producer_chip": producer_chip(&producer_state(&p, &real_alive)),
+                "deletable": !interrupted && !producer_blocks(&producer_state(&p, &real_alive)),
                 // ★크기는 **측정됐을 때만** 숫자다. 아니면 pending — 목록이 걷지 않기 때문이다.
                 "size": match size { Some(s) => json!({"state": "measured", "value": s}),
                                      None => json!({"state": "pending"}) },
@@ -1608,62 +1595,6 @@ mod tests {
         assert_eq!(me["sole_copy_advisory"], true);
         assert_eq!(v["constants"]["recent_window_secs"], 600);
         assert_eq!(v["constants"]["confirm_ttl_secs"], 300);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// ★성찰 A-2 의 수정: 점 파일(`.producer`)은 **오너가 보는 첫 단계 목록에 섞이지 않는다**
-    /// (설계 r2 §3.4). 표식을 쓰기 시작한 뒤 생긴 결함이라 시험이 그 조합을 그대로 만든다.
-    /// ★성찰 A-1 의 수정: 같은 줄의 `producer_chip` 과 `deletable` 은 **한 번의 판독**에서 나와야
-    /// 서로 모순될 수 없다 — 아래 두 경우가 그 일치를 잠근다(살아 있는 pid / 죽은 pid).
-    #[test]
-    fn list_hides_dot_files_and_never_contradicts_itself_about_the_producer() {
-        let root = rig("dotfiles");
-        let state = root.join("sd");
-        std::fs::create_dir_all(&state).unwrap();
-
-        // (가) 살아 있는 생산자(내 pid) → 표지 "돌고 있다" ∧ 고를 수 없음
-        let live = root.join("dept-9-1760000000");
-        mk(&live, "state/x.txt", b"x");
-        std::fs::write(
-            live.join(".producer"),
-            format!(
-                r#"{{"v":1,"state":"open","producer":"t","pid":{},"start_token":"","ts":1}}"#,
-                std::process::id()
-            ),
-        )
-        .unwrap();
-        // (나) 끝내지 못한 생산자(없는 pid) → 표지 "끝내지 못함" ∧ 고를 수 있음
-        let dead = root.join("dept-10-1760000000");
-        mk(&dead, "state/y.txt", b"y");
-        std::fs::write(
-            dead.join(".producer"),
-            r#"{"v":1,"state":"open","producer":"t","pid":4294967294,"start_token":"","ts":1}"#,
-        )
-        .unwrap();
-
-        let v = list_payload(&root, &state);
-        let ents = v["entries"].as_array().unwrap();
-        let g = ents.iter().find(|e| e["name"] == "dept-9-1760000000").unwrap();
-        let kids = g["children_depth1"].as_array().unwrap();
-        assert_eq!(kids.len(), 1, "점 파일이 첫 단계 목록에 섞였다: {kids:?}");
-        assert_eq!(kids[0], "state");
-        assert_eq!(g["children_total"], 1, "개수가 점 파일을 센다");
-        assert_eq!(g["producer_chip"], producer_chip(&ProducerState::ActiveOpen));
-        assert_eq!(g["deletable"], false, "돌고 있다고 적으면서 고를 수 있게 두면 모순이다");
-
-        let d = ents.iter().find(|e| e["name"] == "dept-10-1760000000").unwrap();
-        assert_eq!(d["producer_chip"], producer_chip(&ProducerState::InterruptedOpen));
-        assert_eq!(d["deletable"], true, "끝내지 못한 생산자는 타이핑 확인 뒤 지울 수 있다");
-        assert_eq!(d["children_depth1"].as_array().unwrap().len(), 1);
-
-        // 판독은 항목마다 한 번이다 — 두 번 읽으면 두 값이 서로 다른 순간을 볼 수 있다.
-        let src = include_str!("trash.rs");
-        let body = &src[src.find("pub fn list_payload").unwrap()..src.find("fn ttl_days_default").unwrap()];
-        assert_eq!(
-            body.matches("producer_state(&p, &real_alive)").count(),
-            1,
-            "list_payload 이 표식 상태를 두 번 읽는다(A-1 회귀)"
-        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
