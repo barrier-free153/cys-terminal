@@ -3381,8 +3381,17 @@ async fn handle_connection_capped(
                             //   ★이 호출자는 설계 §2.1 표가 **행으로는 열거했지만**(row 9, 줄 번호로)
                             //   호출자 **수** 에서는 빠진 자리다 — 보고서에 한 줄로 따로 적는다.
                             //   ★여기서 메모리는 persist **전에** 이미 timeout 으로 바뀐다 — 그래서
-                            //   기록이 불확실할 때 메모리와 파일이 어긋날 수 있다. 허용되는 유일한
-                            //   이유는 **아무에게도 무엇도 말하지 않기 때문**이다(발행자는 이미 사라진다).
+                            //   기록이 불확실할 때 메모리와 파일이 어긋날 수 있다.
+                            // ★★정정(codex r3 **m6** · 내가 설계 문장을 그대로 옮겨 적었다가 틀린 자리):
+                            //   처음 여기에 "아무에게도 무엇도 말하지 않기 때문에 허용된다(발행자는 이미
+                            //   사라진다)"고 적었는데 **둘 다 참이 아니다.** 이 갈래는 **시한 만료**(위 sleep
+                            //   루프)로도 들어오고, 그때 발행자는 **아직 연결돼 있으며** 바로 아래에서
+                            //   `status: "timeout"` 응답을 **받는다**. 끊김(EOF)은 같은 `break None` 의
+                            //   **다른 다리**일 뿐이다.
+                            // ⇒ 그래서 이 판에서는 그 응답에 기록의 사실을 **함께 싣는다**(아래 `durability`).
+                            //   `status: "timeout"` 은 **결정이 없었다**는 참인 말이고, `durability` 는 **그
+                            //   표시가 디스크에 확정됐는가**라는 다른 축이다 — 두 축을 한 칸에 뭉치지 않는다.
+                            //   끊긴 발행자에게는 이 응답이 가지 않을 뿐이고, 그것이 이 칸을 빼는 이유는 아니다.
                             let outcome = daemon.persist_feed_item(s);
                             if !outcome.is_committed() {
                                 eprintln!(
@@ -3399,7 +3408,10 @@ async fn handle_connection_capped(
                             );
                             cys::ok_response(
                                 &id,
-                                json!({"request_id": request_id, "status": "timeout", "decision": null}),
+                                json!({"request_id": request_id, "status": "timeout", "decision": null,
+                                       // ★S7/m6 additive: 이 timeout 표시가 기록됐는가
+                                       //   (`durable`|`not_written`|`uncertain`). 기존 키 불변.
+                                       "durability": outcome.durability()}),
                             )
                         } else {
                             // 동시 feed.reply가 이미 종결 — 승인 결정을 삼키고 timeout으로
