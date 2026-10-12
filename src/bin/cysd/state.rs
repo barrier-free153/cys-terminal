@@ -2698,8 +2698,13 @@ pub struct FeedItem {
     ///   `decision_reason` 0 건, 이 판 27 건 — S7 이 **추가하는** 칸이다). 그 시절의 결재가 남긴
     ///   「왜」는 자유 문면인 **`decision` 안**에 적혀 있을 수 있다.
     /// · ⇒ ★**`decision_reason` 만 보는 기준은 옛 줄을 전부 위반으로 읽는다.** B-108 의 기준은
-    ///   **두 칸을 함께** 덮어야 한다: *0.14.51 이후 줄은 이 칸이 비어 있지 않을 것, 그 이전 줄은
-    ///   `decision` 자체가 「왜」를 담고 있을 수 있으며 그것은 위반이 아니다.*
+    ///   **두 칸을 함께** 덮어야 한다. ★그리고 **모집단도 함께 묶어야 한다**(codex R2 minor m3):
+    ///   *0.14.51 이후 줄 중 **사유를 지니는 모집단**(위 ⒜⒝⒞)은 이 칸이 비어 있지 않을 것 ·
+    ///   **자동 종결(stale-clear·gate-window-closed·고아 정리)과 `--reason` 없는 회신은 이 칸이
+    ///   비어 있는 것이 정상**이며 위반이 아니다 · 0.14.50 이하 줄은 `decision` 자체가 「왜」를
+    ///   담고 있을 수 있다.* ★**판·출처를 이 칸의 null 로 추정하지 마라** — 줄 자체에 판 표시가
+    ///   없으므로, 판정은 **독립적으로 아는 판·출처**와 함께 해야 한다(null 하나로는 "옛 줄"도
+    ///   "위반"도 결론 낼 수 없다).
     #[serde(default)]
     pub decision_reason: Option<String>,
     pub created_at: f64,
@@ -6311,7 +6316,36 @@ impl Daemon {
             Ok(f) => f,
             Err(e) => return SettleOutcome::NotWritten(FeedPersistError::Open(e.to_string())),
         };
-        if let Err(e) = std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()) {
+        // ★m1 (codex R2 minor · R3 묶음): 이 파일에도 **F-1 과 같은 줄 경계 규율**을 건다.
+        //   종전에는 `{line}\n` 을 그냥 붙였으므로, 앞선 부분 write 가 개행 없는 접두를 남겼으면
+        //   이 감사 줄이 거기에 **이어붙어** 둘 다 판독 불가가 되고 — 그런데도 영수증은
+        //   `Committed` 였다. feed 쪽에서 고친 것과 **같은 결함**이다(다른 파일일 뿐).
+        //   ★범위를 넘기지 않는다: 이 파일의 **하류 소비자는 이 판에서 찾지 못했다**(codex 의
+        //   유계 census 와 같은 결과). 그래서 이 고침이 지키는 것은 "소비자가 깨진다"가 아니라
+        //   **영수증이 참이 된다**는 것 하나다.
+        let needs_separator = {
+            use std::io::{Read, Seek, SeekFrom};
+            match f.metadata() {
+                Ok(m) if m.len() == 0 => false,
+                Ok(m) => match f.seek(SeekFrom::Start(m.len() - 1)) {
+                    Ok(_) => {
+                        let mut tail = [0u8; 1];
+                        match f.read_exact(&mut tail) {
+                            Ok(()) => tail[0] != b'\n',
+                            Err(_) => true,
+                        }
+                    }
+                    Err(_) => true,
+                },
+                Err(_) => true,
+            }
+        };
+        let payload = if needs_separator {
+            format!("\n{line}\n")
+        } else {
+            format!("{line}\n")
+        };
+        if let Err(e) = std::io::Write::write_all(&mut f, payload.as_bytes()) {
             return SettleOutcome::Uncertain(FeedPersistError::Write(e.to_string()));
         }
         if let Err(e) = f.sync_all() {
@@ -11388,6 +11422,37 @@ mod tests {
             !dir.join("feed.jsonl.tmp").exists(),
             "건너뛴 압축의 임시 파일이 남았다"
         );
+        let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
+    }
+
+    /// ★AT-S7-m1 — **감사 append 도 줄 경계를 보장한다**(codex R2 minor m1 · R3 묶음).
+    ///
+    /// 결함은 F-1 과 같은 모양이고 파일만 다르다: 개행 없는 접두가 남아 있으면 다음 감사 줄이
+    /// 거기에 이어붙어 **둘 다 판독 불가**가 되는데, `write_all`+`sync_all` 이 성공하므로 영수증은
+    /// `Committed` 였다. ★라벨: 접두는 **구성한(constructed)** 것이다.
+    #[test]
+    fn s7_m1_audit_append_keeps_line_boundaries() {
+        let tmp = isolated_sock("s7-m1-audit");
+        let daemon = Daemon::new(tmp.clone());
+        let dir = state_dir(&daemon.socket_path);
+        let audit_path = dir.join("approval_audit.jsonl");
+
+        // 구성한 찢긴 접두 — 개행 없이 끝난다.
+        let prefix = "{\"ts\": 1.0, \"request_id\": \"torn";
+        std::fs::write(&audit_path, prefix).expect("접두 구성");
+
+        let item = sample_feed_item("m1-audit-A", "a".into());
+        let outcome = daemon.append_approval_audit(&item, "allow", Some("m1-reason"), None);
+        assert!(outcome.is_committed(), "전제: 영수증은 Committed 다: {outcome:?}");
+
+        let got = std::fs::read_to_string(&audit_path).expect("읽기");
+        assert!(got.starts_with(prefix), "접두 바이트를 지웠다(되돌림 금지)");
+        // ★요구 성질: `Committed` 를 받은 그 기록이 **자기 줄에서 읽힌다**.
+        let parsed = got
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|v| v.get("req_id").and_then(|x| x.as_str()) == Some("m1-audit-A"));
+        assert!(parsed, "감사 기록이 접두에 이어붙어 판독 불가가 됐다: {got:?}");
         let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
     }
 
