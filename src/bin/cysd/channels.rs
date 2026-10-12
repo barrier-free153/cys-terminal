@@ -635,10 +635,22 @@ fn meta_get(conn: &Connection, key: &str) -> Option<String> {
         .flatten()
 }
 fn meta_set(conn: &Connection, key: &str, val: &str) {
-    let _ = conn.execute(
+    // ★R3-C: 통계·편의 값의 쓰기는 종전대로 **실패를 접는다**(그 실패가 거짓 안전 보고를 만들지
+    //   않는 자리들이다). **안전 상태**(게이트 닫기·정지·잠금)를 쓰는 자리는 아래 checked 를 쓴다.
+    let _ = meta_set_checked(conn, key, val);
+}
+
+/// `meta` 쓰기의 결과를 **돌려준다** — 안전 상태를 적는 자리 전용.
+///
+/// ★★R3-C (codex R2 major MJR-3 · 부서장 티켓 §1 R3-C): 종전 `meta_set` 은 실패를 `let _ =` 로
+/// 버렸고, 호출자는 그것을 모른 채 **"껐다"고 보고**했다. 그런데 게이트의 정본은 저장된 값이므로,
+/// 저장이 실패하면 **읽을 수 있는 게이트가 여전히 허용한다** — 보고가 거짓이 되는 모양이고,
+/// 오늘 S8⒝ 를 철회시킨 **거짓 영수증**과 같은 부류다(사람이 껐다고 믿으면 확인을 멈춘다).
+fn meta_set_checked(conn: &Connection, key: &str, val: &str) -> Result<usize, rusqlite::Error> {
+    conn.execute(
         "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=?2",
         params![key, val],
-    );
+    )
 }
 fn lockdown_active(conn: &Connection) -> bool {
     meta_get(conn, "lockdown").as_deref() == Some("1")
@@ -748,10 +760,19 @@ fn stop(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Value)
         crate::governance::kill_group_or_pid(pid as u32, pgid.unwrap_or(pid) as i32);
         daemon.ledger.lock().unwrap().remove(&(pid as u32));
     }
-    let _ = conn.execute(
+    // ★★R3-C: 브리지를 죽이는 것과 **"정지됐다"고 기록하는 것**은 다른 일이다. 이 UPDATE 가
+    //   실패하면 표에는 `enabled=1` 이 남고 **복구 스윕이 브리지를 되살린다** — 그런데도 종전에는
+    //   `stopped: true` 를 돌려줬다. 그 보고를 믿은 사람은 다시 확인하지 않는다.
+    if let Err(e) = conn.execute(
         "UPDATE channels SET enabled=0, registered=0, scoped_pid=NULL, scoped_pgid=NULL, updated_ts=?2 WHERE channel=?1",
         params![channel, now()],
-    );
+    ) {
+        return err_response(
+            id,
+            "safety_write_failed",
+            &format!("브리지는 종료했으나 정지 상태를 저장하지 못했다 — 복구 스윕이 되살릴 수 있다(다시 시도하라): {e}"),
+        );
+    }
     ok_response(id, json!({"channel": channel, "stopped": true}))
 }
 
@@ -2216,14 +2237,48 @@ fn allow(conn: &mut Connection, params: &Value, id: &Value) -> Value {
 
 /// `cys channel allow-remote-approve --for <기간>` → meta에 만료 ts 기록(기본 OFF에서 기간 열기).
 /// duration_secs=0(또는 --off)이면 즉시 닫는다(만료 ts=0=상시 만료). 폰 분실 시 기본이 안전측.
+/// ★★R3-C 요구 성질(티켓 §1): **"OFF" 보고는 읽을 수 있는 게이트가 아직 허용하는 동안 인쇄될 수
+/// 없다.** 그래서 OFF 갈래는 ①쓰기 결과를 받고 ②**게이트를 다시 읽어** 닫혔음을 확인한 뒤에만
+/// 성공을 돌려준다. 쓰기 성공이 곧 닫힘은 아니다 — 게이트의 정본은 [`remote_approve_active`] 가
+/// 읽는 **저장된 값**이고, 그것이 판정의 유일한 근거다.
+/// ★ON 갈래도 같은 규율로 바꿨다(비대칭을 남기지 않는다): 저장되지 않았으면 "열었다"도 거짓이다.
+///   다만 그 거짓의 방향은 **안전측**이다(열렸다고 믿는데 닫혀 있다 ⇒ 원격 승인이 그냥 안 된다).
+///
+/// ★**두 장치 중 무엇이 무엇을 덮는지 변이로 쟀다**(독해가 아니라 측정이다):
+/// · MP-R3C-1(쓰기 오류 검사를 다시 `meta_set` 으로 되돌림) → 검체 4/4 **초록**. 쓰기가 실패한
+///   경우는 **읽기 확인이 혼자서도 잡는다**(저장된 미래 값이 그대로라 게이트가 열려 있다).
+///   ⇒ 쓰기 오류 검사는 이 검체 집합에서 **중복**이다. 그래도 남긴다: 오류 문면이 **원인**을
+///   말해 주고(무엇이 실패했는가), 읽기 확인은 **증상**만 말한다.
+/// · MP-R3C-2(읽기 확인을 지움) → `…when_the_write_lands_but_the_gate_reopens` **빨강**.
+///   ⇒ **읽기 확인은 필요하다** — 쓰기가 성공했는데도 게이트가 열려 있는 갈래는 그것만이 덮는다.
 fn allow_remote_approve(conn: &mut Connection, params: &Value, id: &Value) -> Value {
     let secs = p_f64(params, "duration_secs").unwrap_or(0.0);
     if secs <= 0.0 {
-        meta_set(conn, "allow_remote_approve_until", "0");
+        if let Err(e) = meta_set_checked(conn, "allow_remote_approve_until", "0") {
+            return err_response(
+                id,
+                "safety_write_failed",
+                &format!("원격 승인 OFF 를 저장하지 못했다 — 게이트는 **그대로 열려 있을 수 있다**(다시 시도하라): {e}"),
+            );
+        }
+        // ★읽어서 확인한다 — 이 한 줄이 "OFF 보고가 인쇄될 수 있는가"의 판정이다.
+        if remote_approve_active(conn, now()) {
+            return err_response(
+                id,
+                "safety_write_failed",
+                "원격 승인 OFF 를 저장했는데도 게이트가 여전히 허용한다 — OFF 로 보고하지 않는다",
+            );
+        }
         return ok_response(id, json!({"allow_remote_approve": false, "until": 0.0}));
     }
     let until = now() + secs;
-    meta_set(conn, "allow_remote_approve_until", &until.to_string());
+    if let Err(e) = meta_set_checked(conn, "allow_remote_approve_until", &until.to_string()) {
+        return err_response(
+            id,
+            "safety_write_failed",
+            &format!("원격 승인 ON 을 저장하지 못했다 — 게이트는 열리지 않았다: {e}"),
+        );
+    }
     ok_response(id, json!({"allow_remote_approve": true, "until": until, "for_secs": secs}))
 }
 
@@ -2258,11 +2313,35 @@ fn lockdown(daemon: &Arc<Daemon>, conn: &mut Connection, id: &Value) -> Value {
             killed += 1;
         }
     }
-    let _ = conn.execute(
+    // ★★R3-C: 같은 규율 — 잠갔다고 보고하려면 **잠금이 적혀 있어야** 한다. 둘 중 하나라도
+    //   실패하면 인바운드 차단(meta)이나 채널 비활성(표)이 서지 않은 채 `lockdown: true` 가 나갔다.
+    // ★변이로 쟀다: MP-R3C-4(meta 쓰기 오류를 다시 버림)도 MP-R3C-5(아래 읽기 확인을 지움)도
+    //   **각각 혼자서는 검체를 빨갛게 만들지 못했다**(다른 하나가 잡는다) — 둘은 서로 중복이고
+    //   함께 심층 방어다. 둘 다 남기되, **어느 하나도 단독 근거가 아니라는 사실**을 여기 적어 둔다.
+    if let Err(e) = conn.execute(
         "UPDATE channels SET enabled=0, registered=0, scoped_pid=NULL, scoped_pgid=NULL, updated_ts=?1",
         params![now()],
-    );
-    meta_set(conn, "lockdown", "1");
+    ) {
+        return err_response(
+            id,
+            "safety_write_failed",
+            &format!("브리지는 종료했으나 채널 비활성을 저장하지 못했다 — 잠금으로 보고하지 않는다: {e}"),
+        );
+    }
+    if let Err(e) = meta_set_checked(conn, "lockdown", "1") {
+        return err_response(
+            id,
+            "safety_write_failed",
+            &format!("잠금 플래그를 저장하지 못했다 — 인바운드가 차단되지 않는다: {e}"),
+        );
+    }
+    if !lockdown_active(conn) {
+        return err_response(
+            id,
+            "safety_write_failed",
+            "잠금을 저장했는데도 잠금이 읽히지 않는다 — 잠금으로 보고하지 않는다",
+        );
+    }
     daemon.bus.publish(
         "channel.lockdown",
         "channel",
@@ -4411,6 +4490,183 @@ mod tests {
         assert_eq!(r["result"]["reason"], json!("cap_counter_unavailable"), "{r}");
         assert_eq!(nonce_used_flag(&d, "slack", &nonce), 0, "거부는 nonce 미소각");
         assert_eq!(feed_status(&d, "feed1").as_deref(), Some("pending"), "feed pending 유지");
+    }
+
+    // ── ★S7/R3-C: 실패한 안전 쓰기가 성공을 보고하지 않는가 (codex R2 major MJR-3) ──
+
+    /// ★R3-C 검체 전용 — 좌석 pid 칸을 **비운다**.
+    ///
+    /// ★왜 필요한가(실측 사고): `seed_registered` 는 `scoped_pid` 에 **이 테스트 프로세스의 pid**,
+    /// `scoped_pgid` 에 **이 프로세스의 그룹**을 넣는다. 그래서 `stop`·`lockdown` 을 그대로 부르면
+    /// `kill_group_or_pid` 가 **테스트 러너 자신의 프로세스 그룹을 죽인다** — 처음 돌렸을 때
+    /// 검체 3 개가 결과를 한 줄도 남기지 못하고 런이 통째로 사라졌다(rc 1 · 출력 0). 이 검체들이
+    /// 재는 것은 **영속 쓰기 실패의 보고**이지 kill 경로가 아니므로 pid 칸을 비워 kill 을 건너뛴다.
+    fn clear_scoped_pids(d: &Arc<Daemon>, channel: &str) {
+        let g = d.channels.lock().unwrap();
+        let conn = g.as_ref().unwrap();
+        conn.execute(
+            "UPDATE channels SET scoped_pid=NULL, scoped_pgid=NULL WHERE channel=?1",
+            params![channel],
+        )
+        .expect("pid 칸 비우기");
+    }
+
+
+    /// ★★AT-S7-R3C — **"OFF" 보고는 읽을 수 있는 게이트가 아직 허용하는 동안 인쇄될 수 없다**
+    /// (부서장 티켓 §1 R3-C 의 요구 성질 문언 그대로).
+    ///
+    /// 결함: `allow_remote_approve(--off)` 는 `meta_set` 의 UPDATE 오류를 버리고 **조건 없이**
+    /// `allow_remote_approve: false` 를 돌려줬다. 저장된 만료 ts 가 미래로 남아 있으면 게이트는
+    /// 그대로 **열려 있고**, 일시적 쓰기 고장이 지나간 뒤 그 값을 읽은 게이트가 **또 하나의 원격
+    /// 승인을 받는다**. 껐다고 믿은 사람은 다시 확인하지 않는다 — 거짓 영수증과 같은 부류다.
+    /// ★라벨: 쓰기 고장은 **구성한(constructed)** 것이다(`meta` 표에 ABORT 트리거).
+    #[test]
+    fn s7_r3c_an_off_report_is_unprintable_while_the_gate_still_permits() {
+        let d = tmp_daemon("s7_r3c_off");
+        seed_registered(&d, "slack", "t");
+        // 게이트를 연다(전제).
+        let on = call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        assert_eq!(on["result"]["allow_remote_approve"], json!(true), "{on}");
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            assert!(remote_approve_active(conn, now()), "전제: 게이트가 열렸다");
+            conn.execute_batch(
+                "CREATE TRIGGER s7r3c_block_ins BEFORE INSERT ON meta \
+                 BEGIN SELECT RAISE(ABORT,'r3c forced meta write failure'); END; \
+                 CREATE TRIGGER s7r3c_block_upd BEFORE UPDATE ON meta \
+                 BEGIN SELECT RAISE(ABORT,'r3c forced meta write failure'); END;",
+            )
+            .expect("트리거 설치");
+        }
+
+        // ① --off — 쓰기가 실패한다. ★"껐다"를 **인쇄하지 않는다**.
+        let off = call(&d, "allow-remote-approve", json!({"duration_secs": 0}), None);
+        assert!(
+            off["result"].is_null(),
+            "쓰기가 실패했는데 성공 응답이 나왔다: {off}"
+        );
+        assert_eq!(off["error"]["code"], json!("safety_write_failed"), "{off}");
+        // ② 그리고 **게이트는 실제로 아직 허용한다** — 그것이 ① 이 거짓이 될 수 있었던 이유다.
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            assert!(
+                remote_approve_active(conn, now()),
+                "이 검체의 전제가 깨졌다 — 게이트가 닫혔다면 ① 의 보고는 거짓이 아니었다"
+            );
+        }
+
+        // ③ 고장이 지나가면 OFF 가 **실제로** 되고, 그때만 성공을 보고한다.
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            conn.execute_batch("DROP TRIGGER s7r3c_block_ins; DROP TRIGGER s7r3c_block_upd;")
+                .expect("트리거 제거");
+        }
+        let off2 = call(&d, "allow-remote-approve", json!({"duration_secs": 0}), None);
+        assert_eq!(off2["result"]["allow_remote_approve"], json!(false), "{off2}");
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            assert!(!remote_approve_active(conn, now()), "OFF 보고가 났는데 게이트가 허용한다");
+        }
+    }
+
+    /// ★AT-S7-R3C-a2 — **쓰기가 착지했는데도 게이트가 다시 열려 있으면 그것도 OFF 가 아니다.**
+    ///
+    /// 이 검체가 없으면 "읽어서 확인한다" 한 줄은 **근거 없는 장치**다(변이 MP-R3C-2 가 그것을
+    /// 재고 나서 추가했다 — 쓰기 오류 검사만으로는 이 갈래가 덮이지 않는다). 구성 방법:
+    /// `meta` 에 **AFTER UPDATE 트리거**를 걸어 `allow_remote_approve_until` 이 `0` 으로 바뀐
+    /// 직후 **먼 미래 값으로 되돌린다**(SQLite 는 기본적으로 재귀 트리거가 꺼져 있어 한 번만 돈다).
+    /// ⇒ 쓰기는 **성공**하고 게이트는 **여전히 허용**한다 — 요구 성질이 가리키는 바로 그 상태다.
+    /// ★라벨: **구성한(constructed)** 상태다.
+    #[test]
+    fn s7_r3c_an_off_report_is_unprintable_when_the_write_lands_but_the_gate_reopens() {
+        let d = tmp_daemon("s7_r3c_reopen");
+        seed_registered(&d, "slack", "t");
+        let on = call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        assert_eq!(on["result"]["allow_remote_approve"], json!(true), "{on}");
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER s7r3c_reopen AFTER UPDATE ON meta \
+                 WHEN new.key='allow_remote_approve_until' AND new.value='0' \
+                 BEGIN UPDATE meta SET value='99999999999' WHERE key='allow_remote_approve_until'; END;",
+            )
+            .expect("트리거 설치");
+        }
+        let off = call(&d, "allow-remote-approve", json!({"duration_secs": 0}), None);
+        assert!(off["result"].is_null(), "게이트가 열린 채인데 OFF 를 보고했다: {off}");
+        assert_eq!(off["error"]["code"], json!("safety_write_failed"), "{off}");
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            assert!(
+                remote_approve_active(conn, now()),
+                "이 검체의 전제가 깨졌다 — 트리거가 게이트를 되열지 못했다"
+            );
+        }
+    }
+
+    /// ★AT-S7-R3C-b — **정지됐다는 보고도 영속 성공 뒤에만.** `stop` 은 브리지를 죽인 뒤
+    /// `enabled=0` 쓰기 오류를 버리고 `stopped: true` 를 돌려줬다 — 표에는 `enabled=1` 이 남아
+    /// **복구 스윕이 브리지를 되살린다**. ★라벨: 구성한 고장(`channels` 표에 ABORT 트리거).
+    #[test]
+    fn s7_r3c_a_stop_report_is_unprintable_when_the_disable_is_not_persisted() {
+        let d = tmp_daemon("s7_r3c_stop");
+        seed_registered(&d, "slack", "t");
+        clear_scoped_pids(&d, "slack"); // ★먼저 — 아래 주석 참조(러너 자살 방지)
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER s7r3c_block_chan BEFORE UPDATE ON channels \
+                 BEGIN SELECT RAISE(ABORT,'r3c forced channels write failure'); END;",
+            )
+            .expect("트리거 설치");
+        }
+        let r = call(&d, "stop", json!({"channel": "slack"}), None);
+        assert!(r["result"].is_null(), "영속이 실패했는데 정지 성공을 보고했다: {r}");
+        assert_eq!(r["error"]["code"], json!("safety_write_failed"), "{r}");
+        // 그리고 표는 **여전히 enabled=1** 이다(= 종전 보고가 거짓이었던 이유).
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            let enabled: i64 = conn
+                .query_row("SELECT enabled FROM channels WHERE channel=?1", params!["slack"], |r| r.get(0))
+                .expect("질의");
+            assert_eq!(enabled, 1, "이 검체의 전제가 깨졌다 — 비활성이 저장됐으면 보고는 참이었다");
+        }
+    }
+
+    /// ★AT-S7-R3C-c — **잠갔다는 보고도 잠금이 적힌 뒤에만.** `lockdown` 은 표 UPDATE 와 meta
+    /// 플래그 쓰기를 모두 버리고 `lockdown: true` 를 돌려줬다 — 인바운드가 차단되지 않는다.
+    #[test]
+    fn s7_r3c_a_lockdown_report_is_unprintable_when_the_flag_is_not_persisted() {
+        let d = tmp_daemon("s7_r3c_lock");
+        seed_registered(&d, "slack", "t");
+        clear_scoped_pids(&d, "slack"); // ★먼저 — lockdown 은 enabled=1 전부를 kill 한다
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER s7r3c_lock_meta_ins BEFORE INSERT ON meta \
+                 BEGIN SELECT RAISE(ABORT,'r3c forced meta write failure'); END; \
+                 CREATE TRIGGER s7r3c_lock_meta_upd BEFORE UPDATE ON meta \
+                 BEGIN SELECT RAISE(ABORT,'r3c forced meta write failure'); END;",
+            )
+            .expect("트리거 설치");
+        }
+        let r = call(&d, "lockdown", json!({}), None);
+        assert!(r["result"].is_null(), "잠금 플래그가 저장되지 않았는데 잠금을 보고했다: {r}");
+        assert_eq!(r["error"]["code"], json!("safety_write_failed"), "{r}");
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            assert!(!lockdown_active(conn), "전제: 잠금은 적히지 않았다");
+        }
     }
 
     // ── V4: 연속 실패 sender 쿨다운 ──
