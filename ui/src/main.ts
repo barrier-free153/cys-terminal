@@ -123,6 +123,7 @@ import {
   resetResultTitle,
   resetResultBody,
   freshStartLiveNotice,
+  TRASH_KEEP_NOTICE,
   resetGateVerdict,
   isBootGateRefusal,
   type ResetGateInput,
@@ -8258,7 +8259,8 @@ function fieldsModal(title: string, label: string, fields: any[]): Promise<strin
 }
 
 // ★기능2: 부서 완전 폐역 확인 — 부서명 타이핑 일치 시에만 "완전 삭제" 활성. 크기·최종 mtime·CEO 강등·
-// 격리 복구를 정직 고지한다(비가역처럼 보이나 실제는 격리 후 약 14일 소거 — 오도 금지). teardown-only 인
+// 격리 복구를 정직 고지한다(비가역처럼 보이나 실제는 격리 보관이고, ★S8 이후 **스스로 소거되지 않는다**
+// — 오도 금지: 자동 소거를 약속하면 그것이 거짓이 된다). teardown-only 인
 // 기존 탭 삭제(2-click 대체 close)와 별개 경로. resolve(true)=진행.
 function purgeConfirmModal(
   name: string,
@@ -8275,7 +8277,7 @@ function purgeConfirmModal(
       // 현실에서 "작업물 격리" 고지는 홈 격리 약속이 되는 오도였다. GUI는 --purge-workdir 미요청.
       "삭제되는 것: 부서 데몬 종료 + 대화기억·pack 격리 + 재시작 부활 영구 차단(묘비 존치). 작업 폴더(cwd)는 보존됩니다.",
       info.isLast ? "⚠ 이 부서가 마지막입니다 — 삭제 시 CEO가 표준 master로 강등됩니다." : "",
-      "복구: 즉시 삭제가 아니라 ~/.local/state/cys-trash/ 로 격리 보관되어 되돌릴 수 있고, 약 14일 후 자동 소거됩니다.",
+      "복구: 즉시 삭제가 아니라 ~/.local/state/cys-trash/ 로 격리 보관되어 되돌릴 수 있습니다. " + TRASH_KEEP_NOTICE,
       `계속하려면 아래에 부서명 "${name}" 을 정확히 입력하세요.`,
     ]
       .filter(Boolean)

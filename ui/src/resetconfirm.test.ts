@@ -89,7 +89,10 @@ describe("resetNoticeLines", () => {
     expect(all).toContain("3건은 삭제되지 않습니다");
     expect(all).toContain("직접 만든 설정"); // ~/.cys/local 기본 보존 계약(A8)
     expect(all).toContain("--undo"); // 복구 수단이 제품에 있다는 사실을 명시(P0)
-    expect(all).toContain("14일");
+    // ★S8 R-4: 자동 소거 약속이 사라졌다 — 그 약속을 다시 적으면 이 줄이 빨개진다.
+    expect(all).toContain("그대로 보관됩니다");
+    expect(all).not.toContain("14일");
+    expect(all).not.toContain("소거될 수 있습니다");
     expect(all).toContain("온보딩");
     expect(all).toContain(RESET_PHRASE);
     // ★P0-2: 세션 즉사 고지가 **첫 줄**이어야 한다 — 가장 되돌릴 수 없는 피해다.

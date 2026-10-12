@@ -279,7 +279,7 @@ dept_purge_state(){
     echo "[cys-dept] purge-state: 원위치 잔존($sd) — 격리 미완(FAIL)" >&2
     return 6
   fi
-  echo "[cys-dept] purge-state: $name state 격리 완료 → $trash/state (복구=mv 역방향·${CYS_TRASH_TTL_DAYS:-14}일 후 reap 소거)"
+  echo "[cys-dept] purge-state: $name state 격리 완료 → $trash/state (복구=mv 역방향 · 그대로 보관 — 이 도구는 지우지 않는다)"
   return 0
 }
 
@@ -2943,20 +2943,26 @@ PY
     done <<EOF
 $snap
 EOF
-    # ★기능2 trash 만료 소거: N일(기본 14·CYS_TRASH_TTL_DAYS) 경과 격리분을 영구 소거한다. 방치 시
-    # transcripts.db(부서당 최대 324MB)가 무한 누적되는데 resource_gate는 디스크 크기를 측정하지 않아
-    # 신호가 없다 — 이 sweep가 유일한 회수 경로. 소유·주기는 CSO_DIRECTIVE 참조. --dry면 판정만.
+    # ★S8 D-1 — 이 도구는 더 이상 휴지통을 **지우지 않는다**(표시만 한다).
+    #   종전: 같은 선택기로 고른 뒤 `rm -rf` 로 영구 소거했다(받는 쪽이 사람 명령이 아니었다).
+    #   지금: 같은 선택기로 고르고 **TRASH-OLD 로 알리기만** 한다. ★0.14.51 에는 격리분을 지우는
+    #   명령 경로가 **없다**(오너 명령 삭제 기구는 이 릴리스에서 철회됐다 — T-S8-WITHDRAW).
+    #   ★여기서 격리분 **안으로 아무 것도 쓰지 않는다**(표식 파일 없음).
+    #   '오래됨' 판정은 종전 그대로 `find -mtime +TTL` 이다(데몬의 이름 스탬프 판정을 쓰지 않는다).
+    #   ★알려진 결과: 아무 것도 스스로 공간을 회수하지 않는다. 휴지통은 커지는 대로 **그대로 둔다** —
+    #   자동 삭제를 되살릴 사유가 아니다. 잃는 것은 디스크 공간이고, 잘못 지울 때 잃는 것은 유일한 사본이다.
     nt=0
     if [ -d "$TRASH_ROOT" ]; then
       ttl="${CYS_TRASH_TTL_DAYS:-14}"
       while IFS= read -r _td; do
         [ -n "$_td" ] || continue
-        if [ "$dry" = 1 ]; then echo "[cys-dept] reap(dry): TRASH-EXPIRE $_td (>${ttl}d)"
-        else rm -rf "$_td" && nt=$((nt+1)) && echo "[cys-dept] reap: TRASH-EXPIRE $_td (>${ttl}d)"; fi
+        nt=$((nt+1))
+        if [ "$dry" = 1 ]; then echo "[cys-dept] reap(dry): TRASH-OLD $_td (>${ttl}d · kept - this tool no longer deletes it)"
+        else echo "[cys-dept] reap: TRASH-OLD $_td (>${ttl}d · kept - this tool no longer deletes it)"; fi
       done < <(find "$TRASH_ROOT" -mindepth 1 -maxdepth 1 -type d -mtime +"$ttl" 2>/dev/null)
     fi
     _dept_count="$(reg_count)" || exit $?
-    echo "[cys-dept] reap 완료(dry=$dry): DEAD=$nd IDLE=$ni SKIP=$ns TRASH-EXPIRE=$nt. 부서 수=$_dept_count"
+    echo "[cys-dept] reap 완료(dry=$dry): DEAD=$nd IDLE=$ni SKIP=$ns TRASH-OLD=$nt. 부서 수=$_dept_count"
     ;;
   promote-ceo)
     # 오너 지명 경로(2026-07-14): 오너/CSO가 기본 데몬 master를 CEO로 직접 지명 — 호출 자체가 동의.
