@@ -3971,7 +3971,7 @@ mod r2f_dm_factory_reset {
         assert!(CYS_BASE_EXACT2.contains(&".update-attempt.json"), "~/.cys/.update-attempt.json(인앱 업데이트 시도 기록)이 기본 격리 목록에 없다");
         assert_eq!(WIN_STATE_EXACT.len(), 25, "윈도우 상태 폴더 정확 이름 목록의 길이");
         assert!(WIN_STATE_EXACT.contains(&"DELETE-LEDGER.jsonl"), "오너 명령 삭제의 삭제 원장이 정확 일치 목록에 없다 — 윈도우에서는 초기화 뒤에도 남는다");
-        assert!(!WIN_STATE_ATOMIC.contains(&"DELETE-LEDGER.jsonl"), "삭제 원장은 append 로 쓰므로 원자 쓰기 목록에 있어서는 안 된다(`.DELETE-LEDGER.jsonl.tmp` 는 생기지 않는다)");
+        assert!(!WIN_STATE_ATOMIC.contains(&"DELETE-LEDGER.jsonl"), "삭제 원장은 append 로 쓰므로 원자 쓰기 목록에 있어서는 안 된다(`.DELETE-LEDGER.jsonl.tmp` 는 **생기지 않는다 — 다만 있으면 격리된다**: 잔재 축이 정확 이름 목록과도 일치한다)");
         for n in ["queue-blocked.json", "queue-blocked.prev.json", "approval-lane"] {
             assert!(WIN_STATE_EXACT.contains(&n), "윈도우 상태 폴더의 {n} 이 정확 일치 목록에 없다");
         }
@@ -4038,8 +4038,11 @@ mod r2f_dm_factory_reset {
         let _ = std::fs::remove_dir_all(&td);
     }
 
-    /// [행동 핀] 윈도우 상태 폴더에서 **삭제 원장**(`DELETE-LEDGER.jsonl`)은 **격리**되고, 이름이 비슷한 미등록 파일
-    /// (`DELETE-LEDGER.jsonl.bak` · `DELETE-LEDGER-notes.md` · `.DELETE-LEDGER.jsonl.tmp`)은 **보존**된다(정확 일치 원칙 · append 쓰기라 원자 잔재 축에 없다).
+    /// [행동 핀] 윈도우 상태 폴더에서 **삭제 원장**(`DELETE-LEDGER.jsonl`)은 **격리**된다. 이름이 비슷한 미등록 파일
+    /// (`DELETE-LEDGER.jsonl.bak` · `DELETE-LEDGER-notes.md`)은 **보존**되고, ★`.DELETE-LEDGER.jsonl.tmp` 는 **격리된다** —
+    /// 잔재 축([`is_win_state_name`] :233-239)이 선두 점과 꼬리 `.tmp` 를 벗긴 뒤 [`WIN_STATE_EXACT`] **또는**
+    /// [`WIN_STATE_ATOMIC`] 과 정확 일치로 보기 때문이다(:237-238). 원장은 append 로 쓰므로 그 이름을 **만들지 않지만**,
+    /// 있으면 상태로 분류된다 — 아래 본문이 그 축을 단언한다.
     /// ★부작용의 방향: 격리는 **이동**이고 삭제가 아니다 — 감사 이력은 격리 폴더에 남고 초기화된 설치에는 넘어가지 않는다.
     #[test]
     fn s8_factory_reset_plan_claims_the_delete_ledger_in_the_windows_state_dir() {
