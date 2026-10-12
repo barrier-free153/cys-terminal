@@ -1466,13 +1466,6 @@ fn verify_interaction(daemon: &Arc<Daemon>, conn: &Connection, channel: &str, pa
             //   서 있다. 핀에는 되돌림이 없고 항목은 이미 resolved 라, 다시 답해도 위 ④가
             //   `feed_not_pending` 으로 막는다 ⇒ 자격만 살아남아 **해소된 항목에 쓸 수 있는 재생
             //   수단**이 된다. 전제가 거짓이므로 그 carve-out 은 이득 없이 위험만 남긴다.
-            // ★이 판에서 `approval_nonce_used=1` 이 뜻하는 것(성찰 1 에서 내가 고른 의미를 적어 둔다):
-            //   **이 자격이 해소를 일으켰다.** 종전 순서에서는 "이 자격이 제시됐다"에 가까웠다 —
-            //   소각이 해소보다 앞섰으므로 아무것도 해소하지 못한 제시도 1 이 됐다. 뒤바뀐 순서에서
-            //   시도 없음(항목 소실·이미 해소)은 0 으로 남으므로, 0 은 이제 "쓰이지 않았다"가 아니라
-            //   **"이 자격으로 해소된 것이 없다"** 를 뜻한다. ★그래서 적용된 해소는 내구성이
-            //   미확인이어도 1 로 적는다 — 그러지 않으면 원장이 "쓰이지 않았다"고 **거짓**을 적는다
-            //   (거부 가능성이 아니라 **원장의 진실**이 여기서 지켜지는 것이다).
             let burn = conn.execute(
                 "UPDATE outbound SET approval_nonce_used=1, updated_ts=?2 WHERE id=?1 AND approval_nonce_used=0",
                 params![oid, now_ts],

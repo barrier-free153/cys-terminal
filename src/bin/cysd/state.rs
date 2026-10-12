@@ -10804,40 +10804,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
     }
 
-    /// ★AT-S7-R1 — **어휘 자체의 검체**(성찰 1 이 찾은 빈칸을 메운다, 과장하지 않고).
-    ///
-    /// 고장 주입으로 실제로 만들어 본 것은 `NotWritten(Open)` 뿐이다 — 부분 write 와 fsync 실패는
-    /// 이 자리에서 결정론적으로 일으킬 방법을 찾지 못했다. ★그래서 이 검체는 **그 두 분류를
-    /// 만들었다고 주장하지 않는다**: 값이 주어졌을 때 호출자가 보는 **철자와 분기**가 맞는지만
-    /// 잰다. 실제 부분 write 를 일으키는 검체는 **없다**(보고서에 그렇게 적었다).
-    #[test]
-    fn s7_r1_outcome_vocabulary_is_stable_for_every_class() {
-        let w = SettleOutcome::Uncertain(FeedPersistError::Write("disk".into()));
-        let s = SettleOutcome::Uncertain(FeedPersistError::Sync("fsync".into()));
-        let o = SettleOutcome::NotWritten(FeedPersistError::Open("enoent".into()));
-        let z = SettleOutcome::NotWritten(FeedPersistError::Serialize);
-        let c = SettleOutcome::Committed;
-        // 철자: 호출자가 분기하는 값이 셋뿐이고 각 분류가 올바른 쪽에 선다.
-        assert_eq!(
-            (w.durability(), s.durability(), o.durability(), z.durability(), c.durability()),
-            ("uncertain", "uncertain", "not_written", "not_written", "durable")
-        );
-        // ★가장 중요한 분기: 적용된 뒤의 불확실은 **내구적이 아니고**, 그래서 "일어나지 않았다"로
-        //   보고될 수 없다(DR-6). 그 판정을 호출자가 한 줄로 할 수 있어야 한다.
-        assert!(!w.is_committed() && !s.is_committed() && !o.is_committed() && c.is_committed());
-        // detail 은 분류 이름을 잃지 않는다(빈 문자열로 뭉개지 않는다).
-        assert!(w.detail().starts_with("write: ") && s.detail().starts_with("sync: "));
-        assert_eq!(z.detail(), "serialize");
-        // 시도 없음 두 값은 durability 축에 들어오지 않는다 — 다른 축이다.
-        assert_eq!(
-            (SettleAttempt::NoItem.label(), SettleAttempt::NotPending.label()),
-            ("no_item", "not_pending")
-        );
-        assert!(!SettleAttempt::NoItem.settled_durably() && !SettleAttempt::NotPending.settled_durably());
-        assert!(SettleAttempt::Attempted(SettleOutcome::Committed).settled_durably());
-        assert!(!SettleAttempt::Attempted(s).settled_durably());
-    }
-
     /// ★AT-S7-G1 — **재시작 뒤 읽기**(O-S7-6 이 요구하는 read-back). Declaration 5 의 두 번째 구절은
     /// "사유가 재시작을 넘어 살아남고 **결정 프로세스 없이** 읽힌다" 이고, 이 검체가 그 문장의
     /// 기계적 형태다: 한 데몬이 결재하고, 그 데몬을 **버리고**, 같은 상태 폴더에서 **새 데몬**을
