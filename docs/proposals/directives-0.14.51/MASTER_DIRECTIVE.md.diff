@@ -1,0 +1,27 @@
+--- /Users/cys/Desktop/CYSjavis/_worktrees/impl-0.14.50-i/cysjavis-pack/directives/MASTER_DIRECTIVE.md	2026-10-11 02:57:43
++++ /private/tmp/claude-501/-Users-cys/76e55355-eb50-4f7b-93b9-a3fc75b5bb44/scratchpad/dirnew/cysjavis-pack/directives/MASTER_DIRECTIVE.md	2026-10-12 18:00:27
+@@ -296,9 +296,21 @@
+   대상행 큐가 적체되면 데몬이 `queue.depth_high`(기본 depth 5+)를 발행한다 — 수신 시
+   노드를 read-screen으로 점검하라. 큐 **머리**가 임계 이상 막혀 있으면 `queue.starved`
+   (기아 · `CYS_QUEUE_STARVE_ALERT_SECS` 기본 600초 · depth_high와 별도 축)가 발행된다 —
+-  요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)는 사람에게 그대로 전달한다. **★LLM
+-  에이전트(master·CEO·CSO 포함)는 자동 조치(강제 배달 `cys queue deliver`·드레인·키 주입·동결
+-  해제·항목 삭제) 금지 — 사람 운영자 전용(depth_high 와 겹쳐도).**
++  요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)는 사람에게 그대로 전달한다. **★구 금지 조항
++  (「LLM 에이전트(master·CEO·CSO 포함)는 자동 조치 — 강제 배달 `cys queue deliver`·드레인·키 주입·
++  동결 해제·항목 삭제 — 금지, 사람 운영자 전용」)은 오너 규칙(2026-10-12)으로 해제됐다** — 오너 문언
++  그대로: "그리고 큐 막힘은 cso가 자동으로 모두 처리하게 하라. 큐 막힘으로 자비스 전체의 성능이
++  하락하거나, 속도가 느려지거나, 업무 효율성이 떨어지면 안된다. cso가 즉각즉각 해결하게 하라."
++  ★**그러나 기구는 아직 출하되지 않았다 — 0.14.51 에는 자동 처방을 수행하는 것이 없다**(S6 는 관측만
++  출하하고 drop·clear 두 갈래는 보류다). 그러므로 이 자리는 **권위의 기록**이고 현재 동작의 서술이
++  아니다 — 지금 `remedy=<코드>`·`blocked_by` 는 위와 같이 사람에게 전달한다. ★기구가 들어올 때는
++  **오너의 두 한계를 함께 지킨다**: **사람이 친 글을 지우지 않는다 · 떠 있는 창의 기본값을 누르지
++  않는다**(2026-09-30 사고 경로 — 다른 좌석의 Return 이 결재창을 닫아 비가역 삭제가 집행됐다). 기계로
++  풀 수 있는 막힘과 **사람의 글이 걸려 있는 막힘**은 같은 것으로 다루지 않는다.
++  ★**아직 금지를 말하는 제품 문면이 하나 남아 있다**: 데몬은 경보 처방 문장 끝에 「· LLM 에이전트는 자동
++  조치(강제 배달·드레인·키 주입·동결 해제·항목 삭제) 금지」를 붙인다(`REMEDY_LLM_SUFFIX` — 0.14.51 에도
++  그대로 출하된다). 그 꼬리는 기구가 들어오는 판에서 함께 판정한다 — 그때까지 **문면이 둘이라는 것을 알고**
++  읽어라(지침=오너 규칙으로 해제 · 제품 문면=아직 금지).
+ - **위임 티켓 — task-prompt 의무 (work management 앵커 1·강조 의무 / 눈대중 금지)**:
+   워커에게 task를 위임하는 프롬프트는 반드시
+   `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" task-prompt --task "<T>"
