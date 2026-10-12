@@ -1,14 +1,14 @@
-//! S5 — the queue-block warning leaves the owner's sight. The carrier that would take a person-remedy block to a person is DEFINED in this file and NOT YET WIRED: nothing calls it at the tip (see the `dead_code` note below).
+//! S5 — the queue-block warning leaves the owner's sight, and the person-remedy still reaches a person.
 //!
 //! ## IMPLEMENTATION CONTRACT (read this before changing anything below)
 //!
 //! A queue block that **only a person can clear** must still reach a person after the owner's rule removed
 //! queue-block *warnings* from his sight. One escalation, two carriers, chosen by **one ordered** selector:
 //!
-//! * **Carrier A** — the master seat reports through its ordinary chain (directive text; nothing in this file calls it).
+//! * **Carrier A** — the master seat reports through its ordinary chain.
 //! * **Carrier B** — the master seat is itself blocked by a person-remedy code (or its hang test is met), so
-//!   the actor that would carry the report is the failing one. The escalation WOULD leave through the CSO's
-//!   pre-existing owner-feed escape; no code calls [`select_carrier`] yet. No new feed kind and no new owner surface is added.
+//!   the actor that would carry the report is the failing one. The escalation leaves through the CSO's
+//!   pre-existing owner-feed escape. No new feed kind and no new owner surface is added.
 //!
 //! ### THE ORDER IS PART OF THE CONTRACT, NOT AN IMPLEMENTATION DETAIL (minor m3)
 //! Carrier A's literal predicate is `!eligible` and carrier B's is `eligible OR hang`, so **a calm-code hang
@@ -25,8 +25,8 @@
 //!   `feed.reply` refuses any item whose status is not `pending` with `invalid_params` / "item already
 //!   resolved", and the daemon's timeout path only rewrites an item that is still `pending`, returning the
 //!   real decision when a reply won the race. This module therefore **adds no guard**; it records the outcome.
-//! * **The incident is not lost (once the store is called).** Expiry WOULD be recorded durably against the **stable incident id** as the
-//!   outcome [`OUTCOME_UNANSWERED`] with the attempt count; at the tip nothing calls the store. Silence toward the owner must not become silence
+//! * **The incident is not lost.** Expiry is recorded durably against the **stable incident id** as the
+//!   outcome [`OUTCOME_UNANSWERED`] with the attempt count. Silence toward the owner must not become silence
 //!   in the record.
 //! * **A re-approach is a NEW ITEM, never a revival** — no writer can modify a settled item — and it happens
 //!   only when the ordered selector fires again on a **FRESH OBSERVATION** of the same incident id, **never on
