@@ -5,13 +5,6 @@
 
 /// CLI `cys factory-reset` 의 FACTORY_RESET_PHRASE 와 동일 문자열 계약 — 갈리면 문서·안내가
 /// 서로 다른 문구를 요구하게 된다.
-/// ★S8 R-4: 격리분의 수명에 대해 제품이 하는 말 — **한 곳에만** 적는다. 여기 한 줄을 고치면
-/// 완전 초기화 모달·부서 삭제 모달·휴지통 탭이 함께 바뀐다(종전에는 같은 약속이 네 곳에 흩어져
-/// 있었고, 그래서 자동 소거가 사라진 뒤에도 세 곳이 계속 그것을 약속했다).
-/// 이 문장은 **무엇이 일어나는가**만 말하고 누가 허용되는지는 말하지 않는다(r2 §8 문안 규칙).
-export const TRASH_KEEP_NOTICE =
-  "격리본은 그대로 보관됩니다 — 이 제품은 더 이상 스스로 지우지 않습니다(삭제는 Control Center 의 휴지통에서 명령합니다).";
-
 export const RESET_PHRASE = "완전 초기화";
 
 // ★P2-1: 확인 문구 정규화 — CLI `normalize_confirm_phrase` 와 **같은 규칙**이어야 한다
@@ -169,8 +162,7 @@ export function resetNoticeLines(info: ResetPreview): string[] {
   }
 
   lines.push(
-    "복구: 즉시 삭제가 아니라 격리 보관되어 되돌릴 수 있습니다 — 완료 후 안내되는 폴더에서 `cys factory-reset --undo <폴더>`. " +
-      TRASH_KEEP_NOTICE,
+    "복구: 즉시 삭제가 아니라 격리 보관되어 되돌릴 수 있습니다 — 완료 후 안내되는 폴더에서 `cys factory-reset --undo <폴더>`. 격리본은 약 14일 뒤 정리 작업에서 소거될 수 있습니다.",
   );
   lines.push("완료 후 앱을 다시 실행하면 설치 온보딩이 처음부터 시작됩니다.");
   lines.push(`계속하려면 아래에 "${RESET_PHRASE}" 를 정확히 입력하세요.`);

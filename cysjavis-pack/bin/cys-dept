@@ -330,8 +330,7 @@ dept_purge_state(){
     return 6
   fi
   producer_mark "$trash" complete
-  # ★S8 R-4·m4: 자동 소거 약속을 지웠다 — reap 은 더 이상 지우지 않고 오래됨만 알린다.
-  echo "[cys-dept] purge-state: $name state 격리 완료 → $trash/state (복구=mv 역방향 · 그대로 보관 — 삭제는 Control Center 의 휴지통에서 오너가 명령한다)"
+  echo "[cys-dept] purge-state: $name state 격리 완료 → $trash/state (복구=mv 역방향·${CYS_TRASH_TTL_DAYS:-14}일 후 reap 소거)"
   return 0
 }
 
