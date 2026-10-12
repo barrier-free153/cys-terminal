@@ -2199,7 +2199,12 @@ impl Surface {
         let (model, fg_used) = self.pending_input_model_with_fg();
         let mut st = self.pending_input.lock().unwrap_or_else(|e| e.into_inner());
         st.count = self.pending_input_bytes.load(Ordering::Relaxed); // 미러가 count 의 SOT
-        // count 만 바꾸는 경로(큐 Inject·롤백 `set_pending_input`)가 지나간 뒤 불변식 human ≤ count 를 복원 — human 은 D-12 Return 게이트 축이라 stale 하면 자기 본문 제출이 거부된다.
+        // count 만 바꾸는 경로(큐 Inject·롤백 `set_pending_input`)가 지나간 뒤 불변식 human ≤ count 를 복원 — 이 복원이 보호하는 쪽은
+        // **raw `human` 을 그대로 읽는 소비자들**이다: `governance::draft_machine_owned` · absorb 의 human 사유 드롭(기계의 **자기 본문** 제출을 막는다) ·
+        // `schedule::draft_divert_step` · 그리고 `surface.list`·`queue.list` 가 **raw 로** 내보내는 `pending_input_human_bytes`(그 값을 사이클 판정
+        // `cys::cycle_target_state` 와 GUI 재시작 계획 `restartplan` 이 읽는다).
+        // ★D-12 Return 게이트(`draft_gate`)와 큐 진단(`queue_block_diag_with`)은 **자기 안에서 `human.min` 을 하므로 이 stale 을 애초에 보지 못한다** —
+        //   그 둘은 이 복원의 이유가 아니다(0.14.51 S1 재유도 · 게이트를 raw 로 바꾸는 변경은 B-080 에서 폐기됐다).
         st.human = st.human.min(st.count);
         let mut next = crate::governance::pending_input_step_model(
             &st,
