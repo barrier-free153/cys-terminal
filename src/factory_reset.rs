@@ -135,7 +135,7 @@ const TEMP_SWEEP_PREFIX: [&str; 7] = [
 /// 격리하면 **앱 자신(cys.exe·cysd.exe·runtime/·resources/)을 언인스톨**해 버린다.
 /// → `~/.cys` 와 같은 교리를 적용한다: **알려진 상태 항목만** 격리하고 나머지(=설치본)는 보존.
 /// 놓친 상태 파일이 남는 것은 불편이지만, 앱을 옮기는 것은 복구 불능급 사고다(fail-safe 방향).
-const WIN_STATE_EXACT: [&str; 24] = [
+const WIN_STATE_EXACT: [&str; 25] = [
     "transcripts.db",
     "analytics.db",
     "channels.db",
@@ -164,6 +164,15 @@ const WIN_STATE_EXACT: [&str; 24] = [
     // ★(성찰 2회차 m-1 · 0.14.44 A4) 승인 묶음 식별자 — 상태 폴더의 무작위 값 파일(`approval::LANE_FILE`). 윈도우 본부의 상태 폴더는 설치 폴더와 같아 알려진 이름만 격리하므로 여기 없으면 초기화 뒤에도 남는다.
     //   `write_json_atomic` 으로 쓰므로 임시 잔재 `.approval-lane.tmp` 는 [`WIN_STATE_ATOMIC`] 이 잡는다.
     "approval-lane",
+    // ★(S8 · 0.14.51) 오너 명령 삭제의 **삭제 원장** — `trash.rs` 의 `DELETE_LEDGER` 가 데몬 상태 폴더에 append+fsync 로 쓴다
+    //   (의도·거부·결과 기록 · 설계 `DESIGN-S8.md:101` 은 휴지통 뿌리였고 2026-10-12 판정으로 **state dir** 가 정본이 됐다 — `DESIGN-S8-SUPERSESSION-1-ledger-location.md`).
+    //   윈도우 본부의 상태 폴더는 **설치 폴더와 같아** 알려진 이름만 격리하므로 여기 없으면 초기화 뒤에도 남는다 — 형제 `.jsonl` 네 개
+    //   (`feed.jsonl`·`dead-letters.jsonl`·`approval_audit.jsonl`·`alert-route-folded.jsonl`)가 이미 이름으로 등재돼 있어 이 하나의 부재는 정책이 아니라 **누락**이었다.
+    //   `write_json_atomic` 이 아니라 append 로 쓰므로 [`WIN_STATE_ATOMIC`](임시 잔재 `.{name}.tmp` 판정용)에는 넣지 않는다 —
+    //   ★단 `is_win_state_name` 의 잔재 축은 이 **정확 이름 목록과의 일치**로도 판정하므로, 실제로는 생기지 않는
+    //   `.DELETE-LEDGER.jsonl.tmp` 도 상태로 분류된다(실측 · 격리는 이동이라 해가 작다 · 행동 핀에 박아 두었다).
+    //   격리는 **이동이고 삭제가 아니다** — 감사 이력은 격리 폴더에 남고 새 설치에는 넘어가지 않는다.
+    "DELETE-LEDGER.jsonl",
 ];
 
 /// 접두로 잡는 Windows 상태 항목(부서 슬러그 디렉토리·저널/스풀 디렉토리·손상 격리본).
@@ -3960,7 +3969,9 @@ mod r2f_dm_factory_reset {
         assert_eq!(CYS_BASE_EXACT2.len(), 12, "~/.cys 직하 정확 이름 목록(2차)의 길이");
         assert!(CYS_BASE_EXACT2.contains(&"claude-tui-written.json") && crate::claude_tui::LEDGER_FILE.ends_with("/claude-tui-written.json"), "claude tui 원장이 기본 격리 목록에 없다");
         assert!(CYS_BASE_EXACT2.contains(&".update-attempt.json"), "~/.cys/.update-attempt.json(인앱 업데이트 시도 기록)이 기본 격리 목록에 없다");
-        assert_eq!(WIN_STATE_EXACT.len(), 24, "윈도우 상태 폴더 정확 이름 목록의 길이");
+        assert_eq!(WIN_STATE_EXACT.len(), 25, "윈도우 상태 폴더 정확 이름 목록의 길이");
+        assert!(WIN_STATE_EXACT.contains(&"DELETE-LEDGER.jsonl"), "오너 명령 삭제의 삭제 원장이 정확 일치 목록에 없다 — 윈도우에서는 초기화 뒤에도 남는다");
+        assert!(!WIN_STATE_ATOMIC.contains(&"DELETE-LEDGER.jsonl"), "삭제 원장은 append 로 쓰므로 원자 쓰기 목록에 있어서는 안 된다(`.DELETE-LEDGER.jsonl.tmp` 는 생기지 않는다)");
         for n in ["queue-blocked.json", "queue-blocked.prev.json", "approval-lane"] {
             assert!(WIN_STATE_EXACT.contains(&n), "윈도우 상태 폴더의 {n} 이 정확 일치 목록에 없다");
         }
@@ -4027,6 +4038,42 @@ mod r2f_dm_factory_reset {
         let _ = std::fs::remove_dir_all(&td);
     }
 
+    /// [행동 핀] 윈도우 상태 폴더에서 **삭제 원장**(`DELETE-LEDGER.jsonl`)은 **격리**되고, 이름이 비슷한 미등록 파일
+    /// (`DELETE-LEDGER.jsonl.bak` · `DELETE-LEDGER-notes.md` · `.DELETE-LEDGER.jsonl.tmp`)은 **보존**된다(정확 일치 원칙 · append 쓰기라 원자 잔재 축에 없다).
+    /// ★부작용의 방향: 격리는 **이동**이고 삭제가 아니다 — 감사 이력은 격리 폴더에 남고 초기화된 설치에는 넘어가지 않는다.
+    #[test]
+    fn s8_factory_reset_plan_claims_the_delete_ledger_in_the_windows_state_dir() {
+        let td = std::env::temp_dir().join(format!("cys-s8-freset-ledger-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let inst = td.join("AppData/Local/cys");
+        touch(&inst.join("cys.exe"), "MZ"); // 설치본(보존 대상)
+        touch(&inst.join("DELETE-LEDGER.jsonl"), "{\"kind\":\"intent\"}\n");
+        touch(&inst.join("DELETE-LEDGER.jsonl.bak"), "owner");
+        touch(&inst.join("DELETE-LEDGER-notes.md"), "owner");
+        touch(&inst.join(".DELETE-LEDGER.jsonl.tmp"), "x");
+        let plan = build_plan(&roots_in(&td, Some(inst.clone())), &ResetOptions { purge_license: false, purge_local: false, purge_round: false });
+        let (q, k) = names(&plan);
+        assert!(q.contains(&"DELETE-LEDGER.jsonl".to_string()), "삭제 원장이 격리 계획에 없다 — 윈도우에서는 초기화 뒤에도 남는다 · 격리: {q:?} · 보존: {k:?}");
+        for keep in ["DELETE-LEDGER.jsonl.bak", "DELETE-LEDGER-notes.md"] {
+            assert!(!q.contains(&keep.to_string()), "{keep}: 미등록 파일을 격리했다 — 보존 계약 위반: {q:?}");
+        }
+        // ★실측된 부작용(내가 기대를 틀렸고 제품이 맞았다): 정확 이름을 목록에 넣으면 `is_win_state_name` 의
+        //   **세 번째 축**(원자 쓰기 임시 잔재 `.{name}.tmp` 는 [`WIN_STATE_EXACT`]·[`WIN_STATE_ATOMIC`] 과의 정확
+        //   일치로 판정)이 `.DELETE-LEDGER.jsonl.tmp` 까지 상태로 분류한다. 원장은 append 로 쓰므로 그 이름을
+        //   **만들지 않는다** — 그래도 그 이름의 파일이 있으면 격리된다(격리는 이동이라 해는 작다). 모르는 채
+        //   두지 않고 여기에 박아 둔다: 이 줄이 붉어지면 판정 축이 바뀐 것이다.
+        assert!(q.contains(&".DELETE-LEDGER.jsonl.tmp".to_string()),
+                "원자 잔재 축의 판정이 바뀌었다(종전: 정확 이름 목록에 있으면 `.{{name}}.tmp` 도 상태로 분류): {q:?}");
+        assert!(k.contains(&"cys.exe".to_string()), "전제: 설치본은 보존한다: {k:?}");
+        // 격리의 뜻 — 분류가 `Quarantine` 이고, 그 등급의 집행이 **이동**(rename/mv)이라는 것은
+        // `execute_moves_writes_manifest_and_is_rerun_safe` 가 이미 박고 있다(여기서 다시 세우지 않는다).
+        // ⇒ 감사 이력은 격리 폴더에 남고 초기화된 설치에는 넘어가지 않는다.
+        let row = plan.quarantine.iter().find(|i| i.path.file_name().map(|n| n == "DELETE-LEDGER.jsonl").unwrap_or(false)).expect("원장 행");
+        assert_eq!(row.action, Action::Quarantine, "원장이 격리 등급으로 분류되지 않았다 — 감사 이력이 사라질 수 있다");
+        assert!(is_win_state_name("DELETE-LEDGER.jsonl"), "이름 판정 자체");
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
     /// [소스 핀] 인벤토리의 이름은 **생산자 상수와 같다** — 데몬의 사유 파일 상수(`QUEUE_BLOCKED_FILE`·`QUEUE_BLOCKED_PREV_FILE`)가 바뀌거나 이름이 갈리면 적색이다(인벤토리가 옛 이름을 들고 있는 채로 초록이 되지 않게).
     #[test]
     fn r2f_dm_factory_reset_inventory_names_match_the_daemon_producer_constants() {
@@ -4044,5 +4091,15 @@ mod r2f_dm_factory_reset {
         assert!(WIN_STATE_ATOMIC.contains(&cur.as_str()), "`write_json_atomic` 으로 쓰는 사유 파일이 원자 쓰기 목록에 없다");
         // 그 파일이 정말 `write_json_atomic` 으로 쓰이는가(목록의 근거) — 생산 구간에서 호출이 상수와 함께 있다.
         assert!(gov.contains("write_json_atomic(&dir, QUEUE_BLOCKED_FILE,"), "사유 파일 쓰기가 `write_json_atomic` 이 아니게 됐다 — 원자 쓰기 목록의 근거가 바뀌었다");
+        // ★(S8 · 0.14.51) 삭제 원장도 같은 방식으로 데몬 상수에 묶는다 — 인벤토리가 옛 이름을 들고 초록이 되지 않게.
+        let trash = include_str!("bin/cysd/trash.rs");
+        let head = "pub const DELETE_LEDGER: &str = \"";
+        let i = trash.find(head).expect("데몬에 DELETE_LEDGER 상수가 없다");
+        let rest = &trash[i + head.len()..];
+        let ledger = &rest[..rest.find('"').expect("리터럴 끝")];
+        assert_eq!(ledger, "DELETE-LEDGER.jsonl");
+        assert!(WIN_STATE_EXACT.contains(&ledger), "데몬이 쓰는 삭제 원장 이름이 인벤토리에 없다");
+        assert!(!WIN_STATE_ATOMIC.contains(&ledger), "삭제 원장은 append 로 쓴다 — 원자 쓰기 목록의 근거가 없다");
+        assert!(trash.contains("fn ledger_append(dir: &Path"), "원장 쓰기 함수 모양이 바뀌었다 — append 축의 근거를 다시 확인하라");
     }
 }

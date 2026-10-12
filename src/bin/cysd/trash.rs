@@ -1561,6 +1561,30 @@ mod tests {
             assert!(!safe_name(bad), "{bad:?} 는 거부돼야 한다");
         }
     }
+    /// ★(S8 · 0.14.51 · 부서장 판정 ③) 원장은 **삭제 경로가 닿는 나무 밖**에 산다 — `trash_root()`(이 파일 :81)와
+    /// `state_dir()`(state.rs)의 분리를 **붉어지는 형태로** 박는다. 구조적 사실만 있고 핀이 없으면 장식이다:
+    /// 누군가 원장을 휴지통 뿌리로 되돌리면(폐기된 `DESIGN-S8.md:101` 의 자리 · 정본은
+    /// `DESIGN-S8-SUPERSESSION-1-ledger-location.md`) 이 검체가 붉어진다.
+    /// ★세 번째 단언이 **왜 성분 비교여야 하는지**를 같이 박는다 — 문자열 접두로 비교하면 `…/cys-trash` 가
+    /// `…/cys` 로 시작하므로 "뿌리 안이다"로 잘못 읽힌다(`Path::starts_with` 는 성분 단위다).
+    #[test]
+    fn the_delete_ledger_lives_outside_the_tree_the_delete_path_can_reach() {
+        let root = trash_root();
+        // 기지 데몬의 제품 규약 소켓 — 그 부모가 상태 폴더다(state.rs `state_dir`).
+        let sock = cys::home_dir().join(".local/state/cys/cysd.sock");
+        let state = crate::state::state_dir(&sock);
+        let ledger = state.join(DELETE_LEDGER);
+        assert!(!ledger.starts_with(&root),
+                "원장이 휴지통 뿌리 안이다 — 삭제 경로가 자기 원장을 지울 수 있다: {} ⊂ {}",
+                ledger.display(), root.display());
+        assert!(!state.starts_with(&root) && !root.starts_with(&state),
+                "상태 폴더와 휴지통 뿌리가 포함 관계다: {} / {}", state.display(), root.display());
+        let rn = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let sn = state.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        assert!(!rn.is_empty() && !sn.is_empty() && rn.starts_with(&sn),
+                "전제: 두 이름은 문자열로는 접두 관계다(그래서 성분 비교가 필요하다): {rn} / {sn}");
+    }
+
     #[test]
     fn a_symlinked_or_nondir_root_is_refused() {
         let base = rig("rootsane");
