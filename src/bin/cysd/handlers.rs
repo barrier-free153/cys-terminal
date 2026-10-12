@@ -8276,14 +8276,23 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // resolve_feed_item_audited가 단일 수행한다(reason·caller 포함).
             // W4-A: caller_sid(위에서 이미 조상 추적으로 해석)를 함께 넘겨 해소 주체를 각인한다
             // — operator token 해소는 caller_sid=None이라 resolver_pid만 남는다(사실 그대로).
-            match daemon.resolve_feed_item_audited(
+            // ★S7 (0.14.51 · O-S7-2): 코어를 직접 불러 **무슨 일이 일어났는가**를 받는다.
+            //   ★한 규칙, 두 호출 지점(이곳과 채널 승인): **결정이 적용된 뒤의 하류 실패는
+            //   거부·부재·"아직 아님"으로 보고될 수 없다.** 설계 §2.1 row 1 의 처방("NotWritten →
+            //   오류 응답, 항목은 여전히 pending")은 **핀에서 전제가 거짓**이다 — 상태 전이가
+            //   영속보다 먼저 임계영역 안에서 끝나므로 pending 이라고 답하는 것은 데몬이 자기
+            //   상태에 관해 사실이 아닌 말을 하는 것이고, 그 답을 받은 호출자의 재시도는 위
+            //   precheck 가 `item already resolved` 로 거부한다. 그래서 **적용됨 + 내구성 사실**을
+            //   돌려준다(부서장 판정 2026-10-12).
+            let (settled, attempt) = daemon.resolve_feed_item_settled(
                 &request_id,
                 &decision,
                 reason.as_deref(),
                 caller_pid,
                 caller_sid,
-            ) {
-                Some(_) => {
+            );
+            match (settled, attempt) {
+                (Some(_), crate::state::SettleAttempt::Attempted(outcome)) => {
                     // W3.6 거부 카운터(형해화 back-pressure) — deny 계열 결재만 집계.
                     // flag ON일 때만(C-4: OFF=현행 100% 동일 — 카운터도 미기록).
                     if daemon.config.approve_auto_route
@@ -8291,7 +8300,23 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     {
                         record_approval_deny(daemon, pub_sid);
                     }
-                    let mut result = json!({"request_id": request_id, "decision": decision});
+                    let mut result = json!({
+                        "request_id": request_id, "decision": decision,
+                        // ★S7 additive·호출자 분기용: `durable` | `not_written` | `uncertain`.
+                        //   ★`durable` 이 아니어도 **결정은 적용됐다** — 그래서 이 응답은 성공이고,
+                        //   호출자는 이 칸으로 "다시 보낼지"가 아니라 "기록을 읽어 확인할지"를 정한다
+                        //   (같은 요청을 다시 보내면 `item already resolved` 로 거부된다).
+                        "durability": outcome.durability(),
+                        "durability_detail": outcome.detail(),
+                    });
+                    if !outcome.is_committed() {
+                        eprintln!(
+                            "cysd: feed.reply {request_id} — 결정 적용됨(기록 {}: {}) · \
+                             거부로 보고하지 않는다(S7/DR-6)",
+                            outcome.durability(),
+                            outcome.detail()
+                        );
+                    }
                     // ★0.14.42 R7: 해소 성공 뒤에만 allow 권한을 닫는다(1회). 닫기 실패는 해소를 되돌리지
                     //   않는다 — 두 번째 해소는 위 precheck 가 `item already resolved` 로 막는다(멱등).
                     if let (true, Some(t)) = (token_ok, team_token.as_deref()) {
@@ -8307,7 +8332,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     Reply::Single(ok_response(&id, result))
                 }
                 // precheck 후 동시 해소(레이스)로 pending이 사라짐 — 이미 해소로 보고.
-                None => Reply::Single(err_response(&id, "invalid_params", "item already resolved")),
+                // ★S7: 이 갈래는 **시도 자체가 없었던** 경우뿐이다(`NoItem`·`NotPending`) —
+                //   즉 이 호출이 아무것도 적용하지 않았으므로 오류로 답하는 것이 사실이다.
+                _ => Reply::Single(err_response(&id, "invalid_params", "item already resolved")),
             }
         }
 
@@ -26900,6 +26927,67 @@ mod tests {
             assert!(!it.auto_route, "영속 스냅샷에 auto_route=true 각인됨");
         }
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★AT-S7-C3 — `feed.reply` 의 **세 번째 팔**: 영속이 실패해도 응답은 **오류가 아니다.**
+    ///
+    /// 설계 §2.1 row 1 은 "`NotWritten` → 오류 응답, 항목은 여전히 pending" 이라고 적었지만 그
+    /// 전제는 핀에서 거짓이다(상태 전이가 영속보다 먼저 임계영역 안에서 끝난다). 그래서 이
+    /// 검체가 박는 것은 부서장이 판정한 규칙이다 — **결정이 적용된 뒤의 하류 실패는 거부·부재·
+    /// "아직 아님"으로 보고될 수 없다.** 고장 주입은 B 단계와 같은 결정론 방식이다(feed.jsonl
+    /// 자리를 디렉터리로 만들어 open 을 실패시킨다).
+    #[test]
+    fn s7_c3_feed_reply_reports_applied_with_truthful_durability() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_auto("s7-c3", false);
+        seed_caller(&daemon, 900_011, 71);
+        seed_caller(&daemon, 900_012, 72);
+        let _ = dispatch(&daemon, w3_push(1, "s7c3", "수동 결재 요청", "본문", None), Some(900_011));
+        // 고장 주입은 push **뒤**에 — 생성 경로가 아니라 해소 경로의 응답을 보려는 검체다.
+        let feed_path = crate::state::state_dir(&daemon.socket_path).join("feed.jsonl");
+        let _ = std::fs::remove_file(&feed_path);
+        std::fs::create_dir_all(&feed_path).expect("고장 주입용 디렉터리");
+
+        let rr = Request {
+            id: json!(2),
+            method: "feed.reply".into(),
+            params: json!({"request_id": "s7c3", "decision": "allow", "reason": "근거 확인"}),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, rr, Some(900_012)) else {
+            panic!("single");
+        };
+        // ★성공 응답이다 — 결정은 적용됐다.
+        assert_eq!(resp["ok"], json!(true), "적용된 결재가 오류로 보고됐다: {resp}");
+        assert_eq!(resp["result"]["decision"], json!("allow"), "{resp}");
+        // ★그리고 내구성은 **사실대로** 실린다(호출자가 분기할 수 있는 값).
+        assert_eq!(resp["result"]["durability"], json!("not_written"), "{resp}");
+        assert!(
+            resp["result"]["durability_detail"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("open: ")),
+            "{resp}"
+        );
+        // 메모리는 resolved + 사유 각인 — 그래서 "아직 pending" 은 거짓이었다.
+        {
+            let items = daemon.feed_items.lock().unwrap();
+            let it = items.iter().find(|i| i.request_id == "s7c3").expect("항목");
+            assert_eq!(it.status, "resolved", "해소가 적용되지 않았다");
+            assert_eq!(it.decision_reason.as_deref(), Some("근거 확인"), "사유 미각인");
+        }
+        // 같은 요청의 재시도는 **시도 없음**이라 오류가 사실이다(그래서 재시도를 권하는 응답을
+        // 주지 않는 것이 맞다).
+        let again = Request {
+            id: json!(3),
+            method: "feed.reply".into(),
+            params: json!({"request_id": "s7c3", "decision": "allow"}),
+        };
+        let Reply::Single(resp2) = dispatch(&daemon, again, Some(900_012)) else {
+            panic!("single");
+        };
+        assert_eq!(resp2["ok"], json!(false), "두 번째 해소는 시도 없음이다: {resp2}");
+
+        let _ = std::fs::remove_dir(&feed_path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

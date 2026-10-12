@@ -1434,26 +1434,60 @@ fn verify_interaction(daemon: &Arc<Daemon>, conn: &Connection, channel: &str, pa
     if decision == "allow" && cap_reached(daily_allow_count(conn, &local_date(now_ts)), REMOTE_APPROVE_DAILY_CAP) {
         return soft_deny("daily_cap");
     }
-    // ⑤ nonce 원자 소각(WHERE used=0 → 0행이면 동시 재생이 이미 태움 = 재생 차단).
-    let burned = conn
-        .execute(
-            "UPDATE outbound SET approval_nonce_used=1, updated_ts=?2 WHERE id=?1 AND approval_nonce_used=0",
-            params![oid, now_ts],
-        )
-        .unwrap_or(0);
-    if burned == 0 {
-        return soft_deny("nonce_race"); // 동시 소각 레이스 — 창은 valid였음(비계수).
-    }
-    // ⑥ 기존 feed reply 경로로 해소(pending→resolved·대기 pusher wake·feed.item.resolved).
-    // ★S7 (0.14.51): 반환이 SettleAttempt 로 바뀌었다. ★이 걸음에서는 **순서를 바꾸지 않았다** —
-    //   설계 §2.1 row 6 의 MOVE(소각을 `Committed` 뒤로)는 O-S7-2 와 **함께만** 착지한다(부서장
-    //   판정: 단독 착지 금지). 그래서 지금은 오늘의 동작을 그대로 번역한다: 시도가 있었으면 성공
-    //   경로, 시도 자체가 없었으면(항목 소실·이미 해소) 종전과 같은 `feed_gone`.
-    match daemon.resolve_feed_item(&feed_id, &decision) {
-        crate::state::SettleAttempt::Attempted(_) => {
-            // 성공 = brute 의심 해제 → V4 카운터 리셋. allow면 V7 일일 상한 +1(소각~bump 사이 동시
-            // allow 경합의 off-by-one 초과는 허용 — 상한은 soft 폭발반경 제한이라 정밀 원자성 불요).
+    // ⑤ ★S7 (0.14.51 · O-S7-2 · 설계 §2.1 row 6 = **MOVE**): **해소를 먼저 하고 nonce 를 그 뒤에
+    //   태운다.** 종전 순서(소각 → 해소)에서는, 소각과 해소 사이에 항목이 사라지면 주인님의 1회용
+    //   자격이 **아무것도 해소하지 못한 채** 소모됐다. 이 집 안에 이미 있는 규율과 같은 꼴이다 —
+    //   일일 상한을 소각 **전에** 검사하는 바로 위 분기(그 주석: 초과 시 "소각·해소 없이 pending
+    //   유지")와, 해소가 성공한 **뒤에만** 팀 토큰을 닫는 RPC 경로.
+    //   ★재생 창: 원자적 `WHERE approval_nonce_used=0` 가 그대로 단발성을 보장한다. 바뀌는 것은
+    //   **언제** 태우는가뿐이고, 동시 요청 둘이 모두 해소에 닿으면 **해소 자체가 직렬화 지점**이
+    //   된다(한쪽은 `Attempted`, 다른 쪽은 `NotPending`).
+    let (_, attempt) = daemon.resolve_feed_item_settled(
+        &feed_id,
+        &decision,
+        // ★S7/B-108: 이 경로의 **왜** — 어느 채널의 원격 결재인가. 보낸 사람 식별자는 싣지 않는다
+        //   (원장·감사가 이미 담는 값을 feed 줄로 복제하지 않는다).
+        Some(&format!("remote channel approval ({channel})")),
+        None,
+        None,
+    );
+    match attempt {
+        // 시도 자체가 없었다(항목 소실·이미 해소) ⇒ ★nonce 를 **태우지 않는다**. 이것이 MOVE 가
+        // 실제로 되돌려 주는 것이다: 아무것도 해소하지 못한 자격은 그대로 살아 있다.
+        crate::state::SettleAttempt::NoItem | crate::state::SettleAttempt::NotPending => {
+            soft_deny("feed_gone")
+        }
+        crate::state::SettleAttempt::Attempted(outcome) => {
+            // ★결정은 **적용됐다**. 그러므로 1회용 자격은 쓴 것으로 표시한다 — 기록의 내구성이
+            //   미확인(`uncertain`)이어도 그렇다. 설계의 판단 그대로: *기록됐을 수도 있는 결재*에
+            //   대한 재생이 두 위험 중 더 나쁘다.
+            // ★그리고 `NotWritten` 도 태운다 — 설계 row 6 은 "NotWritten 이면 nonce 를 건드리지
+            //   않아 주인님이 다시 답할 수 있다"고 적었지만, 그 문장은 **되돌림이 있다는 전제**에
+            //   서 있다. 핀에는 되돌림이 없고 항목은 이미 resolved 라, 다시 답해도 위 ④가
+            //   `feed_not_pending` 으로 막는다 ⇒ 자격만 살아남아 **해소된 항목에 쓸 수 있는 재생
+            //   수단**이 된다. 전제가 거짓이므로 그 carve-out 은 이득 없이 위험만 남긴다.
+            let burn = conn.execute(
+                "UPDATE outbound SET approval_nonce_used=1, updated_ts=?2 WHERE id=?1 AND approval_nonce_used=0",
+                params![oid, now_ts],
+            );
+            // ★종전 `.unwrap_or(0)` 는 **오류와 0행을 한 칸에 뭉쳤다**(codex r3). 둘은 다른 사실이다.
+            let nonce_note = match burn {
+                Ok(1) => None,
+                Ok(_) => Some("nonce_already_used".to_string()),
+                Err(e) => Some(format!("nonce_burn_failed: {e}")),
+            };
+            if let Some(note) = &nonce_note {
+                // ★여기서 **거부로 돌아서지 않는다**: 해소는 이미 일어났고, 거부는 거짓이 된다.
+                eprintln!(
+                    "cysd: 원격 결재 {feed_id} — 해소는 적용됨(기록 {}) · nonce {note}",
+                    outcome.durability()
+                );
+            }
+            // 성공 = brute 의심 해제 → V4 카운터 리셋.
             reset_attempt(conn, channel, &sender_id, now_ts);
+            // ★상한 계수는 **적용된 allow 마다**다(내구성과 무관). 되돌림이 없는 이 판에서
+            //   `uncertain` 은 드문 경우가 아니라 **흔한 경우**이므로, 거기서 계수를 건너뛰면
+            //   일일 상한이 조용히 누출된다(상한은 폭발반경 제한이라 그 누출이 곧 결함이다).
             if decision == "allow" {
                 bump_daily_allow(conn, &local_date(now_ts), now_ts);
             }
@@ -1461,13 +1495,15 @@ fn verify_interaction(daemon: &Arc<Daemon>, conn: &Connection, channel: &str, pa
                 "channel.approval.resolved",
                 "channel",
                 None,
-                json!({"channel": channel, "feed_id": feed_id, "sender_id": sender_id, "decision": decision}),
+                json!({"channel": channel, "feed_id": feed_id, "sender_id": sender_id, "decision": decision,
+                       // ★S7 additive: 기록의 내구성과 자격 소각의 사실을 구독자가 볼 수 있게.
+                       "durability": outcome.durability(), "nonce_note": nonce_note}),
             );
-            ok_response(id, json!({"action": "approval_resolved", "feed_id": feed_id, "decision": decision}))
-        }
-        // 소각~해소 사이 레이스로 feed가 사라짐(다른 경로가 해소) — nonce는 이미 태워 안전(비계수).
-        crate::state::SettleAttempt::NoItem | crate::state::SettleAttempt::NotPending => {
-            soft_deny("feed_gone")
+            ok_response(
+                id,
+                json!({"action": "approval_resolved", "feed_id": feed_id, "decision": decision,
+                       "durability": outcome.durability(), "nonce_note": nonce_note}),
+            )
         }
     }
 }
@@ -3712,6 +3748,92 @@ mod tests {
             .iter()
             .any(|i| i.request_id == "feed1" && i.status == "resolved" && i.decision.as_deref() == Some("allow"));
         assert!(resolved, "interaction이 feed를 resolved로 해소해야 한다");
+    }
+
+    /// ★AT-S7-C1 — **고립 음성 검체: 커밋 뒤의 SQLite 소각 실패.** 해소는 `Committed` 로 끝났고
+    /// 그 **다음** 단계인 nonce 소각만 실패한다(BEFORE UPDATE 트리거로 결정론 주입 — SELECT 는
+    /// 그대로 되고 UPDATE 만 ABORT).
+    ///
+    /// ★이 검체는 두 가지를 동시에 박는다.
+    /// ① **진실한 응답**: 해소가 일어났으므로 응답은 `approval_resolved` 이고 거부가 아니다.
+    ///    소각 실패는 `nonce_note` 로 **표시**되고, 종전처럼 오류·거부로 바뀌지 않는다(DR-6).
+    /// ② ★**순서(설계 §2.1 row 6 의 MOVE)**: 종전 순서(소각 → 해소)였다면 소각 실패는
+    ///    `.unwrap_or(0)` 를 거쳐 `soft_deny("nonce_race")` 가 되고 **feed 는 pending 으로 남았을**
+    ///    것이다. feed 가 resolved 라는 사실 자체가 해소가 소각보다 **먼저** 일어났다는 증거다.
+    #[test]
+    fn s7_c1_burn_failure_after_commit_reports_resolved_not_denied() {
+        let d = tmp_daemon("s7c1");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        push_pending_feed(&d, "feedC1");
+        mirror_approval(&d, "feedC1", "t", "b", Some("c"));
+        let nonce = mirror_nonce(&d, "slack", "feedC1", "U1").expect("nonce minted");
+        let daily_before = read_daily(&d);
+        // 고장 주입: outbound 의 UPDATE 만 실패시킨다(조회·삽입은 그대로).
+        {
+            let mut g = d.channels.lock().unwrap();
+            let conn = g.as_mut().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER s7_block_burn BEFORE UPDATE ON outbound
+                 BEGIN SELECT RAISE(ABORT, 'injected burn failure'); END;",
+            )
+            .expect("트리거 생성");
+        }
+        let r = call(&d, "inbound", interaction_params("slack", "U1", "feedC1", &nonce, "allow"), own_pid());
+        // ① 진실한 응답 — 적용됐으므로 성공이고, 소각 실패는 표시된다.
+        assert_eq!(r["result"]["action"], json!("approval_resolved"), "{r}");
+        assert_eq!(r["result"]["decision"], json!("allow"), "{r}");
+        assert_eq!(r["result"]["durability"], json!("durable"), "기록 자체는 확정됐다: {r}");
+        assert!(
+            r["result"]["nonce_note"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("nonce_burn_failed")),
+            "소각 실패가 표시되지 않았다: {r}"
+        );
+        // ② 순서의 증거 — feed 가 resolved 다(종전 순서면 pending 으로 남고 nonce_race 거부였다).
+        assert_eq!(feed_status(&d, "feedC1").as_deref(), Some("resolved"), "{r}");
+        // 자격은 태우지 못했다는 **사실 그대로**(0) — 꾸미지 않는다.
+        assert_eq!(nonce_used_flag(&d, "slack", &nonce), 0, "소각이 실패했으므로 0 이어야 한다");
+        // ★상한 계수는 적용된 allow 마다 — 소각 실패를 이유로 건너뛰면 일일 상한이 누출된다.
+        assert_eq!(read_daily(&d), daily_before + 1, "적용된 allow 가 계수되지 않았다");
+        // 정리(다음 검체에 트리거를 남기지 않는다).
+        {
+            let mut g = d.channels.lock().unwrap();
+            let conn = g.as_mut().unwrap();
+            conn.execute_batch("DROP TRIGGER s7_block_burn;").expect("트리거 제거");
+        }
+    }
+
+    /// ★AT-S7-C2 — MOVE 뒤에도 정상 경로는 그대로다: 해소되고 **자격은 태워진다**(재생 차단은
+    /// 같은 원자적 `WHERE approval_nonce_used=0` 이 계속 보장한다).
+    #[test]
+    fn s7_c2_move_keeps_the_happy_path_and_still_burns() {
+        let d = tmp_daemon("s7c2");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        push_pending_feed(&d, "feedC2");
+        mirror_approval(&d, "feedC2", "t", "b", Some("c"));
+        let nonce = mirror_nonce(&d, "slack", "feedC2", "U1").expect("nonce minted");
+        let r = call(&d, "inbound", interaction_params("slack", "U1", "feedC2", &nonce, "allow"), own_pid());
+        assert_eq!(r["result"]["action"], json!("approval_resolved"), "{r}");
+        assert_eq!(r["result"]["durability"], json!("durable"), "{r}");
+        assert_eq!(r["result"]["nonce_note"], Value::Null, "정상 경로엔 소각 주석이 없다: {r}");
+        assert_eq!(nonce_used_flag(&d, "slack", &nonce), 1, "정상 경로는 자격을 태운다");
+        assert_eq!(feed_status(&d, "feedC2").as_deref(), Some("resolved"));
+        // ★B-108: 이 경로의 사유가 같은 줄에 남는다(어느 채널의 원격 결재인가).
+        let reason = d
+            .feed_items
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|i| i.request_id == "feedC2")
+            .and_then(|i| i.decision_reason.clone());
+        assert_eq!(reason.as_deref(), Some("remote channel approval (slack)"), "사유 미기록");
+        // 재생은 여전히 막힌다(소각이 뒤로 갔을 뿐, 단발성은 같은 원자 갱신이 보장한다).
+        let replay = call(&d, "inbound", interaction_params("slack", "U1", "feedC2", &nonce, "allow"), own_pid());
+        assert_eq!(replay["result"]["reason"], json!("nonce_used"), "{replay}");
     }
 
     #[test]
