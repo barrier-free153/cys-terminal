@@ -6050,67 +6050,13 @@ impl Daemon {
         let mut f = match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            // ★S7/F-1: 꼬리 한 바이트를 **읽기 위해** read 를 연다. append 모드에서는 쓰기가 항상
-            //   파일 끝으로 가므로(O_APPEND · Windows 도 동일) 읽기용 seek 이 쓰기 위치를 흔들지 않는다.
-            .read(true)
             .open(dir.join("feed.jsonl"))
         {
             Ok(f) => f,
             // open 실패도 한 바이트 전이다.
             Err(e) => return SettleOutcome::NotWritten(FeedPersistError::Open(e.to_string())),
         };
-        // ★★S7/F-1 (codex R1 major · 부서장 티켓 T-S7-R1-FIXES §1) — **줄 경계를 보장한 뒤에 쓴다.**
-        //
-        // 결함: 앞선 부분 write 가 **개행 없는 접두**를 남겼으면, 이 append 는 그 접두에 **이어붙어**
-        // 한 줄이 된다. 복원의 줄 단위 파싱은 그 합쳐진 줄을 해석하지 못해 `unparsed` 로 보관하고,
-        // **이 기록은 복원되지 않는다**. 그런데 write_all·sync_all 은 성공하므로 영수증은 `Committed`
-        // 였다 ⇒ **재생되지 않을 기록에 내구 영수증**. 파일은 완전히 읽을 수 있는 UTF-8 이라
-        // 복원 경로의 이름 붙은 예외(판독 불가 파일)가 이 경우를 **덮지 않는다**.
-        // ★이것이 오늘 밤 S8⒝ 를 철회시킨 **거짓 영수증** 부류다: 영수증이 없으면 사람이 확인하고,
-        //   거짓 영수증이 있으면 확인을 멈춘다.
-        //
-        // 수리의 모양: **바이트를 지우지 않는다**(되돌림·경계 수리 금지는 그대로다). 접두는 그대로
-        // 두고 그 뒤에 **분리자 한 바이트**를 먼저 쓴다 ⇒ 접두는 자기 줄에 남아 `unparsed` 로 보존되고
-        // (U10), 이 기록은 **자기 줄**이 되어 복원된다. 거부하지도, 멈추지도 않는다.
-        //
-        // ★판정 불능일 때 분리자를 **쓰는 쪽**으로 넘어진다. 그 이유를 **변이로 재고 나서** 적는다
-        // (부서장 §7③: 변이할 수 없는 근거는 측정이 아니라 독해다):
-        // · 내가 처음 적은 근거는 "빈 줄의 비용은 0" 이었고 ★**그것은 틀렸다**. 변이 MP-R1
-        //   (분리자를 **항상** 쓴다)을 돌리자 기존 검체 `persist_feed_item_concurrent_smoke_no_corruption`
-        //   이 빨개졌다 — 그 검체는 **이 파일의 모든 줄이 FeedItem 으로 파싱된다**는 더 강한 불변식을
-        //   박고 있고(0 바이트 줄에서 panic), 빈 줄은 그 불변식을 깬다. 복원 루프가 빈 줄을 **건너뛴다**는
-        //   말은 참이지만(그래서 데몬은 안 깨진다), **비용 0** 은 거짓이었다.
-        // · 그래도 방향은 그대로다. 비대칭이 남기 때문이다: 빈 줄은 **다음 기동의 압축에서 사라진다**
-        //   (빈 줄은 파싱 실패로도 세지 않아 `unparsed` 에 들어가지 않고, 압축은 `unparsed` + 복원된
-        //   항목만 다시 쓴다 — 검체 `s7_f1_a_blank_line_is_dropped_at_the_next_restart` 가 그것을 잰다).
-        //   반대로 필요한 분리자를 빠뜨리면 **기록 하나가 영영 복원되지 않는다.** 일시적 지저분함 대
-        //   영구적 유실이다.
-        // · ★그리고 **이 갈래 자체는 어떤 검체도 덮지 않는다**: 변이 MP-R4(세 `Err(_)` 를 모두 `false`
-        //   로 뒤집기)는 **살아남았다** — metadata·seek·read 실패를 이 리그에서 결정론적으로 일으킬
-        //   방법이 없기 때문이다. 그러므로 이 방향은 **측정이 아니라 논증**이다. 그렇게 적어 둔다.
-        let needs_separator = {
-            use std::io::{Read, Seek, SeekFrom};
-            match f.metadata() {
-                Ok(m) if m.len() == 0 => false,
-                Ok(m) => match f.seek(SeekFrom::Start(m.len() - 1)) {
-                    Ok(_) => {
-                        let mut tail = [0u8; 1];
-                        match f.read_exact(&mut tail) {
-                            Ok(()) => tail[0] != b'\n',
-                            Err(_) => true,
-                        }
-                    }
-                    Err(_) => true,
-                },
-                Err(_) => true,
-            }
-        };
-        let payload = if needs_separator {
-            format!("\n{line}\n")
-        } else {
-            format!("{line}\n")
-        };
-        if let Err(e) = std::io::Write::write_all(&mut f, payload.as_bytes()) {
+        if let Err(e) = std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()) {
             // ★부분 write 로 접두가 남았을 수 있다 — **지우지 않는다**(DR-1 은 리더가 그 줄을
             //   건너뜀으로써 유지되고, 제거는 교차 writer 파괴라 이 판에서 금지됐다).
             return SettleOutcome::Uncertain(FeedPersistError::Write(e.to_string()));
@@ -10946,132 +10892,6 @@ mod tests {
         let last = line.lines().filter(|l| l.contains("cap-req")).next_back().expect("줄");
         let back: FeedItem = serde_json::from_str(last).expect("round-trip");
         assert_eq!(back.decision_reason.as_deref(), Some(stored.as_str()));
-        let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
-    }
-
-    /// ★AT-S7-F1 — **찢긴 접두 뒤의 영수증**(codex R1 major · 부서장 티켓 T-S7-R1-FIXES §1·§6-2).
-    ///
-    /// 결함: 앞선 부분 write 가 **개행 없는 접두**를 남기면, 다음 append 가 그 접두에 **이어붙어**
-    /// 한 줄이 된다. 복원의 `serde_json::from_str` 는 그 합쳐진 줄을 파싱하지 못해 `unparsed` 에
-    /// 원문으로 보관하고 ⇒ **새 기록은 복원되지 않는다.** 그런데 `write_all`+`sync_all` 은 성공했으므로
-    /// 영수증은 `Committed` 였다. 파일은 **완전히 읽을 수 있는 UTF-8** 이라 S7 의 이름 붙은 예외
-    /// (판독 불가 파일)가 이 경우를 **덮지 않는다**. ⇒ 재생되지 않을 기록에 내구 영수증이 발급된다
-    /// = S8⒝ 가 오늘 밤 철회된 바로 그 **거짓 영수증** 부류다.
-    ///
-    /// ★이 검체가 만드는 접두는 **구성한(constructed)** 것이지 **유발한(provoked)** 것이 아니다 —
-    /// OS 의 짧은 write 를 결정론적으로 일으킬 방법은 이 리그에 없다. 그 라벨을 여기 적어 둔다.
-    ///
-    /// 박는 성질(티켓의 문언 그대로): **읽을 수 있는 바이트에서 복원되지 않을 기록에 `Committed`
-    /// 를 돌려줄 수 없다.** 수리의 선택은 "분리자 보장"이므로 이 검체는 **기록이 복원되는 쪽**으로
-    /// 만족돼야 하고, 동시에 **접두 바이트가 지워지지 않았음**도 함께 박는다(DR-1 · 되돌림 금지).
-    #[test]
-    fn s7_f1_torn_prefix_never_yields_an_unrestorable_committed() {
-        let tmp = isolated_sock("s7-f1-torn");
-        let daemon = Daemon::new(tmp.clone());
-        let dir = state_dir(&daemon.socket_path);
-        let feed_path = dir.join("feed.jsonl");
-
-        // ① 구성한 찢긴 접두 — 유효한 레코드를 중간에서 자르고 **개행을 붙이지 않는다**.
-        let whole = serde_json::to_string(&sample_feed_item("torn-A", "aaaa".into()))
-            .expect("직렬화");
-        let prefix = &whole[..whole.len() / 2];
-        std::fs::write(&feed_path, prefix).expect("접두 구성");
-        assert!(!prefix.ends_with('\n'), "접두에 개행이 있으면 이 검체는 아무것도 재지 않는다");
-
-        // ② 다음 레코드를 **생산 경로 그대로** append 한다.
-        let item_b = sample_feed_item("intact-B", "bbbb".into());
-        let outcome = daemon.persist_feed_item(&item_b);
-
-        // ③ 접두 바이트는 그대로 남아 있어야 한다(되돌림·경계 수리 금지 — DR-1).
-        let on_disk = std::fs::read_to_string(&feed_path).expect("읽기");
-        assert!(
-            on_disk.starts_with(prefix),
-            "접두 바이트가 지워졌다 — 이 판에서 금지된 되돌림이다: {on_disk:?}"
-        );
-
-        // ④ 재기동 복원(같은 소켓 경로로 Daemon 을 다시 만든다 = 디스크에서 읽는다).
-        let restarted = Daemon::new(tmp.clone());
-        let restored_b = restarted
-            .feed_items
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|i| i.request_id == "intact-B");
-
-        // ⑤ ★요구 성질 — 둘 중 하나는 반드시 참이다.
-        assert!(
-            restored_b || !outcome.is_committed(),
-            "거짓 영수증: 복원되지 않는데 Committed 다 (restored_b={restored_b}, outcome={outcome:?})"
-        );
-        // ⑥ 이 판에서 고른 수리는 **복원되는 쪽**이다 — 그래서 둘 다 참이어야 한다.
-        assert!(restored_b, "분리자 수리가 들어갔는데도 기록이 복원되지 않았다");
-        assert!(
-            outcome.is_committed(),
-            "복원되는데 Committed 가 아니면 수리가 과했다(정상 배달을 세운다): {outcome:?}"
-        );
-
-        // ⑦ 그리고 파일은 **여전히 읽을 수 있는 UTF-8** 이다(이름 붙은 예외가 아니라는 사실의 관측면).
-        assert!(
-            std::fs::read_to_string(&feed_path).is_ok(),
-            "이 경우는 '판독 불가 파일' 예외가 아니다"
-        );
-        let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
-    }
-
-    /// ★AT-S7-F1b — **빈 줄은 다음 기동의 압축에서 사라진다**(F-1 fail-safe 의 비용을 재는 검체).
-    ///
-    /// 왜 이 검체가 있는가: F-1 수리는 꼬리를 판정하지 못하면 **분리자를 쓰는 쪽**으로 넘어진다.
-    /// 그 선택의 비용은 이미 개행으로 끝난 파일에 생기는 **빈 줄** 하나이고, 나는 처음에 그 비용을
-    /// "0" 이라고 적었다가 변이 MP-R1 에서 **틀렸음을 측정했다**(기존 검체
-    /// `persist_feed_item_concurrent_smoke_no_corruption` 이 "모든 줄이 파싱된다"를 박고 있다).
-    /// ⇒ 비용은 0 이 아니라 **일시적**이라는 것이 참이고, 그 일시성을 여기서 **잰다**.
-    #[test]
-    fn s7_f1_a_blank_line_is_dropped_at_the_next_restart() {
-        let tmp = isolated_sock("s7-f1-blank");
-        let daemon = Daemon::new(tmp.clone());
-        let dir = state_dir(&daemon.socket_path);
-        let feed_path = dir.join("feed.jsonl");
-
-        // 생산 경로로 온전한 줄 하나.
-        assert!(daemon
-            .persist_feed_item(&sample_feed_item("blank-A", "a".into()))
-            .is_committed());
-
-        // fail-safe 갈래가 만들었을 모양 그대로: 개행으로 끝난 파일 뒤에 분리자 한 바이트.
-        {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&feed_path)
-                .expect("append 열기");
-            f.write_all(b"\n").expect("분리자");
-        }
-        let before = std::fs::read_to_string(&feed_path).expect("읽기");
-        assert!(
-            before.lines().any(|l| l.is_empty()),
-            "빈 줄을 만들지 못했으면 이 검체는 아무것도 재지 않는다: {before:?}"
-        );
-
-        // 재기동 — 압축이 파일을 다시 쓴다.
-        let restarted = Daemon::new(tmp.clone());
-        assert!(
-            restarted
-                .feed_items
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|i| i.request_id == "blank-A"),
-            "빈 줄 때문에 기록이 사라졌다"
-        );
-        let after = std::fs::read_to_string(&feed_path).expect("읽기");
-        assert!(
-            !after.lines().any(|l| l.is_empty()),
-            "빈 줄이 재기동 압축에서 사라지지 않았다: {after:?}"
-        );
-        // 그리고 남은 모든 줄은 파싱된다(동시 append 검체가 박는 바로 그 불변식이 회복된다).
-        for line in after.lines() {
-            serde_json::from_str::<FeedItem>(line).expect("모든 줄이 파싱돼야 한다");
-        }
         let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
     }
 
