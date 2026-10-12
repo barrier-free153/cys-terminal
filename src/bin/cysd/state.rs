@@ -5946,7 +5946,16 @@ impl Daemon {
         // W3.5 감사 append는 자동결재 기능의 일부 — flag ON일 때만 기록한다(C-4: OFF=현행
         // 100% 동일, audit 파일도 미생성). OFF면 해소만 하고 감사는 건너뛴다.
         if self.config.approve_auto_route {
-            self.append_approval_audit(&snapshot, decision, reason, caller_pid);
+            // ★S7/O-S7-6: 감사 append 의 결과도 **버리지 않는다**. 실패해도 해소를 되돌리거나
+            //   막지 않는다(감사는 역사이고, 결정은 이미 적용됐다) — 보이게 만든다.
+            let audited = self.append_approval_audit(&snapshot, decision, reason, caller_pid);
+            if !audited.is_committed() {
+                eprintln!(
+                    "cysd: 승인 감사 {request_id} 기록 {} ({}) — 해소는 유지한다(S7/O-S7-6)",
+                    audited.durability(),
+                    audited.detail()
+                );
+            }
         }
         if let Some(tx) = self.feed_waiters.lock().unwrap().remove(request_id) {
             let _ = tx.send(decision.to_string());
@@ -6022,13 +6031,29 @@ impl Daemon {
     /// approval_audit.jsonl에 한 줄 기록한다. CEO가 자기 결재를 기록하는 게 아니라 cysd가 단일
     /// 해소 경로에서 자동 기록한다. ⚠v1 로테이션 부재 명시 수용(승인=사람 페이스 저볼륨) —
     /// size/age 캡은 후속 티켓(§5 리스크 대장). feed_persist_lock 재사용으로 append 직렬화.
+    ///
+    /// ★★S7/O-S7-6 (0.14.51) — **이 기록과 `FeedItem::decision_reason` 의 관계**(부서장 질문에 대한
+    /// 답을 코드 옆에 둔다. 한 사실이 두 곳에 적히면 **갈라질 수 있고**, 갈라지지 않는 이유가
+    /// 어딘가에 적혀 있어야 한다):
+    /// · **같은 값, 같은 임계 구간**: 둘 다 해소 한 번의 `reason` 인자에서 나온다
+    ///   ([`Daemon::resolve_feed_item_settled`]) — 하나를 다른 하나에서 **재유도하지 않는다**.
+    /// · **역할이 다르다**: `decision_reason` 은 **항목의 현재 상태**(마지막이 이긴다 · 부팅에
+    ///   복원 · `feed.list` 가 내보낸다)이고, 이 파일은 **추가만 하는 역사**(감사용 · 되돌아보기)다.
+    /// · ★**포함 관계가 한 방향이다**: 이 append 는 `approve_auto_route` 가 켜졌을 때만 일어나고
+    ///   `decision_reason` 은 **항상** 쓰인다 ⇒ feed 줄이 **상위집합**이다. 그래서 둘이 모순될 수
+    ///   있는 방향은 "감사에 있고 feed 에 없다" 하나뿐이고, 그것은 같은 인자에서 같은 호출로
+    ///   쓰이기 때문에 발생하지 않는다. **이 불변식을 바꾸려면 두 자리를 함께 고쳐야 한다.**
+    /// · ★**사유가 아예 없는 해소**: 데몬 자신이 닫는 네 자리(얇은 래퍼 경유 — 고아 쓸기·관문 창
+    ///   종결·stale-clear 둘)는 `reason: None` 이라 **사유 칸이 빈다**. 그 자리에서는 **결정
+    ///   낱말 자체**(`stale-cleared`·`gate-window-closed`)가 기록이고, 없는 사유를 꾸미지 않는다 —
+    ///   그것이 O-S7-6 이 요구한 "어느 해소가 기록 없이 끝나는가"의 **전수 목록**이다.
     fn append_approval_audit(
         &self,
         item: &FeedItem,
         decision: &str,
         reason: Option<&str>,
         caller_pid: Option<u32>,
-    ) {
+    ) -> SettleOutcome {
         let record = json!({
             "ts": now_epoch(),
             "req_id": item.request_id,
@@ -6043,19 +6068,28 @@ impl Daemon {
             "resolver_surface": item.resolver_surface,
         });
         let Ok(line) = serde_json::to_string(&record) else {
-            return;
+            return SettleOutcome::NotWritten(FeedPersistError::Serialize);
         };
         let dir = state_dir(&self.socket_path);
         let _guard = self.feed_persist_lock.lock().unwrap();
         // v1 의도적 무제한 append(승인은 사람 페이스 저볼륨) — size/age 캡은 별건 티켓(#7).
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+        // ★S7/O-S7-6: 이 함수도 세 실패를 **버리던** 같은 `let _ =` 자리였다(부서장 지시 항목 2).
+        //   분류해 돌려주고, 지우지 않고, 아무것도 막지 않는다 — feed append 와 같은 규율이다.
+        let mut f = match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(dir.join("approval_audit.jsonl"))
         {
-            let _ = std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes());
-            let _ = f.sync_all();
+            Ok(f) => f,
+            Err(e) => return SettleOutcome::NotWritten(FeedPersistError::Open(e.to_string())),
+        };
+        if let Err(e) = std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()) {
+            return SettleOutcome::Uncertain(FeedPersistError::Write(e.to_string()));
         }
+        if let Err(e) = f.sync_all() {
+            return SettleOutcome::Uncertain(FeedPersistError::Sync(e.to_string()));
+        }
+        SettleOutcome::Committed
     }
 
     /// ★G1(W2-A): QueueEntry 발급 단일 지점 — seq는 boot 내 단조(fetch_add), id는
@@ -10759,6 +10793,52 @@ mod tests {
         //   (os error 66)` 으로 깨졌다(단독 실행은 통과). 살아 있는 데몬이 끝정리 중에도 상태
         //   폴더에 쓰기 때문이고, test_rm_rf 의 문서가 말하는 그대로다 — 끝정리 실패는 이 검체가
         //   재는 것이 아니다(삭제가 검체의 **단계**인 자리, 즉 위의 고장 제거는 엄격하게 둔다).
+        let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
+    }
+
+    /// ★AT-S7-G1 — **재시작 뒤 읽기**(O-S7-6 이 요구하는 read-back). Declaration 5 의 두 번째 구절은
+    /// "사유가 재시작을 넘어 살아남고 **결정 프로세스 없이** 읽힌다" 이고, 이 검체가 그 문장의
+    /// 기계적 형태다: 한 데몬이 결재하고, 그 데몬을 **버리고**, 같은 상태 폴더에서 **새 데몬**을
+    /// 띄워 사유를 읽는다. 결정을 내린 프로세스는 더 이상 없다.
+    #[test]
+    fn s7_g1_reason_survives_a_restart_and_is_read_without_the_deciding_process() {
+        let tmp = isolated_sock("s7-g1");
+        {
+            let daemon = Daemon::new(tmp.clone());
+            daemon
+                .feed_items
+                .lock()
+                .unwrap()
+                .push(sample_feed_item("g1-req", "b".into()));
+            let (_, attempt) = daemon.resolve_feed_item_settled(
+                "g1-req",
+                "allow",
+                Some("부서장이 직접 재유도했다"),
+                Some(4242),
+                Some(7),
+            );
+            assert!(attempt.settled_durably(), "전제: 기록이 확정돼야 한다 — {attempt:?}");
+            // ★결정을 내린 데몬을 여기서 버린다(블록 종료).
+        }
+
+        // 같은 상태 폴더에서 **새** 데몬 — 앞 프로세스의 메모리는 없다.
+        let revived = Daemon::new(tmp.clone());
+        let items = revived.feed_items.lock().unwrap();
+        let it = items
+            .iter()
+            .find(|i| i.request_id == "g1-req")
+            .expect("재시작 뒤 항목이 복원돼야 한다");
+        assert_eq!(it.status, "resolved");
+        assert_eq!(it.decision.as_deref(), Some("allow"));
+        // ★이것이 B-108 의 기준이다 — 사유가 **읽힌다**.
+        assert_eq!(
+            it.decision_reason.as_deref(),
+            Some("부서장이 직접 재유도했다"),
+            "사유가 재시작을 넘지 못했다 — 재생 가능한 내구적 사유가 아니다"
+        );
+        // 해소 주체도 같은 줄에 남아 있다(W4-A 와 같은 줄을 공유한다는 사실의 확인).
+        assert_eq!((it.resolver_pid, it.resolver_surface), (Some(4242), Some(7)));
+        drop(items);
         let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
     }
 

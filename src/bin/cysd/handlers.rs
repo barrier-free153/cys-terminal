@@ -8359,7 +8359,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     json!({
                         "request_id": i.request_id, "kind": i.kind, "title": i.title,
                         "body": i.body, "surface_id": i.surface_id, "status": i.status,
-                        "decision": i.decision, "created_at": i.created_at,
+                        "decision": i.decision,
+                        // ★S7/B-108 (0.14.51) additive: 결재의 **왜**. 이 칸이 없으면
+                        //   `decision_reason` 은 **제품 독자가 하나도 없는** 필드가 된다 — 파일에
+                        //   남고 부팅에 복원되지만 어떤 RPC 도 내보내지 않아, "결정 프로세스 없이
+                        //   뒤의 독자가 읽는다"(Declaration 5 의 재생 가능성)가 `cat` 으로만
+                        //   성립하게 된다. 기존 키는 하나도 바뀌지 않았다.
+                        "decision_reason": i.decision_reason,
+                        "created_at": i.created_at,
                         "resolved_at": i.resolved_at, "tier": i.tier,
                         // ★파생 필드(2026-08-17 · 성찰3 설계렌즈 major): '데몬이 스스로 발행한
                         //   항목인가'를 **서버 사실로** 실어 준다. 종전에는 GUI 가 request_id 의
@@ -26986,6 +26993,24 @@ mod tests {
             panic!("single");
         };
         assert_eq!(resp2["ok"], json!(false), "두 번째 해소는 시도 없음이다: {resp2}");
+
+        // ★G.1 의 짝: `feed.list` 가 **왜**를 내보낸다. 이 단언이 없으면 그 칸은 아무 시험도
+        //   지키지 않는 export 가 되고, `decision_reason` 은 제품 독자가 없는 필드로 되돌아간다.
+        let Reply::Single(list) = dispatch(
+            &daemon,
+            Request { id: json!(4), method: "feed.list".into(), params: json!({}) },
+            None,
+        ) else {
+            panic!("single");
+        };
+        let row = list["result"]["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|i| i["request_id"] == json!("s7c3"))
+            .expect("s7c3 in list")
+            .clone();
+        assert_eq!(row["decision_reason"], json!("근거 확인"), "feed.list 가 사유를 내보내지 않는다: {row}");
 
         let _ = std::fs::remove_dir(&feed_path);
         let _ = std::fs::remove_dir_all(&dir);
