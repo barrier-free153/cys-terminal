@@ -2943,20 +2943,27 @@ PY
     done <<EOF
 $snap
 EOF
-    # ★기능2 trash 만료 소거: N일(기본 14·CYS_TRASH_TTL_DAYS) 경과 격리분을 영구 소거한다. 방치 시
-    # transcripts.db(부서당 최대 324MB)가 무한 누적되는데 resource_gate는 디스크 크기를 측정하지 않아
-    # 신호가 없다 — 이 sweep가 유일한 회수 경로. 소유·주기는 CSO_DIRECTIVE 참조. --dry면 판정만.
+    # ★S8 D-1 — 이 도구는 더 이상 휴지통을 **지우지 않는다**(표시만 한다).
+    #   종전: 같은 선택기로 고른 뒤 `rm -rf` 로 영구 소거했다(받는 쪽이 사람 명령이 아니었다).
+    #   지금: 같은 선택기로 고르고 **TRASH-OLD 로 알리기만** 한다. 지우는 유일한 경로는 오너가
+    #   Control Center > 휴지통에서 내리는 명령(데몬 `trash.delete`)이다.
+    #   ★여기서 격리분 **안으로 아무 것도 쓰지 않는다**: 표식 파일을 남기면 그 쓰기가 미리보기와
+    #   명령 사이에 항목의 내용 집합을 바꿔(디제스트 불일치) 오너의 명령을 헛되게 거부시킨다.
+    #   '오래됨' 판정의 정본은 데몬의 `trash.list`(이름의 스탬프 기준 · D-r2-9)다.
+    #   ★알려진 결과(설계 R-1 이 받아들인 비용): 아무 것도 스스로 공간을 회수하지 않는다.
+    #   휴지통이 커지는 것은 오너가 명령할 때까지 **그대로 둔다** — 자동 삭제를 되살릴 사유가 아니다.
     nt=0
     if [ -d "$TRASH_ROOT" ]; then
       ttl="${CYS_TRASH_TTL_DAYS:-14}"
       while IFS= read -r _td; do
         [ -n "$_td" ] || continue
-        if [ "$dry" = 1 ]; then echo "[cys-dept] reap(dry): TRASH-EXPIRE $_td (>${ttl}d)"
-        else rm -rf "$_td" && nt=$((nt+1)) && echo "[cys-dept] reap: TRASH-EXPIRE $_td (>${ttl}d)"; fi
+        nt=$((nt+1))
+        if [ "$dry" = 1 ]; then echo "[cys-dept] reap(dry): TRASH-OLD $_td (>${ttl}d · kept - this tool no longer deletes it; delete from Control Center > Trash)"
+        else echo "[cys-dept] reap: TRASH-OLD $_td (>${ttl}d · kept - this tool no longer deletes it; delete from Control Center > Trash)"; fi
       done < <(find "$TRASH_ROOT" -mindepth 1 -maxdepth 1 -type d -mtime +"$ttl" 2>/dev/null)
     fi
     _dept_count="$(reg_count)" || exit $?
-    echo "[cys-dept] reap 완료(dry=$dry): DEAD=$nd IDLE=$ni SKIP=$ns TRASH-EXPIRE=$nt. 부서 수=$_dept_count"
+    echo "[cys-dept] reap 완료(dry=$dry): DEAD=$nd IDLE=$ni SKIP=$ns TRASH-OLD=$nt. 부서 수=$_dept_count"
     ;;
   promote-ceo)
     # 오너 지명 경로(2026-07-14): 오너/CSO가 기본 데몬 master를 CEO로 직접 지명 — 호출 자체가 동의.
