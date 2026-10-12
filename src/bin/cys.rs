@@ -7830,36 +7830,16 @@ fn warn_if_awakening_hooks_missing(config_dir: Option<&str>, role: &str, agent: 
 /// "item already resolved" — 이미 중단된 사이클이므로 올바르다.
 const CYCLE_VERIFY_ABORT_DECISION: &str = "cycle-timeout";
 
-struct CycleVerifyCloser<F: FnMut(&str, &str, &str)> {
+struct CycleVerifyCloser<F: FnMut(&str, &str)> {
     req_id: String,
     armed: bool,
-    /// ★S7/F-3: **지금까지 실제로 일어난 일.** 자동 종결이 실릴 사유의 재료이며, 흐름이 앞으로
-    /// 갈 때마다 갱신된다. 자리표시자가 아니라 **사실**이어야 하므로 단계 이름으로만 쓴다.
-    stage: &'static str,
     close: F,
 }
 
-/// ★S7/F-3 (codex R1 · 티켓 §3) — 자동 종결이 남기는 **왜**. 각 문장은 그 단계까지 실제로
-/// 일어난 일이고, 그 뒤에 무엇이 일어나지 **않았는지**를 말한다. 없는 사유를 지어내지 않는다.
-const CYCLE_VERIFY_WHY_BEFORE_INJECT: &str =
-    "자동 종결: 검증 지시를 검증자 좌석에 넣기 전에 사이클이 중단됐다(판정 요청이 전달되지 않았다)";
-const CYCLE_VERIFY_WHY_AWAITING: &str =
-    "자동 종결: 검증 지시는 전달됐으나 판정을 기다리는 중에 중단됐다(목록 조회 실패 등)";
-const CYCLE_VERIFY_WHY_TIMEOUT: &str = "자동 종결: 시한 안에 검증자 판정이 오지 않았다(timeout)";
-
-impl<F: FnMut(&str, &str, &str)> CycleVerifyCloser<F> {
+impl<F: FnMut(&str, &str)> CycleVerifyCloser<F> {
     fn new(req_id: String, close: F) -> Self {
         let armed = !req_id.is_empty();
-        CycleVerifyCloser {
-            req_id,
-            armed,
-            stage: CYCLE_VERIFY_WHY_BEFORE_INJECT,
-            close,
-        }
-    }
-    /// 흐름이 한 걸음 나아갔다 — 이제부터의 자동 종결은 이 사유로 닫힌다.
-    fn reached(&mut self, stage: &'static str) {
-        self.stage = stage;
+        CycleVerifyCloser { req_id, armed, close }
     }
     /// 항목이 이미 종결됐거나(판정 수신) 성공 경로 — 더 닫을 것이 없다.
     fn disarm(&mut self) {
@@ -7867,11 +7847,11 @@ impl<F: FnMut(&str, &str, &str)> CycleVerifyCloser<F> {
     }
 }
 
-impl<F: FnMut(&str, &str, &str)> Drop for CycleVerifyCloser<F> {
+impl<F: FnMut(&str, &str)> Drop for CycleVerifyCloser<F> {
     fn drop(&mut self) {
         if self.armed {
             self.armed = false;
-            (self.close)(&self.req_id, CYCLE_VERIFY_ABORT_DECISION, self.stage);
+            (self.close)(&self.req_id, CYCLE_VERIFY_ABORT_DECISION);
         }
     }
 }
@@ -21225,35 +21205,20 @@ fn run_cycle_agent(
             let req_id = push["request_id"].as_str().unwrap_or("").to_string();
             // ★U10(D5/DD6): 여기부터의 모든 조기 반환(주입 실패 · 폴링 중 feed.list 실패 · 시간초과)은 자기 요청을
             //   비허가 결정으로 닫는다(best-effort) — 종전엔 pending 으로 영구 잔존했다. 판정 수신 분기에서만 해제.
-            // ★S7/F-3: 자동 종결도 **사유를 싣는다**. 이 제품이 스스로 내리는 결정이고, B-108 이
-            //   약속하는 것(결재한 쪽이 왜를 내구적으로 남긴다)이 바로 이 모집단에 대한 약속이다.
-            let mut verify_closer = CycleVerifyCloser::new(
-                req_id.clone(),
-                |rid: &str, decision: &str, why: &str| {
-                    let _ = request(
-                        "feed.reply",
-                        json!({"request_id": rid, "decision": decision, "reason": why}),
-                    );
-                },
-            );
+            let mut verify_closer = CycleVerifyCloser::new(req_id.clone(), |rid: &str, decision: &str| {
+                let _ = request("feed.reply", json!({"request_id": rid, "decision": decision}));
+            });
             // 3단계 시한 — 주입 잠금 대기(≤ 20초)와 판정 대기를 함께 묶는다(단일 전체 시한 안).
             let deadline = budget.stage(timeout);
             // ★(수정 6회차 V42R-1) 검증자 좌석 주입 직렬화 — 붙여넣기~Return 을 좌석당 하나씩(동시 비동기 사이클의 요청 합체 차단).
             let vlock = InjectLock::acquire(vsid, deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(20)));
-            // ★S7/F-3 (codex R1 · 티켓 §3): 지시문이 **사유를 요구한다.** 종전에는 사유 없이
-            //   판정하라고 적어 두고, 그 결과 기계가 내린 결재가 `decision_reason` 을 비운 채
-            //   남았다 — B-108 이 약속하는 바로 그 칸이, 그 약속을 하는 항목에서 비어 있었다.
-            inject_text(vsid, &format!("[CYCLE-VERIFY] role '{role_name}'(surface:{sid})의 컨텍스트 순환 전 저장 검증 요청. SESSION_STATE/TODO 파일이 방금 갱신되었는지 확인하고 `cys feed reply {req_id} allow --reason \"<무엇을 보고 그렇게 판정했는지 한 줄>\"` 또는 `cys feed reply {req_id} deny --reason \"<무엇이 모자랐는지 한 줄>\"` 로 판정하라. ★--reason 은 생략하지 마라 — 그 한 줄이 결정과 같은 줄에 남아 다음 사람이 읽는 유일한 근거다."))?;
+            inject_text(vsid, &format!("[CYCLE-VERIFY] role '{role_name}'(surface:{sid})의 컨텍스트 순환 전 저장 검증 요청. SESSION_STATE/TODO 파일이 방금 갱신되었는지 확인하고 `cys feed reply {req_id} allow` 또는 `cys feed reply {req_id} deny`로 판정하라."))?;
             drop(vlock);
-            // 지시가 실제로 들어갔다 ⇒ 이제부터의 자동 종결 사유는 "전달됐으나 판정이 없다"다.
-            verify_closer.reached(CYCLE_VERIFY_WHY_AWAITING);
             // ★W4-B(결함 7): 해소 항목을 발견해도 decision 문자열로 즉석 판정하지 않고 영수증
             // 검증(cycle_receipt_ok — resolver==지정 검증자 대조)에 넘긴다. Err 는 전부 clear
             // 미실행 안전 중단(아래 match)이고, timeout(None)의 안전 중단은 종전 그대로다.
             let receipt = loop {
                 if std::time::Instant::now() >= deadline {
-                    // ★S7/F-3: 시한 초과는 "판정이 오지 않았다"는 **구체적인 사실**이다.
-                    verify_closer.reached(CYCLE_VERIFY_WHY_TIMEOUT);
                     break None;
                 }
                 std::thread::sleep(std::time::Duration::from_secs(2));
@@ -42248,60 +42213,31 @@ mod u10_notice_lane {
     /// 빈 request_id(push 응답에 id 없음) → 0회.
     #[test]
     fn u10_cycle_verify_closer_closes_on_every_abort_path() {
-        // ★S7/F-3: 세 번째 칸이 **사유**다. 자동 종결도 왜를 싣는다(티켓 §3).
-        let calls: RefCell<Vec<(String, String, String)>> = RefCell::new(Vec::new());
-        let rec = |r: &str, d: &str, w: &str| {
-            calls
-                .borrow_mut()
-                .push((r.to_string(), d.to_string(), w.to_string()))
-        };
-        fn flow<F: FnMut(&str, &str, &str)>(fail_at: u8, rec: F) -> Result<(), String> {
+        let calls: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
+        let rec = |r: &str, d: &str| calls.borrow_mut().push((r.to_string(), d.to_string()));
+        fn flow<F: FnMut(&str, &str)>(fail_at: u8, rec: F) -> Result<(), String> {
             let mut g = CycleVerifyCloser::new("req-1".to_string(), rec);
             if fail_at == 1 {
                 Err("inject_text 실패".to_string())?;
             }
-            // 주입이 성공한 뒤의 단계(생산 경로에서 `reached` 가 불리는 바로 그 자리).
-            g.reached(CYCLE_VERIFY_WHY_AWAITING);
             if fail_at == 2 {
                 Err("feed.list 실패".to_string())?;
             }
             if fail_at == 3 {
-                g.reached(CYCLE_VERIFY_WHY_TIMEOUT);
                 return Err("검증자 응답 없음 (timeout) — clear 중단".into());
             }
             g.disarm();
             Ok(())
         }
-        // ★세 조기 반환이 **서로 다른 사실**을 남긴다 — 하나의 자리표시자가 아니다.
-        let expect_why = [
-            CYCLE_VERIFY_WHY_BEFORE_INJECT,
-            CYCLE_VERIFY_WHY_AWAITING,
-            CYCLE_VERIFY_WHY_TIMEOUT,
-        ];
         for fail_at in 1..=3u8 {
             calls.borrow_mut().clear();
             assert!(flow(fail_at, rec).is_err());
             assert_eq!(
                 *calls.borrow(),
-                vec![(
-                    "req-1".to_string(),
-                    CYCLE_VERIFY_ABORT_DECISION.to_string(),
-                    expect_why[(fail_at - 1) as usize].to_string()
-                )],
-                "조기 반환 {fail_at} 에서 자기 요청을 닫지 않았거나 사유가 그 단계의 사실이 아니다"
+                vec![("req-1".to_string(), CYCLE_VERIFY_ABORT_DECISION.to_string())],
+                "조기 반환 {fail_at} 에서 자기 요청을 닫지 않았다"
             );
-            let why = calls.borrow()[0].2.clone();
-            assert!(!why.trim().is_empty(), "자동 종결이 빈 사유로 닫았다");
         }
-        // 세 사유는 서로 달라야 한다(같으면 자리표시자다).
-        assert_eq!(
-            expect_why
-                .iter()
-                .collect::<std::collections::HashSet<_>>()
-                .len(),
-            3,
-            "자동 종결 사유가 단계를 구별하지 못한다"
-        );
         calls.borrow_mut().clear();
         assert!(flow(0, rec).is_ok());
         assert!(calls.borrow().is_empty(), "성공 경로에서 닫았다(거동 변경)");
@@ -42310,41 +42246,6 @@ mod u10_notice_lane {
         }
         assert!(calls.borrow().is_empty(), "빈 request_id 를 닫으려 했다");
         assert_ne!(CYCLE_VERIFY_ABORT_DECISION, "allow", "자동 종결은 절대 allow 가 아니다");
-    }
-
-    /// ★S7/F-3 배선 핀 — **지시문이 사유를 요구한다.** 자동 종결 쪽은 위 검체가 재지만, 사람·
-    /// 에이전트가 치는 쪽은 **주입되는 문장**이 유일한 요구 지점이다. 그 문장에서 `--reason` 이
-    /// 빠지면 B-108 의 약속(결재한 쪽이 왜를 내구적으로 남긴다)이 **이 제품이 스스로 지시하는
-    /// 결재에서** 깨진다 — codex R1 F-3 이 지적한 것이 정확히 그 자리였다.
-    #[test]
-    fn s7_f3_cycle_verify_instruction_asks_for_a_reason_source_pin() {
-        let src = include_str!("cys.rs");
-        let line = src
-            .lines()
-            .find(|l| l.contains("[CYCLE-VERIFY] role '{role_name}'"))
-            .expect("주입 지시문을 찾지 못했다");
-        assert!(
-            line.contains("allow --reason") && line.contains("deny --reason"),
-            "지시문이 allow·deny 양쪽에서 사유를 요구하지 않는다: {line}"
-        );
-        assert!(
-            line.contains("생략하지 마라"),
-            "사유를 생략하지 말라는 요구가 지시문에 없다: {line}"
-        );
-
-        // ★두 번째 핀 — **자동 종결의 RPC 본문**. 위 단위 검체는 클로저의 세 번째 인자를 재지만,
-        //   그 인자가 실제 `feed.reply` 본문에 실리는지는 재지 못한다(변이로 확인했다: `"reason"`
-        //   키만 지우면 그 검체는 초록으로 남는다). 구멍이 난 핀은 확신으로 읽히므로 여기서 막는다.
-        let closer_rpc = src
-            .lines()
-            .skip_while(|l| !l.contains("|rid: &str, decision: &str, why: &str|"))
-            .take(8)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            closer_rpc.contains("\"reason\": why"),
-            "자동 종결의 feed.reply 본문이 사유를 싣지 않는다: {closer_rpc}"
-        );
     }
 
     /// 배선 핀: 가드는 push 직후(첫 조기 반환 지점인 검증자 주입 **전**) 무장되고, 영수증 수신 분기에서 해제된다.
