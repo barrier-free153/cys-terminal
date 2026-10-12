@@ -1838,6 +1838,21 @@ const ACL_ROLE_OWNER: &str = "owner";
 ///
 /// ★키를 나눠도 **위조 방어 수준은 동일하다**(같은 비밀이다) — 키 분리의 목적은 위조 방어가
 /// 아니라 오직 **면제 범위의 격리**다. 위 '거버넌스 구분' 문단이 이 등급의 유일한 정직한 경계다.
+/// ★S8 삭제 동사의 등급 — `operator_token` **전용** + 이 데몬의 pane 에 붙지 않은 호출자.
+///
+/// `caller_is_owner`(#6-b)와 **의도적으로 다른 함수**다. 그것은 `owner_token` 도 받는데, 그 키는
+/// ACL 등급 신호라 부착면이 넓다(GUI 가 자동 조립한 주입에도 실린다) — 삭제처럼 **비가역**인 동사가
+/// 그 키를 읽으면 S6·S7 이 그 키를 넓히는 순간 삭제까지 넓어진다. DESIGN-S8.md:38 과 :52 가 이
+/// 분리를 명시하고, r2 리뷰어도 같은 지적을 했다(E3). 비교부는 공통(`daemon_token_matches`)이라
+/// 상수시간류 비교 규칙이 두 곳에서 갈라지지 않는다.
+///
+/// ★정직한 한계(제품 자신의 문장): 이 등급은 **보안 경계가 아니라 거버넌스 구분**이다. 같은 UID 로
+/// `operator.token`(0600)을 읽는 프로세스는 — 다른 데몬의 좌석을 포함해 — raw RPC 로 이 등급을
+/// 참칭할 수 있다. 닫는 것은 지침을 따르는 정상 노드의 평시 경로다(공용 CLI 는 두 토큰을 붙이지 않는다).
+fn trash_owner_grade_ok(daemon: &Daemon, params: &Value, from_sid: Option<u64>) -> bool {
+    from_sid.is_none() && daemon_token_matches(daemon, params, PARAM_OPERATOR_TOKEN)
+}
+
 fn caller_is_owner(daemon: &Daemon, params: &Value, from_sid: Option<u64>) -> bool {
     from_sid.is_none()
         && (daemon_token_matches(daemon, params, PARAM_OWNER_TOKEN)
@@ -4783,6 +4798,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
     if let Some(sub) = req.method.strip_prefix("team.token.") {
         let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
         return crate::teamtoken::handle(daemon, sub, &params, &id, caller_sid);
+    }
+    // ★S8: `trash.*` 는 trash 모듈이 전담한다(channel.*·team.token.* 과 같은 단일 위임).
+    //   등급 판정은 **여기서** 한다 — 모듈에 토큰 비교를 복제하지 않는다.
+    //   ★`owner_token` 은 읽지 않는다: 그 키는 부착면이 더 넓고(모든 GUI pane 쓰기에 실린다),
+    //   S6·S7 이 그 키를 넓히면 **삭제까지 함께 넓어진다**(DESIGN-S8.md:38·:52 · 리뷰어 E3).
+    //   그래서 `caller_is_owner`(owner_token 도 받는다)를 재사용하지 않고 operator token 전용
+    //   비교(공통 비교부 `daemon_token_matches`)에 pane 무귀속 절반을 더해 쓴다.
+    if let Some(sub) = req.method.strip_prefix("trash.") {
+        let from_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+        let owner_grade = trash_owner_grade_ok(daemon, &params, from_sid);
+        return crate::trash::handle(daemon, sub, &params, &id, owner_grade, caller_pid);
     }
     match req.method.as_str() {
         "system.ping" => Reply::Single(ok_response(&id, json!("pong"))),

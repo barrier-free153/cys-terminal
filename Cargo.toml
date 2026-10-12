@@ -23,6 +23,13 @@ path = "src/bin/cysd/main.rs"
 name = "cys"
 path = "src/bin/cys.rs"
 
+[features]
+# ★S8 D-r2-8: 윈도우 휴지통 삭제는 **검증된 빌드에서만** 켜진다. 이 feature 는 default 에 없다 —
+#   들어 있지 않다는 사실이 "12.W 가 돌지 않았으면 삭제는 꺼진 채로 출하된다"를 집행한다.
+#   켜는 유일한 정당 경로는 12.W(W1~W8)를 통과한 릴리스 단계다. 손으로 켜면 미검증 삭제가 켜진다.
+default = []
+trash_win_validated = []
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "process"] }
 serde = { version = "1", features = ["derive"] }
