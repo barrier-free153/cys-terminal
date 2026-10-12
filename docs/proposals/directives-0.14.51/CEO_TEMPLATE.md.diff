@@ -1,5 +1,5 @@
---- /Users/cys/Desktop/CYSjavis/_worktrees/impl-0.14.50-i/cysjavis-pack/directives/CEO_TEMPLATE.md	2026-10-12 16:16:04
-+++ /private/tmp/claude-501/-Users-cys/76e55355-eb50-4f7b-93b9-a3fc75b5bb44/scratchpad/dirnew/cysjavis-pack/directives/CEO_TEMPLATE.md	2026-10-12 18:09:12
+--- a/cysjavis-pack/directives/CEO_TEMPLATE.md
++++ b/cysjavis-pack/directives/CEO_TEMPLATE.md
 @@ -377,9 +377,22 @@
    대상행 큐가 적체되면 데몬이 `queue.depth_high`(기본 depth 5+)를 발행한다 — 수신 시
    노드를 read-screen으로 점검하라. 큐 **머리**가 임계 이상 막혀 있으면 `queue.starved`

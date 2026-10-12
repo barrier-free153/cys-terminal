@@ -1,5 +1,5 @@
---- /Users/cys/Desktop/CYSjavis/_worktrees/impl-0.14.50-i/cysjavis-pack/directives/CSO_DIRECTIVE.md	2026-10-12 16:16:04
-+++ /private/tmp/claude-501/-Users-cys/76e55355-eb50-4f7b-93b9-a3fc75b5bb44/scratchpad/dirnew/cysjavis-pack/directives/CSO_DIRECTIVE.md	2026-10-12 17:56:47
+--- a/cysjavis-pack/directives/CSO_DIRECTIVE.md
++++ b/cysjavis-pack/directives/CSO_DIRECTIVE.md
 @@ -271,7 +271,7 @@
    아니라 ④의 보류이고, 낡음(미저장 위험)은 clear 금지 + 오너 escalation 이다(§2 무응답 정책 그대로 ·
    결측은 값이 아니다).
