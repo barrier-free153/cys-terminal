@@ -9,6 +9,10 @@ directive change is `<file>.new` plus a diff, and the live file is never edited 
 (`ceo_template_superset_ok`, cys-dept:1484-1499, called at :1583-1587), so a `.new` placed beside the
 live file would become live input to that path. Approval first, then the editing seat applies it.
 
+★**`APPLY-FIRST-S6.md` is mandatory reading before applying the MASTER/CEO proposal**: alone it reddens eight
+named content pins (one root cause), and the companion re-pin is a code change that this deliverable does not carry.
+`CSO_DIRECTIVE.md.new` (S2) **is** applicable on its own — measured, zero new red.
+
 | file | item | gate |
 |---|---|---|
 | `CSO_DIRECTIVE.md.new` (+ `.diff`) | S2 — how the quiescing label may be read | PASSED the what-ships gate: S2 ships (commit 937248ab, visibility only) |

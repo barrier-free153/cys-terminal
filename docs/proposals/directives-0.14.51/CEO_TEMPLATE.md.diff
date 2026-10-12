@@ -1,6 +1,6 @@
 --- /Users/cys/Desktop/CYSjavis/_worktrees/impl-0.14.50-i/cysjavis-pack/directives/CEO_TEMPLATE.md	2026-10-12 16:16:04
-+++ /private/tmp/claude-501/-Users-cys/76e55355-eb50-4f7b-93b9-a3fc75b5bb44/scratchpad/dirnew/cysjavis-pack/directives/CEO_TEMPLATE.md	2026-10-12 18:00:27
-@@ -377,9 +377,21 @@
++++ /private/tmp/claude-501/-Users-cys/76e55355-eb50-4f7b-93b9-a3fc75b5bb44/scratchpad/dirnew/cysjavis-pack/directives/CEO_TEMPLATE.md	2026-10-12 18:09:12
+@@ -377,9 +377,22 @@
    대상행 큐가 적체되면 데몬이 `queue.depth_high`(기본 depth 5+)를 발행한다 — 수신 시
    노드를 read-screen으로 점검하라. 큐 **머리**가 임계 이상 막혀 있으면 `queue.starved`
    (기아 · `CYS_QUEUE_STARVE_ALERT_SECS` 기본 600초 · depth_high와 별도 축)가 발행된다 —
@@ -20,7 +20,8 @@
 +  풀 수 있는 막힘과 **사람의 글이 걸려 있는 막힘**은 같은 것으로 다루지 않는다.
 +  ★**아직 금지를 말하는 제품 문면이 하나 남아 있다**: 데몬은 경보 처방 문장 끝에 「· LLM 에이전트는 자동
 +  조치(강제 배달·드레인·키 주입·동결 해제·항목 삭제) 금지」를 붙인다(`REMEDY_LLM_SUFFIX` — 0.14.51 에도
-+  그대로 출하된다). 그 꼬리는 기구가 들어오는 판에서 함께 판정한다 — 그때까지 **문면이 둘이라는 것을 알고**
++  그대로 출하된다). ★그 꼬리는 **기구를 싣는 릴리스에서 이 문장과 함께 자른다**(부서장 판정 2026-10-12 — 지금
++  상수를 바꾸면 부재하는 기구에 대한 제품 텍스트가 된다). 그때까지는 **문면이 둘이라는 것을 알고**
 +  읽어라(지침=오너 규칙으로 해제 · 제품 문면=아직 금지).
  - **위임 티켓 — task-prompt 의무 (work management 앵커 1·강조 의무 / 눈대중 금지)**:
    워커에게 task를 위임하는 프롬프트는 반드시
