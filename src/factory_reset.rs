@@ -135,16 +135,12 @@ const TEMP_SWEEP_PREFIX: [&str; 7] = [
 /// 격리하면 **앱 자신(cys.exe·cysd.exe·runtime/·resources/)을 언인스톨**해 버린다.
 /// → `~/.cys` 와 같은 교리를 적용한다: **알려진 상태 항목만** 격리하고 나머지(=설치본)는 보존.
 /// 놓친 상태 파일이 남는 것은 불편이지만, 앱을 옮기는 것은 복구 불능급 사고다(fail-safe 방향).
-const WIN_STATE_EXACT: [&str; 25] = [
+const WIN_STATE_EXACT: [&str; 24] = [
     "transcripts.db",
     "analytics.db",
     "channels.db",
     "feed.jsonl",
     "feed.jsonl.tmp",
-    // ★(R3-A · 0.14.51) 기동 압축에서 빠지는 종결 결재·판독 불가 줄의 보존소(`state.rs` 의
-    //   `FEED_ARCHIVE_FILE`). 승인 결정·사유·주체가 적히는 **상태 폴더의 사용 흔적**이므로
-    //   `feed.jsonl`·`approval_audit.jsonl` 과 같은 등급이다 — 여기 없으면 완전 초기화 뒤에도 남는다.
-    "feed-archive.jsonl",
     "approval_audit.jsonl",
     "queue-state.json",
     "queue-state-v2.json",
@@ -3838,8 +3834,8 @@ mod r2f_dm_factory_reset {
         assert_eq!(CYS_BASE_EXACT2.len(), 12, "~/.cys 직하 정확 이름 목록(2차)의 길이");
         assert!(CYS_BASE_EXACT2.contains(&"claude-tui-written.json") && crate::claude_tui::LEDGER_FILE.ends_with("/claude-tui-written.json"), "claude tui 원장이 기본 격리 목록에 없다");
         assert!(CYS_BASE_EXACT2.contains(&".update-attempt.json"), "~/.cys/.update-attempt.json(인앱 업데이트 시도 기록)이 기본 격리 목록에 없다");
-        assert_eq!(WIN_STATE_EXACT.len(), 25, "윈도우 상태 폴더 정확 이름 목록의 길이");
-        for n in ["queue-blocked.json", "queue-blocked.prev.json", "approval-lane", "feed-archive.jsonl"] {
+        assert_eq!(WIN_STATE_EXACT.len(), 24, "윈도우 상태 폴더 정확 이름 목록의 길이");
+        for n in ["queue-blocked.json", "queue-blocked.prev.json", "approval-lane"] {
             assert!(WIN_STATE_EXACT.contains(&n), "윈도우 상태 폴더의 {n} 이 정확 일치 목록에 없다");
         }
         assert_eq!(WIN_STATE_ATOMIC.len(), 9, "원자 쓰기 목록의 길이");
