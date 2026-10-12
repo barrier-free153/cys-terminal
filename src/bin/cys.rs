@@ -641,7 +641,8 @@ enum Command {
     },
     /// 완전 초기화(팩토리 리셋) — 연습·사용 흔적 전부(부서·세션·대화기억·상태·훅·스킬링크)를
     /// cys-trash 로 격리하고 "설치 초기 상태"로 되돌린다. 라이선스·미등록 파일(오너 배치 *.env 등)은
-    /// 보존, 복구는 격리 폴더 manifest.json 역방향 mv(14일 후 reap 자동 소거). DESIGN-factory-reset.md
+    /// 보존, 복구는 격리 폴더 manifest.json 역방향 mv(★S8 이후 자동 소거 없음 — 격리본은 그대로
+    /// 보관되고 삭제는 Control Center 의 휴지통에서 오너가 명령한다). DESIGN-factory-reset.md
     FactoryReset {
         /// 쓰기 0 프리뷰 — 격리·보존·해제 계획만 표시하고 아무것도 바꾸지 않는다.
         #[arg(long)]

@@ -8,7 +8,9 @@
 //  ② **전체선택 없음** — 선택은 항목마다 손으로 한다('오래된 것 전부' 단추도 없다).
 //  ③ **누가 허용되는지 말하지 않는다** — 화면 문구는 "이 도구가 무엇을 하는가"만 적는다
 //     ("오너만 삭제할 수 있습니다" 같은 문장은 데몬이 증명하지 않는 것을 주장한다 · r2 §2.4).
-import { normalizePhrase, resetSizeHuman } from "./resetconfirm";
+import { normalizePhrase, resetSizeHuman, TRASH_KEEP_NOTICE } from "./resetconfirm";
+// 격리분 수명 문장의 거처는 resetconfirm.ts 한 곳이다(순환 import 방지 · 선언 주석 참조).
+export { TRASH_KEEP_NOTICE };
 
 /// 여러 항목을 지울 때 타이핑할 문구 — `삭제 N`.
 export function trashBulkPhrase(count: number): string {

@@ -9,6 +9,11 @@ export HOME="$T"
 export CYS_PACK_DIR="$BINDIR/.."          # $ph=CYS_PACK_DIR/bin/javis_phoenix.py 해소(실 phoenix 묘비 기록)
 export CYS_DEPTS_JSON="$T/.cys/depts.json"
 export CYS_ROLE=cso CYS_TRASH_STAMP=222
+# ★호출자 env 격리(2026-10-12 실측): 에이전트 좌석에서 이 스크립트를 돌리면 **1단계에서 rc 7** 로
+#   죽었다 — 좌석이 물려주는 `CYS_SURFACE_ID`(예: 41) 를 stub 데몬이 모르니 cys-dept 의 단일소유
+#   게이트가 "stale 신원" 으로 거부한다. 격리 HOME·stub cys 로도 막히지 않는 유일한 누수여서
+#   여기서 끊는다(소켓 변수도 함께 — 격리 하네스가 실 데몬에 닿을 길을 남기지 않는다).
+unset CYS_SURFACE_ID CYS_SOCKET CYS_GATE_LANE_SOCKET
 STATE="$T/.local/state"
 ROSTER="$STATE/cys/phoenix/dept_roster.json"
 CYSDEPT="$BINDIR/cys-dept"
@@ -120,15 +125,25 @@ echo "$OUT7B" | grep -q "workdir_shared_skip" || fail "[D1a] skip 사유(workdir
 [ -f "$STATE/cys-trash/testdept-222/state/transcripts.db" ] || fail "[D1a] state는 격리됐어야 함"
 echo "  → 기대대로 workdir 보존 + state·pack 격리 + rc 0"
 
-echo "== 8) reap trash 만료 소거(TTL) =="
+# ★S8 R-5: 이 단계는 **뒤집혔다.** 종전엔 "만료 격리분이 reap 에 의해 소거된다"를 확인했다 —
+#   이제 reap 은 지우지 않고 오래됨만 알린다(오너 지시 2026-10-12: 삭제는 오너 명령뿐). 그래서 같은
+#   픽스처로 **살아남는 것**과 **알리는 것**을 확인한다(지우던 행위가 돌아오면 이 단계가 빨개진다).
+echo "== 8) reap: 오래된 격리분은 알리기만 하고 **그대로 남는다**(S8) =="
 setup_depts
 bash "$CYSDEPT" down testdept --purge-state >/dev/null 2>&1 || true
 [ -d "$STATE/cys-trash/testdept-222" ] || fail "격리분 부재"
-# mtime 을 20일 전으로 후퇴 → TTL 14일 초과
+TRASH_BEFORE="$(find "$STATE/cys-trash/testdept-222" | sort | sha256sum 2>/dev/null | cut -d' ' -f1 \
+  || find "$STATE/cys-trash/testdept-222" | sort | shasum -a 256 | cut -d' ' -f1)"
+# mtime 을 20일 전으로 후퇴 → 선택기(기본 14일)에 걸린다
 touch -t "$(date -v-20d +%Y%m%d%H%M 2>/dev/null || date -d '20 days ago' +%Y%m%d%H%M)" "$STATE/cys-trash/testdept-222"
-bash "$CYSDEPT" reap >/dev/null 2>&1 || true
-[ ! -d "$STATE/cys-trash/testdept-222" ] || fail "만료 격리분 미소거"
-echo "  → 만료 소거 OK"
+REAP_OUT="$(bash "$CYSDEPT" reap 2>&1 || true)"
+[ -d "$STATE/cys-trash/testdept-222" ] || fail "오래된 격리분이 사라졌다 — reap 이 다시 지우고 있다(S8 위반)"
+echo "$REAP_OUT" | grep -q "TRASH-OLD" || fail "오래됨을 알리지 않았다(TRASH-OLD 부재): $REAP_OUT"
+echo "$REAP_OUT" | grep -q "TRASH-EXPIRE" && fail "옛 소거 토큰(TRASH-EXPIRE)이 돌아왔다"
+TRASH_AFTER="$(find "$STATE/cys-trash/testdept-222" | sort | sha256sum 2>/dev/null | cut -d' ' -f1 \
+  || find "$STATE/cys-trash/testdept-222" | sort | shasum -a 256 | cut -d' ' -f1)"
+[ "$TRASH_BEFORE" = "$TRASH_AFTER" ] || fail "알리면서 격리분 안을 바꿨다(표식 파일 등) — 무접촉 위반"
+echo "  → 오래됨 알림 OK · 격리분 무접촉 OK"
 
 echo "== 9) [F1a] javis_org destroy: down 실패(exit3) 삼킴 방지 → destroy 비0+incomplete+state 잔존 =="
 setup_depts
