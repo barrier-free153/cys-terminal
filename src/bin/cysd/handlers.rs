@@ -7974,10 +7974,6 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 surface_id,
                 status: "pending".into(),
                 decision: None,
-                // ★S7/B-108 (0.14.51): 생성 시점엔 결재가 없으니 사유도 없다. ★값을 **넣는** 곳은
-                // 해소 경로(resolve_feed_item_settled) 하나뿐이고, **디스크로 내보내는** 곳은 이
-                // 항목을 영속하는 네 경로 전부다(해소 전에는 null 로 나간다).
-                decision_reason: None,
                 created_at: crate::state::now_epoch(),
                 resolved_at: None,
                 tier: tier.clone(),
@@ -8031,18 +8027,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     None
                 }
             };
-            // ★S7 설계 §2.1 row 7 = **EXCLUDE + 로그**: 생성은 해소가 아니므로 `Committed` 가
-            //   정확성의 조건이 아니다(항목은 이미 메모리에 있고 `--wait` waiter 도 위 임계영역에서
-            //   등록됐다). 결과는 **버리지 않는다** — 다만 응답을 실패로 바꾸지도 않는다: 저장이
-            //   불확실하다는 이유로 승인 요청 자체를 세우면 그것이 금지된 방향(큐 막힘)이다.
-            let push_outcome = daemon.persist_feed_item(&item);
-            if !push_outcome.is_committed() {
-                eprintln!(
-                    "cysd: feed.push {request_id} 영속 {} ({}) — 항목은 그대로 공개한다(§2.1 row 7)",
-                    push_outcome.durability(),
-                    push_outcome.detail()
-                );
-            }
+            daemon.persist_feed_item(&item);
             daemon.bus.publish(
                 "feed.item.created",
                 "feed",
@@ -26357,7 +26342,6 @@ mod tests {
             surface_id: Some(7),
             status: "pending".into(),
             decision: None,
-            decision_reason: None, // ★S7: 생성 시점엔 사유가 없다(대입처 = 해소 경로 하나).
             created_at: crate::state::now_epoch(),
             resolved_at: None,
             tier: None,
@@ -26418,7 +26402,6 @@ mod tests {
             surface_id: Some(7),
             status: "pending".into(),
             decision: None,
-            decision_reason: None, // ★S7: 생성 시점엔 사유가 없다(대입처 = 해소 경로 하나).
             created_at: crate::state::now_epoch(),
             resolved_at: None,
             tier: None,
@@ -26719,7 +26702,6 @@ mod tests {
             surface_id: Some(7),
             status: "pending".into(),
             decision: None,
-            decision_reason: None, // ★S7: 생성 시점엔 사유가 없다(대입처 = 해소 경로 하나).
             created_at: crate::state::now_epoch(),
             resolved_at: None,
             tier: Some("c".into()),
@@ -26960,10 +26942,7 @@ mod tests {
         assert_eq!(av["resolver_surface"], json!(62), "감사 레코드 resolver_surface 누락");
         // stale-clear(얇은 래퍼) 경로 — resolver 두 필드 None 유지.
         let _ = dispatch(&daemon, w3_push(4, "res2", "수동 결재 요청 2", "본문", None), Some(900_005));
-        // ★S7: 래퍼는 이제 SettleAttempt 를 돌려준다 — 스냅샷이 필요한 시험은 감사 경로를 쓴다.
-        let snap = daemon
-            .resolve_feed_item_audited("res2", "stale-cleared", None, None, None)
-            .expect("resolve");
+        let snap = daemon.resolve_feed_item("res2", "stale-cleared").expect("resolve");
         assert_eq!(snap.resolver_surface, None, "래퍼 경로가 resolver를 각인함(무주체가 사실)");
         assert_eq!(snap.resolver_pid, None);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);

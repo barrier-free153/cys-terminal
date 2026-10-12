@@ -2509,106 +2509,6 @@ pub struct PackReinject {
     pub directive_hash: String,
 }
 
-/// ★S7 (0.14.51) — append 가 확정되지 못한 **사유**. 종전 코드는 세 실패를 전부 버렸다
-/// (`let _ = write_all` · `let _ = sync_all` · 직렬화 실패 조용한 return) — 그래서 어떤 호출자도
-/// 아무것도 배울 수 없었다. 이 타입은 **기록용**이고, 어떤 갈래도 append·해소를 **막지 않는다**
-/// (부서장 판정 2026-10-12: 내구성 의심으로 append·settle 을 막는 갈래는 이 판에 없다).
-#[derive(Clone, Debug, PartialEq)]
-pub enum FeedPersistError {
-    /// 직렬화 실패 — 한 바이트도 시도되지 않았다.
-    Serialize,
-    /// open 실패 — 한 바이트도 시도되지 않았다.
-    Open(String),
-    /// `write_all` 실패 — **접두가 남았을 수 있다**(부분 write). 제거하지 않는다.
-    Write(String),
-    /// `sync_all` 실패 — 줄은 완전하지만 **내구성이 미확인**이다.
-    Sync(String),
-}
-
-/// ★S7 §1.4 세 값 — "성공/실패" 두 값은 호출자에게 거짓을 강요한다(E5 는 둘 중 어느 것도 아니다).
-/// ★이 판의 축소(설계 §9.1 이 스스로 예고한 붕괴): 되돌림(truncate)이 **없으므로** `NotWritten` 은
-/// **한 바이트도 시도되지 않은 증명 가능한 경우**(직렬화·open)뿐이고, write 이후의 모든 오류는
-/// `Uncertain` 이다. 설계의 E3(“truncate 성공”)는 이 판에 **지시 대상이 없다**.
-/// ★`#[must_use]` 는 장식이 아니라 DR-4 의 집행 수단이다(설계 r3 §2.2): Rust 는 쓰이지 않은
-/// 반환값을 경고하지 않으므로, 이것이 없으면 "공통 경로가 실패 가능해졌는데 호출자가 오류를
-/// 무시한다"(Declaration 3(c) 금지 조합)가 **컴파일되는 상태**로 남는다.
-#[must_use]
-#[derive(Clone, Debug, PartialEq)]
-pub enum SettleOutcome {
-    /// 줄이 완전히 쓰였고 fsync 가 확인됐다.
-    Committed,
-    /// 파일은 시도 전과 **증명 가능하게 같다**.
-    NotWritten(FeedPersistError),
-    /// 파일이 그 기록을 담았을 수도, 담지 않았을 수도 있다. ★호출자에게 "일어나지 않았다"로
-    /// 보고하는 것이 금지된다(DR-6).
-    Uncertain(FeedPersistError),
-}
-
-/// ★S7 m3(codex r3 minor) — 결과 영역에 **시도 없음**이 빠져 있었다: 항목이 없거나, 경합으로 이미
-/// pending 이 아니면 저장을 **시도조차 하지 않는다**. 세 값과 섞으면 호출자가 "안 써졌다"와
-/// "쓸 일이 없었다"를 구별할 수 없다.
-#[must_use]
-#[derive(Clone, Debug, PartialEq)]
-pub enum SettleAttempt {
-    /// 그 `request_id` 의 항목이 없다.
-    NoItem,
-    /// 항목이 이미 pending 이 아니다(멱등 — 중복 해소).
-    NotPending,
-    /// 저장을 시도했고, 그 결과가 이것이다.
-    Attempted(SettleOutcome),
-}
-
-impl SettleOutcome {
-    /// 기록이 디스크에 확정됐는가 — ★이 하나만이 "내구적"이다.
-    pub fn is_committed(&self) -> bool {
-        matches!(self, SettleOutcome::Committed)
-    }
-
-    /// ★호출자가 **분기할 수 있는** 세 값의 안정된 철자. RPC 응답·이벤트·로그가 같은 철자를
-    /// 쓴다(셋이 갈리면 호출자는 세 어휘를 배워야 한다). 값의 뜻:
-    /// · `durable` — 줄이 완전히 쓰이고 fsync 됐다.
-    /// · `not_written` — 한 바이트도 시도되지 않았다(파일은 증명 가능하게 그대로).
-    /// · `uncertain` — 적용은 됐고 **내구성은 미확인**이다. ★이 값을 받은 호출자는
-    ///   "일어나지 않았다"로 보고해서는 안 된다(DR-6) — 다시 보내기 전에 읽어 확인한다.
-    pub fn durability(&self) -> &'static str {
-        match self {
-            SettleOutcome::Committed => "durable",
-            SettleOutcome::NotWritten(_) => "not_written",
-            SettleOutcome::Uncertain(_) => "uncertain",
-        }
-    }
-
-    /// 사람이 읽을 사유(로그·응답의 detail). 값이 없으면 빈 문자열이 아니라 분류 이름이 남는다.
-    pub fn detail(&self) -> String {
-        match self {
-            SettleOutcome::Committed => "committed".into(),
-            SettleOutcome::NotWritten(e) | SettleOutcome::Uncertain(e) => match e {
-                FeedPersistError::Serialize => "serialize".into(),
-                FeedPersistError::Open(m) => format!("open: {m}"),
-                FeedPersistError::Write(m) => format!("write: {m}"),
-                FeedPersistError::Sync(m) => format!("sync: {m}"),
-            },
-        }
-    }
-}
-
-impl SettleAttempt {
-    /// 해소가 **일어났고 내구적인가**. ★`NoItem`·`NotPending` 은 실패가 아니라 **시도 없음**이며
-    /// (codex r3 m3), 종전 `.is_some()` 판정은 이 셋을 한 칸에 뭉쳐 "닫혔다"로 읽었다.
-    pub fn settled_durably(&self) -> bool {
-        matches!(self, SettleAttempt::Attempted(o) if o.is_committed())
-    }
-
-    /// 로그 한 줄용 철자 — `no_item` | `not_pending` | `durable` | `not_written` | `uncertain`.
-    pub fn label(&self) -> &'static str {
-        match self {
-            SettleAttempt::NoItem => "no_item",
-            SettleAttempt::NotPending => "not_pending",
-            SettleAttempt::Attempted(o) => o.durability(),
-        }
-    }
-}
-
 /// 승인 Feed 항목: 워커(에이전트)의 승인 요청을 한 곳에 모은다.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FeedItem {
@@ -2619,16 +2519,6 @@ pub struct FeedItem {
     pub surface_id: Option<u64>,
     pub status: String, // pending | resolved | timeout
     pub decision: Option<String>,
-    /// ★S7/B-108 (0.14.51) — 결재의 **왜**. 해소 시점에 적히고 **같은 줄로 영속**되므로 재시작 뒤
-    /// 결정 프로세스 없이도 읽힌다(Declaration 5 의 "replayable durable reason").
-    ///
-    /// ★하위호환: 이 필드가 없는 **기존 feed.jsonl 줄도 그대로 복원**된다 — 그 성질을 박는 것은
-    /// 검체 `s7_old_feed_line_without_decision_reason_still_restores` 다. ★아래 `#[serde(default)]`
-    /// 는 **그 성질의 원인이 아니다**(실측: 변이로 지워도 검체가 통과한다 — serde 는 `Option<T>`
-    /// 누락을 이미 `None` 으로 읽는다). 의도를 명시하는 **중복 안전장치**로 남긴다 —
-    /// 처음 쓴 주석은 "이것이 없으면 모든 줄이 실패한다"였고 그것은 **틀렸다**.
-    #[serde(default)]
-    pub decision_reason: Option<String>,
     pub created_at: f64,
     pub resolved_at: Option<f64>,
     /// 승인 tier(§2.4-3 S8): "a"|"b"|"c"|"d". None=무태그=D 취급(fail-closed) — 채널 미러는
@@ -5731,10 +5621,6 @@ impl Daemon {
             surface_id,
             status: "pending".into(),
             decision: None,
-            // ★S7/B-108 (0.14.51): 생성 시점엔 결재가 없으니 사유도 없다. ★값을 **넣는** 곳은
-            // 해소 경로(resolve_feed_item_settled) 하나뿐이고, **디스크로 내보내는** 곳은 이 항목을
-            // 영속하는 네 경로 전부다(해소 전에는 null 로 나간다) — 두 문장을 구별해 적는다.
-            decision_reason: None,
             created_at: now_epoch(),
             resolved_at: None,
             tier: None, // 데몬 자동 알림은 무태그(=D·미러 제외) — 채널 스팸 차단.
@@ -5748,17 +5634,7 @@ impl Daemon {
             resolver_pid: None,
         };
         self.feed_items.lock().unwrap().push(item.clone());
-        // ★S7 설계 §2.1 row 8 = **EXCLUDE + 로그**: 알림 생성은 해소가 아니므로 `Committed` 가
-        //   정확성의 조건이 아니다(항목은 이미 메모리에 있고 이벤트는 아래에서 나간다).
-        //   그러나 결과를 **버리지는 않는다** — 버리면 아무도 배울 수 없다는 것이 S7 의 전제다.
-        let outcome = self.persist_feed_item(&item);
-        if !outcome.is_committed() {
-            eprintln!(
-                "cysd: feed 알림 {request_id} 영속 {} ({}) — 알림은 그대로 발행한다(§2.1 row 8)",
-                outcome.durability(),
-                outcome.detail()
-            );
-        }
+        self.persist_feed_item(&item);
         self.bus.publish(
             "feed.item.created",
             "feed",
@@ -5819,13 +5695,8 @@ impl Daemon {
     /// 얇은 래퍼(하위호환 — reason·caller 미상 경로: stale-clear·채널 미러). 감사에는
     /// decision만 남고 reason/caller는 null이 된다. resolver 각인도 None 유지(W4-A —
     /// 데몬 내부·미러 해소는 pane 귀속 주체가 없다는 사실 그대로).
-    /// ★S7 (0.14.51): 반환이 `Option<FeedItem>` 에서 [`SettleAttempt`] 로 바뀌었다. 종전 다섯
-    /// 프로덕션 호출자 중 넷이 이 값을 **버렸고**(둘은 통째로, 하나는 `.is_some()` 으로) 그래서
-    /// "닫혔다" 와 "닫혔다고 적었다" 가 구별되지 않았다. 열거형의 `#[must_use]` 가 그 상태를
-    /// 컴파일되지 않게 만든다(설계 r3 §2.2). 항목 스냅샷이 필요하면
-    /// [`Daemon::resolve_feed_item_settled`] 를 직접 부른다.
-    pub fn resolve_feed_item(&self, request_id: &str, decision: &str) -> SettleAttempt {
-        self.resolve_feed_item_settled(request_id, decision, None, None, None).1
+    pub fn resolve_feed_item(&self, request_id: &str, decision: &str) -> Option<FeedItem> {
+        self.resolve_feed_item_audited(request_id, decision, None, None, None)
     }
 
     /// 단일 해소 경로(M7) + W3.5 감사(producer≠auditor). 모든 결재는 이 코어를 지나며 cysd가
@@ -5842,51 +5713,14 @@ impl Daemon {
         caller_pid: Option<u32>,
         caller_surface: Option<u64>,
     ) -> Option<FeedItem> {
-        self.resolve_feed_item_settled(request_id, decision, reason, caller_pid, caller_surface)
-            .0
-    }
-
-    /// ★S7 (0.14.51) 해소의 **단일 코어** — 위 두 래퍼가 모두 이 함수를 지난다.
-    ///
-    /// 돌려주는 것이 둘인 이유: 항목 스냅샷(기존 계약)과 **무슨 일이 일어났는가**([`SettleAttempt`])는
-    /// 다른 축이다. `None` 하나로는 "그런 항목이 없다"·"이미 해소됐다"·"썼지만 내구성 미확인"이
-    /// 구별되지 않는다(codex r3 m3).
-    ///
-    /// ★★이 함수가 지키는 한 가지 규칙 (부서장 판정 2026-10-12):
-    /// **결정이 적용된 뒤의 하류 실패는 거부·부재·"아직 아님"으로 보고될 수 없다.**
-    /// 상태 전이는 임계영역 안에서 이미 끝났고(아래 `status = "resolved"`), 그것을 되돌리는
-    /// 갈래도, append 를 거부하는 갈래도 이 판에는 **없다**. 그래서 영속이 실패하면 호출자는
-    /// `Attempted(Uncertain)` 를 받는다 — *적용됐다, 내구성은 미확인이다*. 이 규칙은 두 호출
-    /// 지점(여기와 `feed.reply` 응답)에서 **같은 하나**다.
-    ///
-    /// ★설계 §2.1 row 1 의 전제 정정(실측): 그 행의 처방은 "`NotWritten` → 오류 응답, 항목은
-    /// 여전히 pending" 인데, 핀에서 **그 전제가 참이 아니다** — 상태 변경이 영속보다 **먼저**
-    /// 임계영역 안에서 일어난다. pending 이라고 답하는 것은 데몬이 자기 상태에 관해 사실이 아닌
-    /// 말을 하는 것이고, 그 답을 받은 호출자의 재시도는 `item already resolved` 로 거부된다.
-    fn resolve_feed_item_settled(
-        &self,
-        request_id: &str,
-        decision: &str,
-        reason: Option<&str>,
-        caller_pid: Option<u32>,
-        caller_surface: Option<u64>,
-    ) -> (Option<FeedItem>, SettleAttempt) {
         let snapshot = {
             let mut items = self.feed_items.lock().unwrap();
-            let Some(item) = items.iter_mut().find(|i| i.request_id == request_id) else {
-                // 시도 없음 — 파일에 손대지 않았다.
-                return (None, SettleAttempt::NoItem);
-            };
+            let item = items.iter_mut().find(|i| i.request_id == request_id)?;
             if item.status != "pending" {
-                // 멱등(중복 해소) — 역시 시도 없음.
-                return (None, SettleAttempt::NotPending);
+                return None;
             }
             item.status = "resolved".into();
             item.decision = Some(decision.to_string());
-            // ★S7/B-108: 결재의 **왜**를 결정과 같은 줄에 넣는다 — 이 대입이 이 필드의 유일한
-            //   생산처다. 값이 없는 경로(stale-clear·채널 미러 래퍼)는 null 그대로 남고,
-            //   그 사실 자체가 "사유 없이 해소됐다"는 기록이다(없는 사유를 꾸미지 않는다).
-            item.decision_reason = reason.map(|r| r.to_string());
             item.resolved_at = Some(now_epoch());
             // W4-A 해소 주체 각인 — allow/deny 무관 모든 결재의 주체를 남긴다. 래퍼 경유
             // (stale-clear·채널 미러)는 둘 다 None 그대로(위장 방지: 자기신고 없음 — 커널
@@ -5895,18 +5729,7 @@ impl Daemon {
             item.resolver_surface = caller_surface;
             item.clone()
         };
-        // ★영속 결과를 **버리지 않는다**(DR-4) — 이것이 S7 의 전부다. 어떤 값이 와도
-        //   아래 부수효과(대기자 wake·이벤트)는 그대로 수행된다: 결정은 이미 적용됐고,
-        //   내구성 의심으로 통신을 멈추는 갈래는 이 판에 없다(오너 절대규칙 · 부서장 판정).
-        let outcome = self.persist_feed_item(&snapshot);
-        if !outcome.is_committed() {
-            eprintln!(
-                "cysd: feed settle {request_id} — 결정은 적용됐으나 영속이 {} ({}) \
-                 — 되돌리지 않고 기록으로 남긴다(S7/DR-6)",
-                outcome.durability(),
-                outcome.detail()
-            );
-        }
+        self.persist_feed_item(&snapshot);
         // W3.5 감사 append는 자동결재 기능의 일부 — flag ON일 때만 기록한다(C-4: OFF=현행
         // 100% 동일, audit 파일도 미생성). OFF면 해소만 하고 감사는 건너뛴다.
         if self.config.approve_auto_route {
@@ -5923,63 +5746,32 @@ impl Daemon {
                    // 미러/브리지 tier 필터용(§2.4-3). None(무태그)=D 표기(fail-closed).
                    "tier": snapshot.tier.as_deref().unwrap_or("d"),
                    // W4-A additive: 해소 주체 surface(null=비-pane 해소). 기존 키 불변.
-                   "resolver_surface": snapshot.resolver_surface,
-                   // ★S7 additive: 이 해소가 디스크에 확정됐는가 — `durable`|`not_written`|
-                   //   `uncertain`. 구독자(UI·브리지)가 **다르게 행동할 수 있는** 값이다
-                   //   (로그만 남기면 장식이다). 기존 키는 하나도 바뀌지 않았다.
-                   "durability": outcome.durability()}),
+                   "resolver_surface": snapshot.resolver_surface}),
         );
-        (Some(snapshot), SettleAttempt::Attempted(outcome))
+        Some(snapshot)
     }
 
     /// Feed 항목 스냅샷 한 줄을 JSONL에 append (영속화 — 데몬 재시작 복원용).
-    ///
-    /// ★★S7 구현 계약 (0.14.51) — **이 함수는 바이트를 지우지 않는다.**
-    /// · 세 실패를 **버리지 않고 분류해 돌려준다**([`SettleOutcome`]). 종전에는 셋 다 `let _ =` 로
-    ///   버려져 어떤 호출자도 배울 수 없었다 — 그 **보이지 않음**이 S7 이 고치는 것이다.
-    /// · ★되돌림(`set_len`)·경계 수리·append 거부는 **이 판에 없다**(부서장 판정 2026-10-12).
-    ///   내구성 의심은 **보이게** 만들고 **행동하지 않는다**: 접두가 남았을 수 있으면 그대로 두고
-    ///   `Uncertain` 으로 보고한다. 어떤 갈래도 뒤이은 append·settle 을 막지 않는다 —
-    ///   "사람이 와야 레인이 다시 돈다"는 방향은 오너 절대규칙(360도 소켓통신 완벽 유지)이 금지한다.
-    /// · ★S7 이 약속하는 것과 **약속하지 않는 것**(부서장 Declaration 5 의 문언 그대로):
-    ///   *settled 된 결재는 재생 가능한 내구적 사유를 가진다 — **feed 파일이 판독 불가가 되는 경우는
-    ///   예외이며, 그때는 다음 부팅에서 모든 pending 항목과 그 기록이 사라지고 S7 은 아무것도
-    ///   약속하지 않는다***. 그 예외의 자리는 이 함수가 아니라 복원 경로의 전부-또는-전무 읽기
-    ///   ([`Daemon::new`] 의 `read_to_string` 블록)이고, **E7 의 수리는 이 판 밖**이다(0.14.51 번들
-    ///   `E7` = OUT, "OUT MEANS ZERO LINES THIS RELEASE" · 백로그 B-117). 같은 이유로 그 수리를
-    ///   게이트하는 `T-r3-7` 도 이 판 밖이며, 여기서 그것을 덮었다고 읽으면 안 된다.
-    pub fn persist_feed_item(&self, item: &FeedItem) -> SettleOutcome {
+    pub fn persist_feed_item(&self, item: &FeedItem) {
         // 직렬화 후에 락 — JSON 변환(락 불필요)은 임계영역 밖에서.
         let Ok(line) = serde_json::to_string(item) else {
-            // 한 바이트도 시도되지 않았다 ⇒ 파일은 증명 가능하게 그대로다.
-            return SettleOutcome::NotWritten(FeedPersistError::Serialize);
+            return;
         };
         let dir = state_dir(&self.socket_path);
         // feed_persist_lock으로 append 전 구간을 직렬화: write_all이 짧은 write로
         // 분할돼도 한 줄이 통째로 쓰여, 동시 appender의 라인이 끼어들어 JSONL을
         // 손상시키는 인터리빙(복원 시 pending 무음 유실)을 차단한다.
         let _guard = self.feed_persist_lock.lock().unwrap();
-        let mut f = match std::fs::OpenOptions::new()
+        if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(dir.join("feed.jsonl"))
         {
-            Ok(f) => f,
-            // open 실패도 한 바이트 전이다.
-            Err(e) => return SettleOutcome::NotWritten(FeedPersistError::Open(e.to_string())),
-        };
-        if let Err(e) = std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()) {
-            // ★부분 write 로 접두가 남았을 수 있다 — **지우지 않는다**(DR-1 은 리더가 그 줄을
-            //   건너뜀으로써 유지되고, 제거는 교차 writer 파괴라 이 판에서 금지됐다).
-            return SettleOutcome::Uncertain(FeedPersistError::Write(e.to_string()));
+            let _ = std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes());
+            // §9.1-1: append 후 fsync — 재부팅에도 미배달 승인요청(feed)이 디스크에 확정된다.
+            // (파일별 내구성 불균일 해소: topology는 이미 fsync, feed.jsonl은 누락돼 있었다.)
+            let _ = f.sync_all();
         }
-        // §9.1-1: append 후 fsync — 재부팅에도 미배달 승인요청(feed)이 디스크에 확정된다.
-        // (파일별 내구성 불균일 해소: topology는 이미 fsync, feed.jsonl은 누락돼 있었다.)
-        if let Err(e) = f.sync_all() {
-            // 줄은 완전하다 — 디스크에 있을 수도, 없을 수도 있다. "일어나지 않았다"는 거짓이다.
-            return SettleOutcome::Uncertain(FeedPersistError::Sync(e.to_string()));
-        }
-        SettleOutcome::Committed
     }
 
     /// W3.5 승인 감사 append(producer≠auditor): 해소된 항목 스냅샷 + decision·reason·caller를
@@ -10522,7 +10314,6 @@ mod tests {
             surface_id: Some(7),
             status: "pending".into(),
             decision: None,
-            decision_reason: None, // ★S7: 생성 시점엔 사유가 없다(대입처 = 해소 경로 하나).
             created_at: now_epoch(),
             resolved_at: None,
             tier: None,
@@ -10657,154 +10448,6 @@ mod tests {
         );
     }
 
-    /// ★AT-S7-B1 — 해소 결과가 **세 값으로** 구별된다(codex r3 m3). 종전 반환은 `Option` 하나였고
-    /// "그런 항목이 없다"·"이미 해소됐다"·"썼다"가 한 칸에 뭉쳐 있었다.
-    #[test]
-    fn s7_settle_attempt_distinguishes_no_item_not_pending_and_committed() {
-        let tmp = isolated_sock("s7-attempt");
-        let daemon = Daemon::new(tmp.clone());
-        let dir = state_dir(&daemon.socket_path);
-        let _ = std::fs::remove_file(dir.join("feed.jsonl"));
-
-        // ⓐ 없는 항목 = 시도 없음.
-        assert_eq!(
-            daemon.resolve_feed_item("ghost", "allow"),
-            SettleAttempt::NoItem
-        );
-
-        daemon
-            .feed_items
-            .lock()
-            .unwrap()
-            .push(sample_feed_item("s7-a", "b".into()));
-
-        // ⓑ 첫 해소 = 시도했고 내구적이다 + 사유가 같은 줄에 들어간다.
-        let (snap, attempt) = daemon.resolve_feed_item_settled(
-            "s7-a",
-            "allow",
-            Some("부서장 판정 — 시험"),
-            None,
-            None,
-        );
-        let snap = snap.expect("스냅샷");
-        assert_eq!(attempt, SettleAttempt::Attempted(SettleOutcome::Committed));
-        assert!(attempt.settled_durably());
-        assert_eq!(attempt.label(), "durable");
-        assert_eq!(snap.decision_reason.as_deref(), Some("부서장 판정 — 시험"));
-
-        // 영속된 줄에도 사유가 있다 — 재시작 뒤 결정 프로세스 없이 읽힌다(B-108).
-        let content = std::fs::read_to_string(dir.join("feed.jsonl")).expect("feed.jsonl");
-        let line = content
-            .lines()
-            .filter(|l| l.contains("s7-a"))
-            .next_back()
-            .expect("해소 줄");
-        let back: FeedItem = serde_json::from_str(line).expect("round-trip");
-        assert_eq!(back.decision_reason.as_deref(), Some("부서장 판정 — 시험"));
-        assert_eq!(back.status, "resolved");
-
-        // ⓒ 두 번째 해소 = 멱등이고, 그것은 실패가 아니라 **시도 없음**이다.
-        assert_eq!(
-            daemon.resolve_feed_item("s7-a", "allow"),
-            SettleAttempt::NotPending
-        );
-
-        // ⓓ 사유 없는 경로(래퍼)는 null 을 남긴다 — 없는 사유를 꾸미지 않는다.
-        daemon
-            .feed_items
-            .lock()
-            .unwrap()
-            .push(sample_feed_item("s7-b", "b".into()));
-        let (snap2, _) = daemon.resolve_feed_item_settled("s7-b", "stale-cleared", None, None, None);
-        assert_eq!(snap2.expect("스냅샷").decision_reason, None);
-
-        test_rm_rf(tmp.parent().unwrap());
-    }
-
-    /// ★AT-S7-B2 — 하위호환 성질: 새 필드가 없는 **구판 feed.jsonl 줄도 역직렬화된다**. 깨지면
-    /// 복원 경로가 그 줄을 버리므로, 판을 올리는 순간 대기 중인 승인 요청이 조용히 사라진다.
-    ///
-    /// ★이 검체가 지키는 것은 **성질**이고, `#[serde(default)]` 라는 **수단**이 아니다: 변이
-    /// 실행에서 그 속성을 지워도 검체는 통과했다(serde 가 `Option<T>` 누락을 이미 `None` 으로
-    /// 읽는다) ⇒ 그 속성은 **중복 안전장치**다. 반대로 필드 타입을 `Option` 이 아닌 것으로
-    /// 바꾸거나 `deny_unknown_fields` 가 붙으면 이 검체가 잡는다.
-    #[test]
-    fn s7_old_feed_line_without_decision_reason_still_restores() {
-        let old_line = r#"{"request_id":"legacy-1","kind":"approval","title":"t","body":"b",
-            "surface_id":7,"status":"pending","decision":null,"created_at":1.0,"resolved_at":null}"#;
-        let item: FeedItem = serde_json::from_str(old_line).expect("구판 줄이 역직렬화돼야 한다");
-        assert_eq!(item.request_id, "legacy-1");
-        assert_eq!(item.decision_reason, None);
-        assert_eq!(item.status, "pending");
-    }
-
-    /// ★AT-S7-B3 — **고장 주입**: `feed.jsonl` 자리를 디렉터리로 만들어 open 을 실패시킨다.
-    /// 이 검체가 박는 것은 세 가지이고, 그 셋이 부서장 판정의 전부다.
-    /// ① 결과는 `NotWritten` 으로 **보고된다**(종전에는 세 실패가 전부 버려졌다).
-    /// ② 결정은 **되돌려지지 않는다** — 메모리는 resolved 다. 그래서 호출자에게 "일어나지
-    ///    않았다"로 답하는 것이 금지된다(DR-6).
-    /// ③ ★**뒤이은 append 가 막히지 않는다** — 거부 래치가 없다. 저장이 회복되면 사람의
-    ///    손 없이 다시 `Committed` 가 된다. 이것이 오너 절대규칙의 "큐 막힘 금지" 쪽이다.
-    #[test]
-    fn s7_persist_failure_is_reported_applied_and_never_latches() {
-        let tmp = isolated_sock("s7-fault");
-        let daemon = Daemon::new(tmp.clone());
-        let dir = state_dir(&daemon.socket_path);
-        let feed_path = dir.join("feed.jsonl");
-        let _ = std::fs::remove_file(&feed_path);
-        // open 실패를 결정론적으로 만든다(디렉터리는 append 로 열 수 없다).
-        std::fs::create_dir_all(&feed_path).expect("고장 주입용 디렉터리");
-
-        daemon
-            .feed_items
-            .lock()
-            .unwrap()
-            .push(sample_feed_item("s7-f1", "b".into()));
-        let (snap, attempt) =
-            daemon.resolve_feed_item_settled("s7-f1", "allow", Some("왜"), None, None);
-
-        // ① 분류돼 보고된다.
-        match &attempt {
-            SettleAttempt::Attempted(o) => {
-                assert_eq!(o.durability(), "not_written");
-                assert!(matches!(o, SettleOutcome::NotWritten(FeedPersistError::Open(_))));
-                assert!(o.detail().starts_with("open: "));
-            }
-            other => panic!("시도가 보고되지 않았다: {other:?}"),
-        }
-        assert!(!attempt.settled_durably());
-
-        // ② 되돌리지 않는다 — 스냅샷도 메모리도 resolved 다(그래서 "아직 pending" 은 거짓이다).
-        assert_eq!(snap.expect("스냅샷").status, "resolved");
-        assert_eq!(
-            daemon
-                .feed_items
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|i| i.request_id == "s7-f1")
-                .map(|i| (i.status.clone(), i.decision_reason.clone())),
-            Some(("resolved".to_string(), Some("왜".to_string())))
-        );
-
-        // ③ 거부 래치 없음: 같은 프로세스에서 **다음** append 도 시도된다(거부가 아니라 시도).
-        let second = daemon.persist_feed_item(&sample_feed_item("s7-f2", "b".into()));
-        assert!(matches!(
-            second,
-            SettleOutcome::NotWritten(FeedPersistError::Open(_))
-        ));
-
-        // 그리고 저장이 회복되면 사람의 손 없이 다시 내구적이 된다.
-        std::fs::remove_dir(&feed_path).expect("고장 제거");
-        assert!(daemon
-            .persist_feed_item(&sample_feed_item("s7-f3", "b".into()))
-            .is_committed());
-        let healed = std::fs::read_to_string(&feed_path).expect("회복 뒤 feed.jsonl");
-        assert!(healed.contains("s7-f3"));
-
-        test_rm_rf(tmp.parent().unwrap());
-    }
-
     /// 실제 persist_feed_item을 동시 다발 호출해도(프로덕션 경로) feed.jsonl이 손상되지
     /// 않음을 확인하는 스모크. (플랫폼이 단일 write()를 분할하지 않으면 락 유무와 무관하게
     /// 통과할 수 있으므로 '이빨' 박제는 위 결정론 테스트가 담당한다. 여기선 프로덕션 경로가
@@ -10826,13 +10469,7 @@ mod tests {
                 for i in 0..PER_THREAD {
                     let rid = format!("req-{t}-{i}");
                     let body = format!("{rid}::{}", "한AB\"{}".repeat(2048));
-                    // ★S7: 반환을 버리지 않는다 — 이 시험의 전제(모든 줄이 온전히 쓰인다)는
-                    //   이제 **반환값으로도** 주장된다.
-                    assert!(
-                        d.persist_feed_item(&sample_feed_item(&rid, body))
-                            .is_committed(),
-                        "동시 append 가 Committed 가 아니다"
-                    );
+                    d.persist_feed_item(&sample_feed_item(&rid, body));
                 }
             }));
         }
@@ -10870,11 +10507,7 @@ mod tests {
         let guard = daemon.feed_persist_lock.lock().unwrap();
         let d = Arc::clone(&daemon);
         let writer = std::thread::spawn(move || {
-            assert!(
-                d.persist_feed_item(&sample_feed_item("locked-req", "x".into()))
-                    .is_committed(),
-                "락 해제 후 append 는 Committed 여야 한다"
-            );
+            d.persist_feed_item(&sample_feed_item("locked-req", "x".into()));
         });
 
         // 락을 쥔 동안에는 파일이 생성/기록되지 않아야 한다(persist가 락에서 대기 중).
