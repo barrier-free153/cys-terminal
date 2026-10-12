@@ -2566,6 +2566,38 @@ pub enum SettleAttempt {
     Attempted(SettleOutcome),
 }
 
+/// ★S7 (0.14.51 · 부서장 지시 2026-10-12): [`FeedItem::decision_reason`] 에 **저장되는** 글자 수
+/// 상한 — **표시자를 포함한 총량**이다(그래서 "400 자를 넘지 않는다"가 조건 없이 참이다).
+/// 값의 근거: 팩의 같은 개념(`javis_approval_queue.py` 의 `_oneline(.., 400)`)과 **같은 400**.
+pub const DECISION_REASON_MAX_CHARS: usize = 400;
+
+/// 잘렸다는 **표시**(12 자). ★팩의 `_oneline` 은 표시 없이 `s[:limit]` 로 조용히 자른다 —
+/// 여기서는 일부러 다르게 한다: 사람이 쓴 사유를 말없이 줄이면 그 기록은 **조용히 거짓**이 된다.
+const DECISION_REASON_TRUNCATED_MARKER: &str = "…[truncated]";
+
+/// 사유를 상한 안으로 **자른다 — 거부하지 않는다.**
+///
+/// ★거부가 아니라 절단인 이유: 내구성·형식에 대한 의심이 해소를 **멈추게** 해서는 안 된다
+/// (DR-2 가 이 판에서 기록/불변식 형태로만 착지한 것과 같은 규율 · 오너 절대규칙의 "큐 막힘 금지").
+/// 긴 사유는 결재를 막을 사유가 아니다.
+///
+/// 세는 단위는 **글자(char)** 이고 바이트가 아니다 — 한글 사유가 바이트 상한에서 잘리면 UTF-8
+/// 스칼라가 쪼개져 줄 자체가 역직렬화 불가가 될 수 있다(그 줄은 복원에서 버려진다 ⇒ 상한이
+/// 기록을 지우는 장치가 된다). `chars()` 경계는 스칼라를 쪼개지 않는다.
+/// ★한계(명시): 결합 문자(자모 조합·이모지 ZWJ 등)의 **자소 묶음**은 쪼개질 수 있다. 파일은
+/// 깨지지 않고 복원도 되며, 보이는 글자 하나가 갈라질 수 있을 뿐이다 — grapheme 단위 절단은
+/// 외부 크레이트가 필요해 이 판에서 하지 않는다.
+pub fn cap_decision_reason(raw: &str) -> String {
+    let n = raw.chars().count();
+    if n <= DECISION_REASON_MAX_CHARS {
+        // ★상한 이하면 **한 글자도 건드리지 않는다**(표시도 붙이지 않는다).
+        return raw.to_string();
+    }
+    let keep = DECISION_REASON_MAX_CHARS - DECISION_REASON_TRUNCATED_MARKER.chars().count();
+    let head: String = raw.chars().take(keep).collect();
+    format!("{head}{DECISION_REASON_TRUNCATED_MARKER}")
+}
+
 impl SettleOutcome {
     /// 기록이 디스크에 확정됐는가 — ★이 하나만이 "내구적"이다.
     pub fn is_committed(&self) -> bool {
@@ -5930,7 +5962,10 @@ impl Daemon {
             // ★S7/B-108: 결재의 **왜**를 결정과 같은 줄에 넣는다 — 이 대입이 이 필드의 유일한
             //   생산처다. 값이 없는 경로(stale-clear·채널 미러 래퍼)는 null 그대로 남고,
             //   그 사실 자체가 "사유 없이 해소됐다"는 기록이다(없는 사유를 꾸미지 않는다).
-            item.decision_reason = reason.map(|r| r.to_string());
+            // ★상한은 이 **유일한 대입처**에서 적용된다(부서장 지시 2026-10-12): 기계가 스스로
+            //   결재하며 쓰는 칸이고, 그것이 부팅에서 **전부-또는-전무**로 읽히는 파일에 들어가므로
+            //   독자 쪽 보호 장치가 없는 성장 경로였다. 자르되 **멈추지 않는다**.
+            item.decision_reason = reason.map(cap_decision_reason);
             item.resolved_at = Some(now_epoch());
             // W4-A 해소 주체 각인 — allow/deny 무관 모든 결재의 주체를 남긴다. 래퍼 경유
             // (stale-clear·채널 미러)는 둘 다 None 그대로(위장 방지: 자기신고 없음 — 커널
@@ -10801,6 +10836,62 @@ mod tests {
         //   (os error 66)` 으로 깨졌다(단독 실행은 통과). 살아 있는 데몬이 끝정리 중에도 상태
         //   폴더에 쓰기 때문이고, test_rm_rf 의 문서가 말하는 그대로다 — 끝정리 실패는 이 검체가
         //   재는 것이 아니다(삭제가 검체의 **단계**인 자리, 즉 위의 고장 제거는 엄격하게 둔다).
+        let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
+    }
+
+    /// ★AT-S7-CAP — 사유 상한의 경계값 **399 / 400 / 401** (부서장 지시 2026-10-12).
+    ///
+    /// 박는 것 넷: ①상한 이하는 **한 글자도 바뀌지 않는다**(표시도 안 붙는다) ②상한을 넘으면
+    /// 저장량이 **정확히 400 자**이고 끝에 표시가 붙는다 ③세는 단위가 **글자**라 한글도 같은
+    /// 400 자이고 결과가 **유효한 UTF-8** 이다(바이트로 잘랐다면 스칼라가 쪼개져 그 줄이
+    /// 역직렬화 불가가 되고 복원에서 **버려졌을** 것이다 — 상한이 기록을 지우는 장치가 된다)
+    /// ④긴 사유가 해소를 **막지 않는다**(절단이지 거부가 아니다).
+    #[test]
+    fn s7_cap_decision_reason_at_399_400_401_and_in_hangul() {
+        // ① 399·400 은 그대로다.
+        let a = "x".repeat(399);
+        let b = "x".repeat(400);
+        assert_eq!(cap_decision_reason(&a), a, "399 자가 바뀌었다");
+        assert_eq!(cap_decision_reason(&b), b, "400 자가 바뀌었다");
+        assert!(!cap_decision_reason(&b).contains("truncated"), "상한 이하에 표시가 붙었다");
+
+        // ② 401 → 정확히 400 자 + 표시, 그리고 앞부분은 원문 그대로.
+        let c = "x".repeat(401);
+        let out = cap_decision_reason(&c);
+        assert_eq!(out.chars().count(), DECISION_REASON_MAX_CHARS, "저장량이 400 자가 아니다: {}", out.chars().count());
+        assert!(out.ends_with("…[truncated]"), "잘렸는데 표시가 없다");
+        assert!(out.starts_with(&"x".repeat(388)), "앞부분이 원문과 다르다");
+
+        // ③ 한글 401 자 — 글자 단위이고 결과는 유효한 UTF-8(String 이 그 자체로 증거)이며
+        //    바이트 길이는 400 보다 훨씬 크다(바이트 상한이 아니라는 사실의 관측면).
+        let k = "가".repeat(401);
+        let ko = cap_decision_reason(&k);
+        assert_eq!(ko.chars().count(), DECISION_REASON_MAX_CHARS);
+        assert!(ko.len() > DECISION_REASON_MAX_CHARS, "바이트가 아니라 글자로 세야 한다: {} bytes", ko.len());
+        assert!(ko.starts_with(&"가".repeat(388)) && ko.ends_with("…[truncated]"));
+        // 빈 문자열·짧은 값은 불변.
+        assert_eq!(cap_decision_reason(""), "");
+
+        // ④ ★긴 사유가 해소를 막지 않는다 — 실제 해소 경로로 확인한다.
+        let tmp = isolated_sock("s7-cap");
+        let daemon = Daemon::new(tmp.clone());
+        daemon
+            .feed_items
+            .lock()
+            .unwrap()
+            .push(sample_feed_item("cap-req", "b".into()));
+        let huge = "한".repeat(5000);
+        let (snap, attempt) = daemon.resolve_feed_item_settled("cap-req", "allow", Some(&huge), None, None);
+        assert!(attempt.settled_durably(), "긴 사유가 해소를 막았다 — {attempt:?}");
+        let stored = snap.expect("스냅샷").decision_reason.expect("사유");
+        assert_eq!(stored.chars().count(), DECISION_REASON_MAX_CHARS);
+        assert!(stored.ends_with("…[truncated]"));
+        // 영속된 줄도 같은 상한이고 다시 읽힌다(상한이 복원을 깨지 않는다).
+        let line = std::fs::read_to_string(state_dir(&daemon.socket_path).join("feed.jsonl"))
+            .expect("feed.jsonl");
+        let last = line.lines().filter(|l| l.contains("cap-req")).next_back().expect("줄");
+        let back: FeedItem = serde_json::from_str(last).expect("round-trip");
+        assert_eq!(back.decision_reason.as_deref(), Some(stored.as_str()));
         let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
     }
 
