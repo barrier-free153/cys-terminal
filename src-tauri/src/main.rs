@@ -4974,22 +4974,6 @@ async fn trash_order(order_id: String) -> Result<Value, String> {
     }
 }
 
-/// 미리보기 — 오너 등급. 고른 이름만 받는다(빈 목록은 데몬이 거절한다: '전체선택'이 프로토콜에도 없다).
-#[tauri::command]
-async fn trash_preview(names: Vec<String>) -> Result<Value, String> {
-    let sock = default_socket();
-    let mut params = json!({"names": names, "client": "tauri-app"});
-    if let Some(tok) = read_operator_token_for(&sock) {
-        params["operator_token"] = json!(tok);
-    }
-    let resp = rpc_full(&sock, "trash.preview", params).await?;
-    if resp["ok"].as_bool() == Some(true) {
-        Ok(resp["result"].clone())
-    } else {
-        Err(trash_err(&resp))
-    }
-}
-
 /// ★S8 재착륙 §1 — 비동기 미리보기 **기동**. 오너 등급. 즉시 `{job_id}` 로 돌아온다.
 ///
 /// ★이 명령은 **순회를 기다리지 않는다**: 데몬이 배경 스레드를 띄우고 바로 응답하므로 이 호출이
@@ -8198,7 +8182,6 @@ fn main() {
             dept_tombstones,
             trash_list,
             trash_order,
-            trash_preview,
             trash_preview_start,
             trash_preview_poll,
             trash_delete,
@@ -16353,7 +16336,17 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
     /// 넓어짐을 **막는 장치가 아니라 의식하게 만드는 장치**이고, 지금 그것이 의식적으로 일어났다.
     /// ⇒ 숫자를 올리는 대신 **이름을 「잠근 목록」으로 바꿨다**: 수치가 이름에 박히면 다음 개정마다
     /// 이름이 거짓이 되고, 이 시험이 실제로 재는 것은 **개수가 아니라 집합**이다.
-    /// ★`trash_preview`(동기)는 **퇴역 예정**이라 목록에서 곧 빠진다 — 그때 이 목록도 함께 줄어든다.
+    /// ★**개정 2(동기 미리보기 퇴역 · 2단계 심사 minor)**: 잠근 집합이 **여섯에서 다섯으로 줄었다** —
+    /// `trash_preview`(동기)를 등재와 함수째로 뺐기 때문이다. 왜 줄였는가: 리뷰어가 「그 빗장에
+    /// 실제로 참여하는 호출자가 누구냐」를 물어 재 보니 **예약을 잡는 것은 `preview_start` 경로뿐**이고
+    /// (`trash.rs` 의 `preview_lock_try_acquire`) 동기 경로는 `certify_names(root, state, &names, None, None)`
+    /// 으로 **세션 마감도 빗장도 없이** 걸었다 ⇒ 그것이 남아 있는 동안은 「단일 플라이트가 인증자를
+    /// 1로 묶는다」가 **GUI 경로에 대해서도 거짓**이었다. 퇴역 전에 호출자를 셌다: UI 0(핀 두 줄만
+    /// 부재를 단언한다) · Tauri 0 · `cys` CLI 0. ⚠오너 등급 우회는 아니었다(두 경로 모두 오너 게이트
+    /// 뒤다) — 그래서 major 가 아니라 minor 였다.
+    /// ★남은 정직한 한계: **데몬의 `trash.preview` 동사 자체는 남아 있다**(raw RPC 로만 닿는다).
+    /// 그러므로 단일 플라이트가 1로 묶는 것은 **GUI 경로 전체**이고 raw RPC 를 포함한 시스템 전체가
+    /// 아니다 — 그 동사의 처분은 이 티켓의 범위가 아니다(보고 대상이다).
     #[test]
     fn s8_trash_commands_are_registered_and_the_token_attach_list_is_the_locked_set() {
         // 경계는 기존 배선 핀(c2_feed_reply_and_list_all_wiring)과 같은 식으로 잡는다.
@@ -16368,20 +16361,27 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
         for name in [
             "trash_list",
             "trash_order",
-            "trash_preview",
             "trash_preview_start",
             "trash_preview_poll",
             "trash_delete",
         ] {
             assert!(reg.lines().any(|l| l.trim() == format!("{name},")), "{name} 미등재");
         }
+        // ★퇴역의 결박: 동기 미리보기는 **등재돼 있지 않고 함수도 없다**(다시 들어오면 빨개진다).
+        assert!(
+            !reg.lines().any(|l| l.trim() == "trash_preview,"),
+            "동기 trash_preview 가 다시 등재됐다 — 그것은 빗장에 참여하지 않는 두 번째 인증자다"
+        );
+        assert!(
+            !prod.contains("async fn trash_preview("),
+            "동기 trash_preview 명령이 되살아났다"
+        );
         for ro in ["async fn trash_list(", "async fn trash_order("] {
             let body: &str = seg(ro);
             assert!(!body.contains("read_operator_token_for") && !body.contains("\"operator_token\""),
                     "{ro} 읽기 전용인데 토큰이 실린다");
         }
         for rw in [
-            "async fn trash_preview(",
             "async fn trash_preview_start(",
             "async fn trash_preview_poll(",
             "async fn trash_delete(",
@@ -16391,7 +16391,7 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
             assert!(body.contains("rpc_full("), "{rw} 데몬의 error.code 가 화면까지 살아야 한다");
             assert!(!body.contains("socket: Option<String>"), "{rw} 소켓 인자를 받으면 안 된다(기지 전용)");
         }
-        // ★부착면의 전수: `read_operator_token_for` 를 쓰는 **최상위 명령 함수**는 정확히 넷이다.
+        // ★부착면의 전수: `read_operator_token_for` 를 쓰는 **최상위 명령 함수**는 잠근 집합과 같다.
         //   감싸는 함수는 **열 0 의 `fn`/`async fn` 줄**을 거슬러 찾는다(feed_reply 안의 중첩
         //   `async fn call(` 처럼 들여쓴 보조 함수는 그 바깥 명령으로 귀속된다).
         let mut callers: Vec<String> = Vec::new();
@@ -16418,7 +16418,6 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
                 "feed_reply".to_string(),
                 "send_input".to_string(),
                 "trash_delete".to_string(),
-                "trash_preview".to_string(),
                 "trash_preview_poll".to_string(),
                 "trash_preview_start".to_string()
             ],
