@@ -2200,11 +2200,21 @@ impl Surface {
         let mut st = self.pending_input.lock().unwrap_or_else(|e| e.into_inner());
         st.count = self.pending_input_bytes.load(Ordering::Relaxed); // 미러가 count 의 SOT
         // count 만 바꾸는 경로(큐 Inject·롤백 `set_pending_input`)가 지나간 뒤 불변식 human ≤ count 를 복원 — 이 복원이 보호하는 쪽은
-        // **raw `human` 을 그대로 읽는 소비자들**이다: `governance::draft_machine_owned` · absorb 의 human 사유 드롭(기계의 **자기 본문** 제출을 막는다) ·
-        // `schedule::draft_divert_step` · 그리고 `surface.list`·`queue.list` 가 **raw 로** 내보내는 `pending_input_human_bytes`(그 값을 사이클 판정
-        // `cys::cycle_target_state` 와 GUI 재시작 계획 `restartplan` 이 읽는다).
+        // **raw `human` 을 그대로 읽는 소비자들**이다: `governance::draft_machine_owned` ·
+        // `governance::resubmit_withheld_one` 의 `"human"` 사유 드롭(보류된 기계 제출을 **다시 쓰지 않는다** — 사람 바이트가 남아
+        //   있거나 본문 기록 뒤 사람 입력이 있었으면 포기한다 · 그 자리가 `.min` 없이 raw 를 읽는다) ·
+        // `schedule::draft_divert_step` · 그리고 `surface.list`·`org.status`·`queue.list` 가 **raw 로** 내보내는
+        // `pending_input_human_bytes`(그 값을 사이클 판정 `cys::cycle_target_state` 와 GUI 재시작 계획 `restartplan` 이 읽는다 —
+        //   후자가 읽는 좌석 행은 **`org.status` 의 것**이다. 열거에서 그 RPC 가 빠지면 이 문단이 자기 안에서 어긋난다).
+        // ★짝 Return **흡수(absorb)는 이 목록이 아니다** — 그 자리는 `human.min(pending)` 으로 **접어서** 읽으므로(1차 판정과
+        //   재검사 두 자리) 이 stale 을 애초에 보지 못한다. 종전 문면이 absorb 를 raw 소비자로 적은 것은 **틀렸다**(0.14.51 U2 MIN-1).
         // ★D-12 Return 게이트(`draft_gate`)와 큐 진단(`queue_block_diag_with`)은 **자기 안에서 `human.min` 을 하므로 이 stale 을 애초에 보지 못한다** —
         //   그 둘은 이 복원의 이유가 아니다(0.14.51 S1 재유도 · 게이트를 raw 로 바꾸는 변경은 B-080 에서 폐기됐다).
+        // ★큐 쌍 3항(오너 절대규칙 · 이 변경은 **주석 전용**이다): ①막는 폭주 = 없음 — 실행 바이트를 바꾸지 않으므로 어떤 폭주도
+        //   새로 막지 않는다(이 수리는 이름의 사실 정확성만 고친다). ②세울 수 있는 정상 배달 = **없음** — 이 복원식
+        //   `st.human = st.human.min(st.count)` 과 그 호출자 `apply_pending_input` 의 바이트가 그대로이므로 배달·제출 판정의
+        //   입력이 한 비트도 달라지지 않는다. ③세우지 않음의 확인 근거 = 이 커밋의 diff 가 `//` 로 시작하는 줄만 담는다(비주석
+        //   줄 변경 0 — 커밋 뒤 기계 검사로 되찍었다 · U2-REPAIR 보고서의 '큐 3항' 절).
         st.human = st.human.min(st.count);
         let mut next = crate::governance::pending_input_step_model(
             &st,
