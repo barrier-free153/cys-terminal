@@ -107,6 +107,23 @@ enum RpcErr {
     AfterSend(String),
 }
 
+/// ★MJR-4(델타 §2.2) — 전송 **가능성**의 두 부류. 이 분류가 **수신증의 진실성**을 가른다.
+///
+/// `Definite` = 「데몬은 이 요청을 **보지 못했다**」가 확정인 경우(바이트 미송신).
+/// `Uncertain` = 「**이미 처리됐을 수 있다**」인 경우(flush 뒤 단절·응답 파싱 실패).
+/// ⛔둘을 한 문자열로 합치면 화면이 Class 2 에서도 「지우지 않았습니다」라고 **거짓**을 말한다 —
+/// 삭제는 최종적이고 복구 단계가 없으므로 그 거짓은 오너를 **두 번 누르게** 만든다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportClass {
+    Definite,
+    Uncertain,
+}
+
+/// Class 2 의 표식 — 이 접두가 붙은 오류만 화면이 「결과를 확인할 수 없습니다」로 읽는다.
+/// ★화면 쪽 정의처는 `ui/src/trashconfirm.ts` 의 `TRASH_DELETE_UNCERTAIN_CODE` 이고,
+/// 두 자리가 어긋나지 않도록 **시험이 양쪽 문자열을 대조한다**.
+const TRASH_DELETE_UNCERTAIN_CODE: &str = "transport_uncertain";
+
 async fn rpc_once(
     socket: &std::path::Path,
     conn: &mut Option<tokio::io::BufReader<Stream>>,
@@ -160,8 +177,21 @@ async fn rpc_on(socket: &std::path::Path, method: &str, params: Value) -> Result
 /// 재시도·UI 분류를 해야 하는데 rpc_on은 message만 올려 코드가 유실됐다 — 기존 호출부의 문자열
 /// 계약(message만)은 rpc_on 래퍼로 그대로 보존하고, 코드가 필요한 곳만 이 함수를 직접 쓴다.
 async fn rpc_full(socket: &std::path::Path, method: &str, params: Value) -> Result<Value, String> {
+    rpc_full_classified(socket, method, params)
+        .await
+        .map_err(|(_, e)| e)
+}
+
+/// `rpc_full` 의 본체 — 실패를 **부류와 함께** 돌려준다(델타 §2.2).
+/// ★`rpc_full` 은 이것의 얇은 포장이다: 기존 호출부 수십 곳의 문자열 계약을 **바꾸지 않기 위해**
+/// 메시지만 떼어 준다. 부류가 필요한 자리(비멱등 명령 = 삭제)만 이 함수를 직접 쓴다.
+async fn rpc_full_classified(
+    socket: &std::path::Path,
+    method: &str,
+    params: Value,
+) -> Result<Value, (TransportClass, String)> {
     let req = json!({"id": 1, "method": method, "params": params});
-    let mut line = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
+    let mut line = serde_json::to_vec(&req).map_err(|e| (TransportClass::Definite, e.to_string()))?;
     line.push(b'\n');
     let cell = conn_cell(socket);
     let mut conn = cell.lock().await;
@@ -172,9 +202,15 @@ async fn rpc_full(socket: &std::path::Path, method: &str, params: Value) -> Resu
             *conn = None;
             match rpc_once(socket, &mut conn, &line).await {
                 Ok(r) => r,
-                Err(RpcErr::BeforeSend(e)) | Err(RpcErr::AfterSend(e)) => {
+                // 두 번째 시도도 미송신이면 **확정적 비실행**이다.
+                Err(RpcErr::BeforeSend(e)) => {
                     *conn = None;
-                    return Err(e);
+                    return Err((TransportClass::Definite, e));
+                }
+                // 두 번째 시도에서 바이트가 나갔다면 결과는 **알 수 없다**.
+                Err(RpcErr::AfterSend(e)) => {
+                    *conn = None;
+                    return Err((TransportClass::Uncertain, e));
                 }
             }
         }
@@ -182,10 +218,11 @@ async fn rpc_full(socket: &std::path::Path, method: &str, params: Value) -> Resu
             // 데몬이 이미 처리했을 수 있음 — 중복 surface 생성·키 이중 주입을 막기 위해
             // 재전송하지 않고 에러를 그대로 올린다
             *conn = None;
-            return Err(e);
+            return Err((TransportClass::Uncertain, e));
         }
     };
-    serde_json::from_str(resp_line.trim()).map_err(|e| e.to_string())
+    // ★응답 파싱 실패도 Class 2 다 — 바이트는 나갔고 데몬의 처리 여부를 알 수 없다.
+    serde_json::from_str(resp_line.trim()).map_err(|e| (TransportClass::Uncertain, e.to_string()))
 }
 
 #[tauri::command]
@@ -5026,11 +5063,21 @@ async fn trash_delete(
     if let Some(tok) = read_operator_token_for(&sock) {
         params["operator_token"] = json!(tok);
     }
-    let resp = rpc_full(&sock, "trash.delete", params).await?;
-    if resp["ok"].as_bool() == Some(true) {
-        Ok(resp["result"].clone())
-    } else {
-        Err(trash_err(&resp))
+    // ★MJR-4 — 삭제는 **비멱등**이다. 전송 실패를 두 부류로 갈라 올리고, Class 2(전송 불확실)는
+    //   코드로 표시해 화면이 「지우지 않았습니다」라고 **말하지 못하게** 한다(델타 §2.2 엄격 금지선).
+    //   ⛔재전송은 하지 않는다: `rpc_once` 의 AfterSend 는 이미 재시도 없이 올라오고, 여기서도
+    //   다시 보내지 않는다(맹목 재전송은 삭제를 두 번 거는 길이다).
+    match rpc_full_classified(&sock, "trash.delete", params).await {
+        Ok(resp) => {
+            if resp["ok"].as_bool() == Some(true) {
+                Ok(resp["result"].clone())
+            } else {
+                // 데몬의 정형 거부 = Class 1(인텐트 기록 전 명시적 거부) — 사유 코드를 그대로 올린다.
+                Err(trash_err(&resp))
+            }
+        }
+        Err((TransportClass::Uncertain, e)) => Err(format!("{TRASH_DELETE_UNCERTAIN_CODE}: {e}")),
+        Err((TransportClass::Definite, e)) => Err(e),
     }
 }
 
@@ -16388,9 +16435,36 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
         ] {
             let body: &str = seg(rw);
             assert!(body.contains("read_operator_token_for(&sock)"), "{rw} 토큰을 매번 새로 읽어야 한다");
-            assert!(body.contains("rpc_full("), "{rw} 데몬의 error.code 가 화면까지 살아야 한다");
+            // ★`rpc_on` 은 message 만 올려 코드를 잃는다 ⇒ 둘 중 하나여야 한다. `_classified` 는
+            //   비멱등 명령(삭제)이 전송 **부류**까지 필요해서 쓰는 변종이고(MJR-4 · 델타 §2.2),
+            //   error.code 보존은 둘이 같다.
+            assert!(
+                body.contains("rpc_full(") || body.contains("rpc_full_classified("),
+                "{rw} 데몬의 error.code 가 화면까지 살아야 한다"
+            );
             assert!(!body.contains("socket: Option<String>"), "{rw} 소켓 인자를 받으면 안 된다(기지 전용)");
         }
+        // ★MJR-4 결박 — 삭제만은 **부류를 아는** 전송을 쓴다(그냥 `rpc_full` 로 되돌리면 화면이
+        //   Class 2 에서도 「지우지 않았습니다」를 말하게 된다).
+        {
+            let del: &str = seg("async fn trash_delete(");
+            assert!(
+                del.contains("rpc_full_classified(&sock, \"trash.delete\""),
+                "삭제가 부류 없는 전송으로 되돌아갔다 — 전송 불확실을 거부로 보고하게 된다"
+            );
+            assert!(
+                del.contains("TransportClass::Uncertain") && del.contains("TRASH_DELETE_UNCERTAIN_CODE"),
+                "삭제가 Class 2 를 코드로 표시하지 않는다"
+            );
+            // ★화면 쪽 정의처와 **같은 문자열**인가(두 자리가 어긋나면 수신증이 조용히 거부로 떨어진다).
+            let ui = include_str!("../../ui/src/trashconfirm.ts");
+            assert!(
+                ui.contains("export const TRASH_DELETE_UNCERTAIN_CODE = \"transport_uncertain\";"),
+                "ui 쪽 TRASH_DELETE_UNCERTAIN_CODE 가 데몬측 표식과 다르다"
+            );
+            assert_eq!(TRASH_DELETE_UNCERTAIN_CODE, "transport_uncertain");
+        }
+
         // ★부착면의 전수: `read_operator_token_for` 를 쓰는 **최상위 명령 함수**는 잠근 집합과 같다.
         //   감싸는 함수는 **열 0 의 `fn`/`async fn` 줄**을 거슬러 찾는다(feed_reply 안의 중첩
         //   `async fn call(` 처럼 들여쓴 보조 함수는 그 바깥 명령으로 귀속된다).
@@ -16434,5 +16508,89 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
         fill_canonical_dept_sockets(&mut reg);
         assert_eq!(reg["depts"]["alpha"]["socket"], "/x/cys-dept-alpha/cys.sock", "값이 있는 소켓은 건드리지 않는다");
         assert!(reg["depts"]["zeta"]["socket"].as_str().map(|s| s.contains("cys-dept-zeta")).unwrap_or(false), "빈 등재는 canonical 로 채운다");
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    // ★MJR-4 결박 — `test_delete_transport_loss_receipt_is_unknown_not_refused`(델타 §2.3).
+    //
+    // 이 검체가 재는 것(6단정 중 **전송 쪽**): ⑴flush 뒤 단절은 `TransportClass::Uncertain` 이다
+    // ⑵그 실패에 **자동 재전송이 0건**이다(소켓이 받은 `trash.delete` 가 정확히 1건) ⑶양성 대조로
+    // 바이트 미송신은 `Definite` 다. 문면 쪽 다섯 단정(제목·상태·본문·제목 금지어·본문 금지어)은
+    // 순수 모듈 검사 `ui/src/trashconfirm.test.ts` 의 같은 이름 검체가 **동작으로** 잰다 —
+    // 토스트는 이 층에서 관측할 수 없고, 그 판정은 화면이 아니라 `trashTransportReceipt` 에 있다.
+    // ⚠못 보는 것(델타가 적은 그대로): 데몬 **안에서** 디스크 삭제가 어디까지 갔는지는 이 층에서
+    // 볼 수 없다 — 그것은 `DELETE-LEDGER.jsonl` 만이 안다. 그래서 수신증이 「알 수 없다」여야 한다.
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    #[cfg(unix)]
+    #[test]
+    fn test_delete_transport_loss_receipt_is_unknown_not_refused() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncBufReadExt as _;
+        use tokio::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("cys-mjr4-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let eof_sock = dir.join("eof.sock");
+        let gone_sock = dir.join("never-bound.sock");
+        let _ = std::fs::remove_file(&eof_sock);
+        let _ = std::fs::remove_file(&gone_sock);
+        let seen = std::sync::Arc::new(AtomicUsize::new(0));
+
+        tauri::async_runtime::block_on(async {
+            // 모의 데몬 — 요청 한 줄을 **읽고**(= 바이트가 나갔다) 응답 없이 **끊는다**(EOF 주입).
+            let l = UnixListener::bind(&eof_sock).unwrap();
+            let c = seen.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    match l.accept().await {
+                        Ok((mut s, _)) => {
+                            let mut line = String::new();
+                            let mut br = BufReader::new(&mut s);
+                            if br.read_line(&mut line).await.unwrap_or(0) > 0
+                                && line.contains("\"trash.delete\"")
+                            {
+                                c.fetch_add(1, Ordering::SeqCst);
+                            }
+                            // s 를 여기서 떨어뜨린다 = flush 뒤 단절.
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await; // bind 안정화
+
+            // ⑴ Class 2 — 전송 불확실
+            let err = rpc_full_classified(
+                &eof_sock,
+                "trash.delete",
+                json!({"confirm_id": "cf-1", "names": ["dept-9-1760000000"], "digest": "d"}),
+            )
+            .await
+            .expect_err("응답이 없으므로 실패여야 한다");
+            assert_eq!(
+                err.0,
+                TransportClass::Uncertain,
+                "flush 뒤 단절이 확정적 비실행으로 분류됐다 — 화면이 「지우지 않았습니다」라고 거짓을 말한다: {}",
+                err.1
+            );
+            // ⑵ ★자동 재전송 0건 — 삭제는 비멱등이므로 한 번만 나가야 한다.
+            assert_eq!(
+                seen.load(Ordering::SeqCst),
+                1,
+                "삭제 요청이 두 번 이상 나갔다 — 맹목 재전송은 삭제를 두 번 거는 길이다"
+            );
+
+            // ⑶ ★양성 대조(Class 1) — 소켓이 없으면 **바이트가 한 개도** 나가지 않는다.
+            let err2 = rpc_full_classified(&gone_sock, "trash.delete", json!({"confirm_id": "cf-2"}))
+                .await
+                .expect_err("없는 소켓이면 실패여야 한다");
+            assert_eq!(
+                err2.0,
+                TransportClass::Definite,
+                "바이트 미송신이 전송 불확실로 분류됐다 — 안전한 재시도를 막는다: {}",
+                err2.1
+            );
+            assert_eq!(seen.load(Ordering::SeqCst), 1, "대조군이 모의 데몬에 닿았다");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

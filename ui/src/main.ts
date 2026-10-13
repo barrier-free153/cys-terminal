@@ -135,8 +135,10 @@ import {
   trashAgeLines,
   trashChips,
   trashMismatchHint,
+  TRASH_DELETE_UNCERTAIN_TITLE,
   TRASH_PREVIEW_EXPIRED_CODE,
   TRASH_PREVIEW_WAIT_LINE,
+  trashTransportReceipt,
   trashModalLines,
   trashOrderProgressText,
   trashOrderSeverity,
@@ -1532,7 +1534,7 @@ async function trashPollOrder(orderId: string, total: number, gen: number, polls
     if (gen !== trashOrderGen) return;
     trashDeleting = false;
     trashSetStatus(TRASH_ORDER_UNKNOWN);
-    stickyToast("trash-order", "watchdog", "휴지통 삭제 — 결과를 확인할 수 없습니다", `${TRASH_ORDER_UNKNOWN} (${e})`);
+    stickyToast("trash-order", "watchdog", TRASH_DELETE_UNCERTAIN_TITLE, `${TRASH_ORDER_UNKNOWN} (${e})`);
     void refreshTrash();
     return;
   }
@@ -1601,18 +1603,28 @@ async function trashDeleteFlow() {
       digest: prev.digest,
     })) as { order_id?: string };
   } catch (e) {
+    // ★MJR-4(델타 §2.2) — 전송 실패는 **두 부류**다. 판정은 순수 모듈이 하고 화면은 그대로 옮긴다.
+    //   Class 1(확정적 비실행)만 「지우지 않았습니다」라고 말할 수 있다.
+    const rcpt = trashTransportReceipt(String(e).split(":")[0], String(e));
+    trashSetStatus(rcpt.status);
+    stickyToast("trash-order", "watchdog", rcpt.title, rcpt.body);
+    if (rcpt.resend === "blocked") {
+      // ★맹목 재전송 차단(화해 프로토콜) — `trashDeleting` 을 **풀지 않는다**: 그 깃발이
+      //   `trashSyncDeleteButton` 에서 단추를 계속 잠그므로 주기 갱신이 와도 다시 열리지 않는다.
+      //   원장(DELETE-LEDGER.jsonl)을 대조하는 것이 먼저다 — 그 말은 상태줄이 이미 하고 있다.
+      trashSyncDeleteButton(true);
+      return;
+    }
     trashDeleting = false;
-    const code = String(e).split(":")[0];
-    const r = trashRefusalText(code);
-    trashSetStatus(r.text);
-    stickyToast("trash-order", "watchdog", "휴지통 삭제 — 지우지 않았습니다", `${r.text}\n${e}`);
+    trashSyncDeleteButton(true);
     await refreshTrash();
     return;
   }
   if (!ordered?.order_id) {
     trashDeleting = false;
     trashSetStatus(TRASH_ORDER_UNKNOWN);
-    stickyToast("trash-order", "watchdog", "휴지통 삭제 — 결과를 확인할 수 없습니다", TRASH_ORDER_UNKNOWN);
+    // ★제목의 정의처는 하나다(순수 모듈) — 응답은 왔지만 order_id 가 없는 이 자리도 「알 수 없다」다.
+    stickyToast("trash-order", "watchdog", TRASH_DELETE_UNCERTAIN_TITLE, TRASH_ORDER_UNKNOWN);
     return;
   }
   trashStopPoll();

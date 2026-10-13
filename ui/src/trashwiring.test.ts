@@ -201,12 +201,34 @@ describe("걷는 동안 · 데몬이 없을 때 · 결과를 못 읽을 때 (12.
     const iBad = f.indexOf("stickyToast(\n      \"trash-order\"");
     expect(iOk >= 0 && iBad > iOk).toBe(true);
   });
+  it("★MJR-4: 삭제 실패의 수신증은 순수 모듈이 가르고, 전송 불확실에서는 **단추를 다시 열지 않는다**", () => {
+    const f = fnBody("trashDeleteFlow");
+    // 판정은 화면이 아니라 순수 함수가 한다(제목·본문·상태·재전송 허용 여부가 한 자리에 있다).
+    expect(f.includes('trashTransportReceipt(String(e).split(":")[0], String(e))')).toBe(true);
+    expect(f.includes('stickyToast("trash-order", "watchdog", rcpt.title, rcpt.body)')).toBe(true);
+    expect(f.includes("trashSetStatus(rcpt.status);")).toBe(true);
+    // ★맹목 재전송 차단 — `blocked` 분기는 `trashDeleting` 을 풀지 않고 돌아간다(깃발이 단추를 잠근다).
+    const iBlocked = f.indexOf('if (rcpt.resend === "blocked") {');
+    const iRelease = f.indexOf("trashDeleting = false;", iBlocked);
+    const iReturn = f.indexOf("return;", iBlocked);
+    expect(iBlocked >= 0).toBe(true);
+    expect(iReturn > iBlocked && (iRelease < 0 || iRelease > iReturn)).toBe(true);
+    // 단추를 잠그는 곳은 그 깃발이다(두 벌의 잠금 규칙을 만들지 않는다).
+    expect(fnBody("trashSyncDeleteButton").includes("btn.disabled = trashDeleting || !supported || n === 0;")).toBe(true);
+    // ⛔화면이 **토스트 제목**을 다시 짓지 않는다: 그 문자열이 이 흐름에 리터럴로 없다
+    //   (취소·확인 0건의 「아무 것도 지우지 않았습니다」는 사실 주장이 참인 자리이므로 남는다).
+    expect(f.includes("휴지통 삭제 — 지우지 않았습니다")).toBe(false);
+    expect(f.includes("결과를 확인할 수 없습니다")).toBe(false);
+  });
   it("거부 코드는 순수 모듈의 표로만 문구가 된다(화면이 사유를 다시 지어내지 않는다)", () => {
     // ★자리가 옮겼다: 미리보기의 거부는 이제 **모달 안에서** 문구가 된다(동기 경로 퇴역).
     const m = fnBody("trashConfirmModal");
     expect((m.match(/trashRefusalText\(/g) ?? []).length).toBeGreaterThanOrEqual(3);
     expect(m.includes("String(e).split(\":\")[0]")).toBe(true);
-    // 명령(삭제) 쪽의 거부도 같은 표를 쓴다.
-    expect(fnBody("trashDeleteFlow").includes("trashRefusalText(code)")).toBe(true);
+    // 명령(삭제) 쪽은 **수신증 함수**를 거쳐 같은 표에 닿는다 — 흐름이 표를 직접 부르지 않는다
+    //   (전송 부류를 가르는 자리를 지나치지 않게 하려고 한 단계를 더 세웠다).
+    const d = fnBody("trashDeleteFlow");
+    expect(d.includes("trashTransportReceipt(")).toBe(true);
+    expect(d.includes("trashRefusalText(")).toBe(false);
   });
 });

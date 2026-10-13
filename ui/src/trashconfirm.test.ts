@@ -22,6 +22,10 @@ import {
   type TrashEntryOutcome,
   type TrashOrder,
   TRASH_PREVIEW_EXPIRED_CODE,
+  TRASH_DELETE_UNCERTAIN_CODE,
+  TRASH_DELETE_REFUSED_TITLE,
+  TRASH_DELETE_UNCERTAIN_TITLE,
+  trashTransportReceipt,
 } from "./trashconfirm";
 
 const E = (o: Partial<TrashEntry> = {}): TrashEntry => ({
@@ -217,4 +221,38 @@ test("명령 심각도 = 항목 중 가장 나쁜 것 · 결과를 못 읽었을
   expect(trashOrderSeverity(mk([O({ outcome: "refused" }), O({ outcome: "partial" })]))).toBe("fail");
   expect(TRASH_ORDER_UNKNOWN).toContain("DELETE-LEDGER.jsonl");
   for (const bad of ["지웠습니다", "실패했습니다"]) expect(TRASH_ORDER_UNKNOWN).not.toContain(bad);
+});
+
+// ───────────────────────────────────────────────────────────────────────────────────────────
+// ★MJR-4 결박 — `test_delete_transport_loss_receipt_is_unknown_not_refused` 의 **문면 절반**.
+//   델타 §2.3 의 6단정 중 ⑴제목 ⑵상태 ⑶본문 ⑷제목 금지어 ⑸본문 금지어 다섯이 여기 있고,
+//   ⑹전송 1회(자동 재전송 0)는 소켓을 봐야 하므로 `src-tauri` 의 같은 이름 검체가 잰다.
+//   ★판정이 순수 함수에 있으므로 이것은 **문자열 핀이 아니라 동작 검사**다.
+// ───────────────────────────────────────────────────────────────────────────────────────────
+test("test_delete_transport_loss_receipt_is_unknown_not_refused — 전송 불확실은 거부가 아니다", () => {
+  const r = trashTransportReceipt(TRASH_DELETE_UNCERTAIN_CODE, "transport_uncertain: connection closed");
+  // ⑴ 제목 ⑵ 상태 ⑶ 본문
+  expect(r.title).toBe("휴지통 삭제 — 결과를 확인할 수 없습니다");
+  expect(r.status).toBe(TRASH_ORDER_UNKNOWN);
+  expect(r.body).toContain("명령 바이트가 전송되었으나");
+  // ⑷⑸ ★엄격 금지선 — 제목에도 본문에도 그 말이 없어야 한다(있으면 거짓 주장이다)
+  expect(r.title).not.toContain("지우지 않았습니다");
+  expect(r.body).not.toContain("지우지 않았습니다");
+  // 화해 프로토콜 — 맹목 재전송 차단
+  expect(r.klass).toBe("uncertain");
+  expect(r.resend).toBe("blocked");
+  // 다시 누르지 말라는 말이 본문에 있다(원장 대조가 먼저다)
+  expect(r.body).toContain("다시 삭제를 누르지 마십시오");
+});
+
+test("★양성 대조(Class 1) — BeforeSend·정형 거부는 '지우지 않았습니다'로 정확히 분기한다", () => {
+  for (const code of ["confirm_expired", "entry_changed_since_preview", "producer_active", "connection refused"]) {
+    const r = trashTransportReceipt(code, `${code}: x`);
+    expect(r.title).toBe("휴지통 삭제 — 지우지 않았습니다");
+    expect(r.klass).toBe("refused");
+    expect(r.resend).toBe("allowed");
+    expect(r.status).not.toBe(TRASH_ORDER_UNKNOWN);
+  }
+  // ★두 부류의 제목은 **다르다**(같아지면 이 검사 전체가 무의미해진다)
+  expect(TRASH_DELETE_REFUSED_TITLE).not.toBe(TRASH_DELETE_UNCERTAIN_TITLE);
 });

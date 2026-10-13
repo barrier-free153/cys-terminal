@@ -102,6 +102,47 @@ export const TRASH_PREVIEW_WAIT_LINE =
 /// 폴링이 받은 `status: "expired"` 를 사유 표에 넣기 위한 **화면 합성 코드**(데몬 문자열이 아니다).
 export const TRASH_PREVIEW_EXPIRED_CODE = "preview_expired";
 
+// ─── MJR-4 — 전송 실패의 **수신증**(델타 §2.2 Class 1 / Class 2) ─────────────────────────────
+/// Class 2 의 표식 — Tauri 가 이 접두를 붙여 올린다(정의처 쌍: `src-tauri/src/main.rs` 의
+/// `TRASH_DELETE_UNCERTAIN_CODE` · 두 자리가 어긋나면 그쪽 시험이 빨개진다).
+export const TRASH_DELETE_UNCERTAIN_CODE = "transport_uncertain";
+/// Class 1 — **확정적 비실행**의 제목(바이트 미송신 · 데몬의 정형 거부).
+export const TRASH_DELETE_REFUSED_TITLE = "휴지통 삭제 — 지우지 않았습니다";
+/// Class 2 — **전송 불확실**의 제목. ⛔여기에 「지우지 않았습니다」가 들어가면 거짓이 된다.
+export const TRASH_DELETE_UNCERTAIN_TITLE = "휴지통 삭제 — 결과를 확인할 수 없습니다";
+/// Class 2 의 본문 — 무엇이 확실하고(바이트는 나갔다) 무엇이 불확실한지(결과), 그리고
+/// **다시 누르지 말 것**을 말한다(맹목 재전송은 삭제를 두 번 거는 길이다).
+export const TRASH_DELETE_UNCERTAIN_BODY =
+  "명령 바이트가 전송되었으나 응답을 수신하지 못했습니다. 삭제가 실행 중이거나 이미 완료되었을 수 있으니 다시 삭제를 누르지 마십시오.";
+
+/// 삭제 명령이 실패했을 때의 수신증 — **두 부류를 가르는 유일한 자리**다.
+///
+/// ★판정이 화면이 아니라 이 순수 함수에 있는 이유: 「지우지 않았습니다」는 **사실 주장**이고,
+/// 전송이 불확실한 경우에 그 주장을 하면 오너가 **다시 누른다**(삭제는 최종적이고 복구 단계가 없다).
+/// 그래서 문면·상태·재전송 허용 여부를 한 자리에서 정하고, 검사가 그 자리에 하중을 건다.
+export function trashTransportReceipt(
+  code: string,
+  detail: string,
+): { klass: "uncertain" | "refused"; title: string; body: string; status: string; resend: "blocked" | "allowed" } {
+  if (code === TRASH_DELETE_UNCERTAIN_CODE) {
+    return {
+      klass: "uncertain",
+      title: TRASH_DELETE_UNCERTAIN_TITLE,
+      body: TRASH_DELETE_UNCERTAIN_BODY,
+      status: TRASH_ORDER_UNKNOWN,
+      resend: "blocked",
+    };
+  }
+  const r = trashRefusalText(code);
+  return {
+    klass: "refused",
+    title: TRASH_DELETE_REFUSED_TITLE,
+    body: detail ? `${r.text}\n${detail}` : r.text,
+    status: r.text,
+    resend: "allowed",
+  };
+}
+
 export function trashRefusalText(code: string): { text: string; action: "preview_again" | "none" } {
   switch (code) {
     case "confirm_expired":
