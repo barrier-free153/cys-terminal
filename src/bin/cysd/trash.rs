@@ -52,6 +52,22 @@ pub const TRASH_CERTIFY_MAX_SECS: u64 = 60;
 /// 제거가 길어질 때 **보고**만 하는 임계(초). 중단이 아니다(부서장 D2: report, never abort).
 pub const TRASH_REMOVE_STALL_REPORT_SECS: u64 = 120;
 
+/// ★MJR-1 — 예산을 **자식 루프 안에서** 다시 보는 간격(노드 수).
+/// 실측 근거(`S10-PACING-MEASUREMENT.md` · debug/release 두 프로파일): 노드당 3,368 ns(release) ·
+/// `Instant::now()` 34.9 ns ⇒ 128 노드마다면 초과분 상한이 **0.43 ms**(항목 예산 60 s 의 0.0007 %)이고
+/// 검사 비용은 **0.008 %** 다. 느린 파일계(노드당 100 µs 가정)에서도 초과분이 12.8 ms 로 묶인다.
+pub const TRASH_CERTIFY_BUDGET_CHECK_NODES: usize = 128;
+/// ★B-162 — 배경 순회가 디스패치에 **양보하는 간격(ms)**.
+/// ⚠선행 설계는 「1 ms / 5,000 inode」라 적었다. 양보 길이는 승계하고 **트리거는 시간으로 바꿨다**:
+/// 노드 수는 입력 공백의 상한이 **아니다**(같은 5,000 노드가 release 16.8 ms · debug 41.9 ms 이고
+/// 느린 파일계에서는 수백 ms 가 된다 — ★보호가 가장 필요한 상황에서 노드 트리거가 보호를 놓는다).
+/// 실측 근거: `sleep(1ms)` 의 실제 길이는 1.498 ms(avg) · 1.527 ms(max) ⇒ 20 ms 간격이면 처리량
+/// 비용 **7.0 %**, 입력 공백 상한 ≈ **21.7 ms**(결박선 50 ms 의 2.3배 여유). release 에서 5,000 노드가
+/// 16.8 ms 이므로 **동결 제안값과 같은 자리수**다(값을 깎은 것이 아니라 속도 독립 좌표로 다시 썼다).
+pub const TRASH_CERTIFY_YIELD_EVERY_MILLIS: u64 = 20;
+/// 한 번의 양보 길이(ms · 요청값) — 동결 설계의 1 ms 를 **승계**한다(실제로는 약 1.5 ms 다 · 위 주석).
+pub const TRASH_CERTIFY_YIELD_MILLIS: u64 = 1;
+
 /// ★미리보기 **세션** 상한(초) — 다수 항목을 한 잡에서 인증할 때의 전체 예산(델타 §1.3).
 /// ★`TRASH_REMOVE_STALL_REPORT_SECS` 와 **숫자가 같지만 다른 것**이다: 그것은 제거가 길어질 때
 ///   **보고만** 하는 임계(중단 아님)이고, 이것은 **중단시키는 예산**이다. 숫자가 같다는 이유로
@@ -133,6 +149,26 @@ pub struct Refusal {
 
 pub type CertifyResult = Result<Certificate, Refusal>;
 
+/// 디스패치에 한 번 양보한다(B-162) — ★셀 수 있는 자리로 떼어 둔다. 양보는 **보이지 않는 동작**이라
+/// 함수 안에 숨기면 「배경 순회만 양보한다」를 어떤 검사도 재지 못한다.
+fn dispatch_yield() {
+    #[cfg(test)]
+    YIELD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(TRASH_CERTIFY_YIELD_MILLIS));
+}
+
+/// 시험 전용 — 지금까지의 양보 횟수(전역이므로 이 값을 읽는 검체는 직렬화한다).
+#[cfg(test)]
+static YIELD_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub fn yields_for_test() -> usize {
+    YIELD_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[cfg(test)]
+pub fn reset_yields_for_test() {
+    YIELD_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// 장치 번호를 어디서 읽는가 — **시험용 주입점**(C-R4 known-failure 픽스처).
 /// 이 기계에는 휴지통 뿌리 아래 교차장치 디렉터리가 **0개**라(부서장 실측 · 내 재측정도 0) 실물로는
 /// 이 경로를 밟을 수 없다. 그래서 장치 읽기를 seam 으로 두고, 시험이 경계에서 다른 값을 주입한다.
@@ -167,8 +203,12 @@ pub fn certify_entry(root: &Path, dev_of: DevOf) -> CertifyResult {
 /// 무관한 자리가 함께 붉어진다. **가산(additive)** 으로 두고 기존 함수는 이 함수에 위임한다.
 /// ★마감은 **항목별 상한과 별개**다: 항목별은 `TRASH_CERTIFY_MAX_SECS`(이 항목만 거부),
 /// 세션 마감은 넘으면 `R_SESSION_TOO_SLOW` 로 거부하고 **잡 전체를 종결**시킨다.
-/// 마감 검사는 순회 루프의 **매 디렉터리마다** 걸리므로 진행 중인 순회가 **중단된다**
-/// (델타 §1.3 「세션 상한 도달 시 진행 중인 순회는 중단되고」).
+/// 마감 검사는 ⒜**매 디렉터리** 경계 ⒝**자식 루프 안에서 `TRASH_CERTIFY_BUDGET_CHECK_NODES` 노드마다**
+/// ⒞**루프를 빠져나온 뒤 한 번 더** 걸린다 ⇒ ★`Ok`(그리고 그 위의 `Ready`)는 **예산 안에서 끝난 것만**
+/// 뜻한다(델타 §1.3 「세션 상한 도달 시 진행 중인 순회는 중단되고」 · 동결본 `:103` 「up to the budget」).
+/// ⛔⒝⒞ 가 없던 동안에는 자식이 아주 많은 **한** 디렉터리가 예산을 넘겨 끝나고도 `Ok` 였다(MJR-1).
+/// ★`session_deadline` 이 `Some` 인 순회 ⇔ **배경 잡의 순회**다(동기·제거 경로는 전부 `None` 이다).
+/// 그래서 B-162 의 디스패치 양보도 그 조건에 걸린다 — 동기 경로에서 자면 stall 을 **늘린다**.
 pub fn certify_entry_until(
     root: &Path,
     dev_of: DevOf,
@@ -197,6 +237,8 @@ pub fn certify_entry_until(
     let mut set_digest: u128 = 0;
     // 순회 순서는 결정론으로 두되(진단 가능), 요약은 순서에 의존하지 않는다.
     let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    // ★B-162: 마지막으로 디스패치에 양보한 시각(간격은 노드 수가 아니라 **시간**이다 · 상수 주석 참조).
+    let mut last_yield = t0;
     while let Some((dir, depth)) = stack.pop() {
         // ★세션 마감 먼저 — 항목별 상한보다 상위다(넘으면 잡 전체가 끝난다).
         if let Some(dl) = session_deadline {
@@ -241,6 +283,41 @@ pub fn certify_entry_until(
                     detail: format!("노드 상한 {TRASH_CERTIFY_MAX_NODES} 초과 — 이 항목은 삭제 대상이 아니다"),
                 });
             }
+            // ★MJR-1 — 예산을 **자식 루프 안에서도** 본다. 시간 검사가 디렉터리 루프 머리에만 있으면
+            //   자식이 아주 많은 **한** 디렉터리가 예산을 넘겨 끝나고도 `Ok` → `Done` → `Ready` 가 된다
+            //   (동결본 `DESIGN-S8.md:103` 의 「up to the budget」이 최악에서 깨진다).
+            //   ★`Instant::now()` 는 **한 번만** 부르고 세 판정이 그 값을 나눠 쓴다(단가를 두 번 내지 않는다).
+            if nodes % TRASH_CERTIFY_BUDGET_CHECK_NODES == 0 {
+                let now_i = Instant::now();
+                if let Some(dl) = session_deadline {
+                    if now_i >= dl {
+                        return Err(Refusal {
+                            code: R_SESSION_TOO_SLOW,
+                            boundary: Some(p.display().to_string()),
+                            detail: format!(
+                                "미리보기 세션 상한 {TRASH_PREVIEW_SESSION_MAX_SECS}s 초과 — 디렉터리 **안에서** 순회를 중단했다(이 항목은 삭제 대상이 아니다)"
+                            ),
+                        });
+                    }
+                }
+                if now_i.duration_since(t0).as_secs() > TRASH_CERTIFY_MAX_SECS {
+                    return Err(Refusal {
+                        code: R_TOO_SLOW,
+                        boundary: Some(p.display().to_string()),
+                        detail: format!(
+                            "인증 시간 상한 {TRASH_CERTIFY_MAX_SECS}s 초과 — 디렉터리 **안에서** 중단했다(이 항목은 삭제 대상이 아니다)"
+                        ),
+                    });
+                }
+                // ★B-162 — 배경 잡의 순회만 양보한다(`session_deadline.is_some()` ⇔ 배경 잡).
+                if session_deadline.is_some()
+                    && now_i.duration_since(last_yield).as_millis() as u64
+                        >= TRASH_CERTIFY_YIELD_EVERY_MILLIS
+                {
+                    dispatch_yield();
+                    last_yield = Instant::now();
+                }
+            }
             let md = std::fs::symlink_metadata(&p).map_err(|e| Refusal {
                 code: R_UNREADABLE,
                 boundary: Some(p.display().to_string()),
@@ -279,6 +356,29 @@ pub fn certify_entry_until(
                 stack.push((p, depth + 1));
             }
         }
+    }
+    // ★MJR-1 의 마지막 구멍 — 루프를 **빠져나온 뒤에도** 마감을 본다. 간격 검사만으로는 간격보다
+    //   작은 트리(또는 유별나게 느린 lstat 한 번)가 예산을 넘기고도 `Ok` 로 나갈 수 있다.
+    //   ⇒ ★`Ready` 로 가는 길에 **예산을 넘긴 순회가 없다**(부서장이 못 박은 성공 기준).
+    if let Some(dl) = session_deadline {
+        if Instant::now() >= dl {
+            return Err(Refusal {
+                code: R_SESSION_TOO_SLOW,
+                boundary: Some(root.display().to_string()),
+                detail: format!(
+                    "미리보기 세션 상한 {TRASH_PREVIEW_SESSION_MAX_SECS}s 초과 — 순회는 끝났지만 예산을 넘겼으므로 인증으로 인정하지 않는다"
+                ),
+            });
+        }
+    }
+    if t0.elapsed().as_secs() > TRASH_CERTIFY_MAX_SECS {
+        return Err(Refusal {
+            code: R_TOO_SLOW,
+            boundary: Some(root.display().to_string()),
+            detail: format!(
+                "인증 시간 상한 {TRASH_CERTIFY_MAX_SECS}s 초과 — 순회는 끝났지만 예산을 넘겼으므로 인증으로 인정하지 않는다"
+            ),
+        });
     }
     let (rdev, rino) = dev_ino(&root_md);
     Ok(Certificate {
@@ -584,6 +684,7 @@ pub fn reset_state_for_test() {
     preview_jobs().lock().unwrap().clear();
     *PREVIEW_LOCK.lock().unwrap() = None;
     set_preview_spawn_fails(false);
+    reset_yields_for_test();
 }
 
 /// ★시험 전용 단계 훅(R2 §3.5 의 `after_seal`) — 봉인과 대조 **사이**에 끼어드는 쓰기를 만든다.
@@ -1276,6 +1377,41 @@ fn preview(id: &Value, root: &Path, state: &Path, params: &Value) -> Reply {
     }
 }
 
+/// 잡 결과 → (단계, 결과, 거부) 매핑.
+///
+/// ★별 함수로 떼어 둔 이유는 **검사가 잡을 자리를 만들기 위해서**다: 부서장이 못 박은 §1 성공 기준은
+/// 「예산을 넘긴 순회가 `Ready` 로 끝나는 길이 없다」이고, 그 「길」이 모이는 자리가 이 함수다.
+/// ⇒ `Ready` 로 가는 입구는 **`Done` 하나뿐**이고 `SessionExpired` 는 `Failed` 다(스레드 안에 두면
+/// 120 s 상수를 주입할 수 없어 어떤 검사도 이 매핑에 하중을 걸 수 없다).
+fn preview_outcome_phase(out: NamesOutcome) -> (PreviewPhase, Option<Value>, Option<Value>) {
+    match out {
+        NamesOutcome::Done {
+            shown,
+            refusals,
+            certs,
+        } => (
+            PreviewPhase::Ready,
+            Some(preview_payload(shown, refusals, certs)),
+            None,
+        ),
+        NamesOutcome::InvalidName => (
+            PreviewPhase::Failed,
+            None,
+            Some(job_refusal("(names)", "invalid_params", INVALID_NAME_MSG)),
+        ),
+        NamesOutcome::LedgerUnwritable => (
+            PreviewPhase::Failed,
+            None,
+            Some(job_refusal("(ledger)", R_LEDGER_UNWRITABLE, LEDGER_FAIL_MSG)),
+        ),
+        NamesOutcome::SessionExpired(r) => (
+            PreviewPhase::Failed,
+            None,
+            Some(refusal_json("(session)", &r)),
+        ),
+    }
+}
+
 /// `trash.preview_start` — 배경 잡을 띄우고 **즉시** `job_id` 를 돌려준다(순회를 기다리지 않는다).
 ///
 /// ★최상위 불변식: 이 함수는 파일을 **한 번도 걷지 않는다**. 하는 일은 이름 안전성 검사와 맵 등록뿐이다.
@@ -1334,32 +1470,7 @@ fn preview_start(id: &Value, root: &Path, state: &Path, params: &Value) -> Reply
             Some(deadline),
             Some(&prog as &dyn Fn(usize)),
         );
-        let (phase, result, refusal) = match out {
-            NamesOutcome::Done {
-                shown,
-                refusals,
-                certs,
-            } => (
-                PreviewPhase::Ready,
-                Some(preview_payload(shown, refusals, certs)),
-                None,
-            ),
-            NamesOutcome::InvalidName => (
-                PreviewPhase::Failed,
-                None,
-                Some(json!({"code": "invalid_params", "detail": INVALID_NAME_MSG})),
-            ),
-            NamesOutcome::LedgerUnwritable => (
-                PreviewPhase::Failed,
-                None,
-                Some(json!({"code": R_LEDGER_UNWRITABLE, "detail": LEDGER_FAIL_MSG})),
-            ),
-            NamesOutcome::SessionExpired(r) => (
-                PreviewPhase::Failed,
-                None,
-                Some(refusal_json("(session)", &r)),
-            ),
-        };
+        let (phase, result, refusal) = preview_outcome_phase(out);
         if let Some(j) = preview_jobs().lock().unwrap().get_mut(&jid) {
             j.phase = phase;
             j.result = result;
@@ -1381,7 +1492,7 @@ fn preview_start(id: &Value, root: &Path, state: &Path, params: &Value) -> Reply
         if let Some(j) = preview_jobs().lock().unwrap().get_mut(&job_id) {
             j.phase = PreviewPhase::Failed;
             j.result = None;
-            j.refusal = Some(json!({"code": R_PREVIEW_NO_WORKER, "detail": detail}));
+            j.refusal = Some(job_refusal("(worker)", R_PREVIEW_NO_WORKER, &detail));
         }
         preview_lock_release(&job_id);
         return Reply::Single(err_response(id, R_PREVIEW_NO_WORKER, &detail));
@@ -1417,6 +1528,14 @@ fn preview_poll(id: &Value, params: &Value) -> Reply {
 
 pub const LEDGER_FAIL_MSG: &str = "거부를 원장에 기록할 수 없어 진행하지 않았다 — \
     읽을 수 없는 거부는 거부가 아니다(아무 것도 건드리지 않았다)";
+
+/// 잡 거부의 모양 — ★화면(`ui/src/main.ts:1438` `refused?: { name, reason_code, boundary, detail }[]` ·
+/// `ui/src/trashconfirm.ts:172` `reason_code`)이 읽는 열 이름은 **`reason_code` 하나**다.
+/// 순회가 만든 거부는 `refusal_json` 이 그 모양으로 적고, 순회 **밖**에서 난 거부(이름·원장·일꾼)는
+/// 이 함수가 적는다 — 한 응답 안에 `code` 와 `reason_code` 두 이름이 섞이면 화면이 사유를 놓친다.
+fn job_refusal(name: &str, code: &str, detail: &str) -> Value {
+    json!({"name": name, "reason_code": code, "boundary": Value::Null, "detail": detail})
+}
 
 fn refusal_json(name: &str, r: &Refusal) -> Value {
     json!({"name": name, "reason_code": r.code, "boundary": r.boundary, "detail": r.detail})
@@ -2254,7 +2373,10 @@ mod tests {
             assert_eq!(m.len(), 1, "잡 하나만 등록돼 있어야 한다");
             let j = m.values().next().unwrap();
             assert_eq!(j.phase, PreviewPhase::Failed, "생성 실패 잡이 Running 으로 남았다");
-            assert_eq!(j.refusal.as_ref().expect("거부가 있어야 한다")["code"], R_PREVIEW_NO_WORKER);
+            assert_eq!(
+                j.refusal.as_ref().expect("거부가 있어야 한다")["reason_code"],
+                R_PREVIEW_NO_WORKER
+            );
         }
 
         // ⒜ 호출자는 **지금** 거부를 받는다(job_id 를 받고 영원히 폴링하지 않는다).
@@ -2285,6 +2407,232 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         reset_state_for_test();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    // ★MJR-1 결박 — **예산을 넘긴 순회가 `Ready` 로 끝나는 길이 없다**(부서장이 못 박은 성공 기준).
+    //   성공 기준이 「거부 코드가 구별된다」가 아닌 이유: 예산 초과 `Ready` 에는 거부가 **아예 없어서**
+    //   코드 구별이 하중을 받지 못한다. 그래서 네 자리를 따로 잰다 —
+    //   ⒜디렉터리 **안**(자식 루프) ⒝간격보다 작은 트리(루프 **뒤**) ⒞이름 묶음 전체의 결말
+    //   ⒟결말 → 단계 매핑(`Ready` 의 입구가 하나뿐임).
+    //   순회를 느리게 만드는 수단은 **기존 `dev_of` 주입점**이다(노드마다 불린다 — 60 s·120 s 상수를
+    //   기다리지 않고 예산 초과를 만드는 유일한 길이고, 새 주입점을 만들지 않는다).
+    // ───────────────────────────────────────────────────────────────────────────────────────
+
+    /// 노드마다 `micros` 만큼 느려지는 `dev_of` — 장치 번호 자체는 실값을 돌려준다.
+    fn slow_dev(micros: u64) -> impl Fn(&Path, &std::fs::Metadata) -> u64 {
+        move |p: &Path, md: &std::fs::Metadata| {
+            std::thread::sleep(std::time::Duration::from_micros(micros));
+            real_dev(p, md)
+        }
+    }
+
+    #[test]
+    fn a_budget_that_runs_out_inside_one_directory_refuses_instead_of_certifying() {
+        let _g = PREVIEW_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let root = rig("mjr1-inside");
+        let entry = root.join("dept-9-1760000000");
+        std::fs::create_dir_all(&entry).unwrap();
+        // 검사 간격(128)보다 **많은** 자식 — 자식 루프 안에서 마감이 지나간다.
+        let kids = TRASH_CERTIFY_BUDGET_CHECK_NODES * 3;
+        for i in 0..kids {
+            std::fs::write(entry.join(format!("f{i:05}")), b"x").unwrap();
+        }
+        let dev_of = slow_dev(500);
+        // 마감은 **디렉터리 머리 검사는 통과**하고(아직 지나지 않았다) 자식 루프 중간에 지나간다.
+        let dl = Instant::now() + std::time::Duration::from_millis(50);
+        let r = certify_entry_until(&entry, &dev_of, Some(dl))
+            .expect_err("예산을 넘긴 순회는 인증이 아니다");
+        assert_eq!(r.code, R_SESSION_TOO_SLOW, "세션 예산 소진 코드여야 한다");
+        // ★경계가 **자식 경로**다 = 디렉터리 머리도, 루프 뒤도 아닌 **자식 루프 안**에서 끊겼다는 증거
+        //   (머리 검사는 디렉터리 경로를, 루프 뒤 검사는 항목 뿌리를 경계로 적는다).
+        let b = r.boundary.clone().expect("경계가 있어야 한다");
+        assert_ne!(b, entry.display().to_string(), "경계가 항목 뿌리면 자식 루프에서 끊긴 것이 아니다");
+        assert!(
+            b.starts_with(&entry.display().to_string()),
+            "경계가 이 항목 안이어야 한다: {b}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_tree_smaller_than_the_check_cadence_still_cannot_certify_past_the_budget() {
+        let _g = PREVIEW_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let root = rig("mjr1-small");
+        let entry = root.join("dept-9-1760000001");
+        std::fs::create_dir_all(&entry).unwrap();
+        // 자식이 **검사 간격보다 적다** ⇒ 자식 루프의 간격 검사는 **한 번도 불리지 않는다**.
+        for i in 0..5 {
+            std::fs::write(entry.join(format!("f{i}")), b"x").unwrap();
+        }
+        assert!(5 < TRASH_CERTIFY_BUDGET_CHECK_NODES, "이 검체의 전제");
+        let dev_of = slow_dev(2_000); // 노드당 2 ms ⇒ 6 노드면 12 ms 이상
+        let dl = Instant::now() + std::time::Duration::from_millis(4);
+        let r = certify_entry_until(&entry, &dev_of, Some(dl))
+            .expect_err("순회가 끝났더라도 예산을 넘겼으면 인증이 아니다");
+        assert_eq!(r.code, R_SESSION_TOO_SLOW);
+        // ★루프 **뒤** 검사가 잡았다 = 경계는 항목 뿌리다.
+        assert_eq!(
+            r.boundary.as_deref(),
+            Some(entry.display().to_string().as_str()),
+            "간격보다 작은 트리는 루프 뒤 검사가 잡아야 한다"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_name_set_whose_session_budget_runs_out_ends_the_job_instead_of_showing_a_preview() {
+        let _g = PREVIEW_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let root = rig("mjr1-names");
+        let name = "dept-9-1760000002";
+        let entry = root.join(name);
+        std::fs::create_dir_all(&entry).unwrap();
+        let state = root.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        for i in 0..3_000 {
+            std::fs::write(entry.join(format!("f{i:05}")), b"x").unwrap();
+        }
+        // 먼저 **예산 없이** 재서 이 기계에서의 순회 시간을 얻는다(예측하지 않는다).
+        let t = Instant::now();
+        let full = certify_entry(&entry, &real_dev).expect("예산 없는 순회는 인증된다");
+        let whole = t.elapsed();
+        assert_eq!(full.nodes, 3_000);
+        // 그 절반을 예산으로 준다 ⇒ 순회는 반드시 예산 안에 끝나지 못한다.
+        let dl = Instant::now() + whole / 2;
+        let out = certify_names(&root, &state, &[name.to_string()], Some(dl), None);
+        // ★결말이 `Done` 이면 안 된다 — `Done` 은 `Ready` 의 **유일한 입구**이기 때문이다(⒟ 검체).
+        //   ⚠선존 결함에서는 여기서 `Done` 이 나왔다(그 안의 항목은 `recent` 로 거부되지만 **단계는
+        //   `Ready`** 다 — 예산을 넘긴 순회가 `Ready` 로 끝나는 바로 그 길이다).
+        match &out {
+            NamesOutcome::SessionExpired(r) => {
+                assert_eq!(r.code, R_SESSION_TOO_SLOW);
+            }
+            NamesOutcome::Done { shown, refusals, .. } => panic!(
+                "예산을 넘긴 순회가 Done 으로 끝났다(= Ready) — shown {} · refusals {}",
+                shown.len(),
+                refusals.len()
+            ),
+            NamesOutcome::InvalidName => panic!("이름이 거부됐다 — 이 검체의 전제가 깨졌다"),
+            NamesOutcome::LedgerUnwritable => panic!("원장을 쓸 수 없다 — 이 검체의 전제가 깨졌다"),
+        }
+        // ⒟ 과 묶어서 읽는다: 이 결말의 단계는 `Failed` 다.
+        let (phase, result, refusal) = preview_outcome_phase(out);
+        assert_eq!(phase, PreviewPhase::Failed, "예산 초과가 Ready 로 매핑됐다");
+        assert!(result.is_none());
+        assert_eq!(refusal.expect("거부")["reason_code"], R_SESSION_TOO_SLOW);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_only_entrance_to_ready_is_a_completed_walk() {
+        let done = NamesOutcome::Done {
+            shown: vec![],
+            refusals: vec![],
+            certs: HashMap::new(),
+        };
+        assert_eq!(preview_outcome_phase(done).0, PreviewPhase::Ready);
+        for out in [
+            NamesOutcome::InvalidName,
+            NamesOutcome::LedgerUnwritable,
+            NamesOutcome::SessionExpired(Refusal {
+                code: R_SESSION_TOO_SLOW,
+                boundary: None,
+                detail: "x".into(),
+            }),
+        ] {
+            let (phase, result, refusal) = preview_outcome_phase(out);
+            assert_eq!(phase, PreviewPhase::Failed, "Ready 의 입구는 Done 하나뿐이다");
+            assert!(result.is_none(), "실패에 결과가 실리면 화면이 반쯤 참을 보여준다");
+            let r = refusal.expect("실패는 이유를 들고 있어야 한다");
+            assert!(
+                r["reason_code"].is_string(),
+                "화면이 읽는 열 이름은 reason_code 하나다(code 로 적으면 사유를 놓친다): {r}"
+            );
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    // ★측정 전용 — 박자 파라미터의 **근거를 재는** 자리(B-162 의 「측정으로 조율할 파라미터」).
+    //   초록/빨강 판정이 아니므로 `#[ignore]` 다: `cargo test --bin cysd -- --ignored --nocapture
+    //   measure_the_pacing_parameters` 로 돌리고 **그 출력을 선언문에 인용한다**.
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    #[test]
+    #[ignore = "측정 전용 — 파라미터 근거를 재는 자리다(합격 판정이 아니다)"]
+    fn measure_the_pacing_parameters() {
+        let root = rig("pacing");
+        let entry = root.join("flat");
+        std::fs::create_dir_all(&entry).unwrap();
+        const N: usize = 20_000;
+        for i in 0..N {
+            std::fs::write(entry.join(format!("f{i:06}")), b"x").unwrap();
+        }
+        // ⒜ 노드당 순회 비용(lstat + sha256 + 집계) — 예산 초과량의 단위다.
+        let t0 = Instant::now();
+        let c = certify_entry(&entry, &real_dev).expect("인증");
+        let walk = t0.elapsed();
+        let per_node_ns = walk.as_nanos() as f64 / c.nodes as f64;
+        // ⒝ `Instant::now()` 1회 비용 — 매 노드 검사의 상한 비용이다.
+        let t1 = Instant::now();
+        let mut acc = 0u128;
+        for _ in 0..N {
+            acc = acc.wrapping_add(std::hint::black_box(Instant::now()).elapsed().as_nanos());
+        }
+        let now_ns = t1.elapsed().as_nanos() as f64 / N as f64;
+        // ⒞ `sleep(1ms)` 의 **실제** 길이 — 이 기계의 양보 단가(요청값보다 길다).
+        let mut slept: Vec<f64> = Vec::new();
+        for _ in 0..20 {
+            let t2 = Instant::now();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            slept.push(t2.elapsed().as_secs_f64() * 1e3);
+        }
+        let sleep_avg = slept.iter().sum::<f64>() / slept.len() as f64;
+        let sleep_max = slept.iter().cloned().fold(0.0f64, f64::max);
+        println!("PACING-MEASURE nodes={} walk_ms={:.3} per_node_ns={:.1} instant_now_ns={:.1} sleep1ms_avg_ms={:.3} sleep1ms_max_ms={:.3} blackbox_acc={}",
+            c.nodes, walk.as_secs_f64() * 1e3, per_node_ns, now_ns, sleep_avg, sleep_max, acc != 0);
+        // 파생값 — 선언문에 인용할 수치.
+        for cadence in [256usize, 512, 1_000, 2_000, 5_000] {
+            println!(
+                "PACING-DERIVE cadence={cadence} overshoot_ms={:.3} check_overhead_pct={:.4} yield_cost_pct={:.2}",
+                cadence as f64 * per_node_ns / 1e6,
+                now_ns / (cadence as f64 * per_node_ns) * 100.0,
+                sleep_avg * 1e6 / (cadence as f64 * per_node_ns) * 100.0,
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_the_background_walk_yields_to_the_dispatch_path() {
+        let _g = PREVIEW_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let root = rig("b162-yield");
+        let entry = root.join("dept-9-1760000003");
+        std::fs::create_dir_all(&entry).unwrap();
+        // 노드당 0.5 ms × 300 = 약 150 ms 의 일 ⇒ 20 ms 간격이면 양보가 여러 번 일어난다.
+        for i in 0..300 {
+            std::fs::write(entry.join(format!("f{i:04}")), b"x").unwrap();
+        }
+        let dev_of = slow_dev(500);
+
+        // ⒜ 배경 잡(마감 있음 · 넉넉하게) — 양보한다.
+        reset_yields_for_test();
+        let far = Instant::now() + std::time::Duration::from_secs(60);
+        certify_entry_until(&entry, &dev_of, Some(far)).expect("넉넉한 예산이면 인증된다");
+        let bg = yields_for_test();
+        assert!(
+            bg >= 2,
+            "배경 순회가 디스패치에 양보하지 않았다(양보 {bg}회) — B-162 가 배선되지 않았다"
+        );
+
+        // ⒝ ★동기·제거 경로(마감 없음) — **양보하지 않는다**(그 경로에서 자면 stall 을 늘린다).
+        reset_yields_for_test();
+        certify_entry(&entry, &dev_of).expect("동기 경로도 인증된다");
+        assert_eq!(
+            yields_for_test(),
+            0,
+            "마감 없는 순회(동기·제거 경로)가 양보했다 — 디스패치를 더 오래 막는다"
+        );
+        reset_yields_for_test();
         let _ = std::fs::remove_dir_all(&root);
     }
 }
