@@ -17826,17 +17826,20 @@ mod tests {
         // ★(0.14.51 · U2 MIN-3) 옛 4키를 **비사소한 값**으로 심는다 — `None`·`None` 로는 "값까지 그대로"를
         //   재지 못한다(가산 키가 옛 값을 **덮는** 변이가 `None` 위에서는 보이지 않는다). `updated_at` 을
         //   `now - 1234.5` 로 두는 이유: 상태행의 `age_secs` 는 `(핸들러의 now_epoch() - updated_at) as u64`
-        //   라 **정수 절단**이고, 0.5 를 깔아 두면 검체 지연이 500ms 미만인 동안 절단값이 **정확히 1234** 다
-        //   (지연이 500ms 를 넘으면 1235 로 보여 이 단정이 **깨진다** — 숨기지 않고 그렇게 두었다. 그 실패는
-        //   느린 기계의 신호이지 제품 결함이 아니므로, 깨지면 이 주석을 읽고 판단한다).
+        //   라 **정수 절단**이다.
+        //   ★(0.14.51 · U2 성찰 1회차 보강) 종전 문면은 「검체 지연이 500ms 미만이면 절단값이 정확히 1234」
+        //   였다 — 그것은 **느린 기계(윈도우 CI)에서 제품 결함 없이 붉어지는** 단정이다. 핸들러의
+        //   `now_epoch()` 는 아래 RPC 를 감싼 두 판독 `t0`·`t1` **사이**에 있으므로, 절단값이 취할 수 있는
+        //   값은 그 두 끝에서 계산된다. 두 끝이 같으면(통상) 이것은 **단일 값에 대한 정확 단정**이고, 느린
+        //   기계에서 둘로 벌어지면 그 **두 값만** 허용한다 — 거짓 적색도 없고 느슨해지지도 않는다.
         let q_ctx: u8 = 61;
         let q_task = "U2 MIN-3 비사소 옛값";
-        let q_age_secs: u64 = 1234;
+        let q_age_offset = 1234.5_f64;
         *quiescing.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
             state: "quiescing".into(),
             context_pct: Some(q_ctx),
             task: Some(q_task.to_string()),
-            updated_at: now - (q_age_secs as f64) - 0.5,
+            updated_at: now - q_age_offset,
         });
         *plain.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
             state: "working".into(), context_pct: Some(7), task: Some("라벨 없는 좌석".into()), updated_at: now,
@@ -17855,11 +17858,18 @@ mod tests {
         };
         let b0 = (before(&quiescing), before(&plain), before(&guard_only));
 
+        // ★RPC 를 벽시계 두 판독으로 감싼다 — 핸들러의 `now_epoch()` 가 이 둘 **사이**에 있다는 것이
+        //   아래 `age_secs` 정확 단정의 유일한 전제다.
+        let t0 = crate::state::now_epoch();
         let resp = d12_rpc(&daemon, pid, "org.status", json!({}));
+        let t1 = crate::state::now_epoch();
         assert_eq!(resp["ok"], json!(true), "{resp}");
         let result = resp["result"].clone();
         let b1 = (before(&quiescing), before(&plain), before(&guard_only));
         d12_cleanup(&daemon, &dir);
+        // 핸들러와 **같은 모양의 식**으로 두 끝을 계산한다(`(now_h - updated_at).max(0.0) as u64`).
+        let age_at = |t: f64| ((t - (now - q_age_offset)).max(0.0)) as u64;
+        let (age_lo, age_hi) = (age_at(t0), age_at(t1));
 
         let seat = |sid: u64| -> Value {
             result["surfaces"].as_array().unwrap().iter()
@@ -17887,7 +17897,14 @@ mod tests {
         assert_eq!(q["status"]["state"], json!("quiescing"), "{q}");
         assert_eq!(q["status"]["context_pct"], json!(q_ctx), "심은 context_pct 가 아니다: {q}");
         assert_eq!(q["status"]["task"], json!(q_task), "심은 task 가 아니다: {q}");
-        assert_eq!(q["status"]["age_secs"], json!(q_age_secs), "age_secs 절단값이 어긋났다(검체 지연 500ms+ 이면 1235): {q}");
+        let got_age = q["status"]["age_secs"].as_u64();
+        assert!(
+            got_age == Some(age_lo) || got_age == Some(age_hi),
+            "age_secs 가 가능한 절단값 밖이다 — 허용 {:?}{} · 받은 {:?}: {q}",
+            if age_lo == age_hi { vec![age_lo] } else { vec![age_lo, age_hi] },
+            if age_lo == age_hi { " (단일 값 = 정확 단정)" } else { " (RPC 가 초 경계를 넘었다)" },
+            got_age
+        );
         for k in ["state", "context_pct", "task", "age_secs"] {
             assert!(q["status"].get(k).is_some(), "기존 키 {k} 가 사라졌다: {q}");
         }
@@ -17970,7 +17987,15 @@ mod tests {
         let mut with_window = 0usize;
         let mut without_window = 0usize;
         let mut violations: Vec<Value> = Vec::new();
-        for _ in 0..1200 {
+        // ★(0.14.51 · U2 성찰 1회차 보강) 고정 반복 수 대신 **두 극을 찾을 때까지** 돈다(300회 이상 ∧ 10초
+        //   예산). 고정 수는 느린 기계에서 극 하나를 못 보고 **제품 결함 없이 붉어질** 수 있었다. 이 꼴은
+        //   거짓 적색을 거의 없애면서 아래 공허한 초록 금지 가드를 그대로 지킨다.
+        let t_end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut iters = 0usize;
+        while std::time::Instant::now() < t_end
+            && (iters < 300 || with_window == 0 || without_window == 0)
+        {
+            iters += 1;
             let resp = d12_rpc(&daemon, pid, "org.status", json!({}));
             let Some(rows) = resp["result"]["surfaces"].as_array() else {
                 continue;
@@ -18002,7 +18027,7 @@ mod tests {
         // ★공허한 초록 금지 — 두 극을 모두 봤을 때만 이 실행이 무언가를 쟀다고 말할 수 있다.
         assert!(
             with_window > 0 && without_window > 0,
-            "이 실행은 경합을 재지 못했다(창 있음 {with_window}건 · 창 없음 {without_window}건) —              초록을 '배선이 덮였다' 로 읽지 마라"
+            "이 실행은 경합을 재지 못했다(창 있음 {with_window}건 · 창 없음 {without_window}건 · 호출 {iters}회 · 10초 예산 소진) — 초록을 '배선이 덮였다' 로 읽지 마라"
         );
     }
 
