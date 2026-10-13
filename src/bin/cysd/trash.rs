@@ -78,6 +78,45 @@ pub const TRASH_PREVIEW_SESSION_MAX_SECS: u64 = 120;
 /// 미조회 만료(초) — 마지막 폴링 뒤 이만큼 아무도 묻지 않으면 잡을 버리고 빗장을 놓는다.
 pub const TRASH_PREVIEW_JOB_TTL_SECS: u64 = 120;
 
+/// ★⒟-2(판정문 S17 §4 · 교정 뒤에도 **그대로 유지된 지시**) — 크기 캐시를 **읽는 양의 상한**(바이트).
+/// 초과하면 캐시를 **무시하고 정상 경로로 간다**(⛔거부로 바꾸지 않는다 — 캐시는 **선택적 가속**이고,
+/// 가속이 없으면 느릴 뿐 **틀리지 않는다**: 목록은 그 항목을 `size.state = "pending"` 으로 보여준다).
+///
+/// 왜 상한이 필요한가: `size_cache_read` 는 종전에 **읽는 양에 상한이 없었다**. 쓰는 쪽은 64항목으로
+/// 자르므로(`size_cache_flush`) **자기 손으로는** 커지지 않지만, 그 파일은 휴지통 뿌리의
+/// `size-cache.json` 이고 **같은 UID 의 아무 프로세스나 키울 수 있다**. 그리고 그 파일을 읽는 자리는
+/// 둘인데 하나가 **오너 전용이 아닌** `trash.list`(`list_payload`)다 ⇒ 상한이 없으면 **감사자도 쓰는
+/// 목록 응답**이 파일 크기에 비례해 무계로 늘어난다(검증 좌석 실측: 19.8 MB 에서 1.215 s).
+///
+/// ★값의 실측 근거(이 기계 · debug 빌드 · 각 크기 5회 중 **최악** · S18 임시 프로브 출력 그대로):
+/// `10,349 B`(= 우리 쓰기 상한인 64항목의 크기) **451.292 µs** · `163,781 B` **5.278958 ms** ·
+/// `246,781 B` **7.858792 ms** · `263,381 B` **8.371083 ms** · `329,781 B` **10.264125 ms** ·
+/// `1,159,781 B` **38.001291 ms** · `4,681,781 B` **156.051792 ms** · `21,537,781 B` **727.17 ms**
+/// ⇒ 바이트당 약 **33.8 ns** 로 선형이다(= 검증 좌석의 19.8 MB/1.215 s 와 같은 자리수).
+/// ★그래서 **256 KiB** 다: ⒜우리가 쓰는 크기(10,349 B)의 **약 25배**라 **자기 손으로는 상한을 넘길 수
+/// 없다**(64항목이 평균 4 KB 가 되어야 하는데 한 항목은 약 160 B 다 — 즉 정상 동작에서 이 상한은
+/// **발화하지 않는다**) ⒝상한 바로 위 크기(263,381 B)의 최악 읽기가 **8.371083 ms** 로 측정됐으므로
+/// 캐시 때문에 `list`·미리보기가 멈추는 시간이 **약 8 ms 로 묶인다**.
+/// ⛔**시간 상한(ms)으로 잠그지 않은 이유**: 디스크 지연은 무계라 어떤 ms 단언도 거짓이 된다 —
+/// 그래서 묶는 것은 **읽는 바이트 수**이고, 위 수치는 그 선택의 **근거**이지 보장이 아니다.
+/// ★초과 뒤의 자기 치유(부수효과 · 목적이 아니다): 상한을 넘긴 파일은 다음 `size_cache_flush` 가
+/// **작은 파일로 덮는다**(읽기가 빈 맵을 주므로). 그 파일은 우리 산출물이라 덮는 것이 맞다.
+///
+/// ★**⒟′-2 개정 문면(S20A §1 · codex R1 M1 수용)** — 셋이 **의무**다:
+/// ⒜상한은 **바이트**다 ⛔**항목 수만의 상한은 금지**한다(항목 하나가 커도 읽는 양이 무계가 된다) ·
+/// ⒝검사는 **읽기 전에** 파일 크기로 한다 · ⒞검사 자리는 **유일한 독자 `size_cache_read` 안**이다 —
+/// ★그래야 **오너 전용이 아닌 `list_payload`(비오너 목록)** 를 포함한 **모든 호출자**가 같은 상한 뒤에 선다
+/// (호출자 둘: `size_cache_flush` · `list_payload` · 전수 확인). 초과 = **캐시 부재와 동일**(빈 맵).
+/// ⛔**거부로 바꾸지 않는다.**
+///
+/// ⛔★**범위 — 이 상한은 「양」을 묶고 「기다림」을 묶지 않는다**(S20A §2 · codex R1 의 새 질문):
+/// 읽는 **바이트 수**는 묶이지만 **첫 바이트·EOF 를 기다리는 시간**은 묶이지 않는다 ⇒
+/// ⛔**「목록 응답성이 유계다」를 주장하지 않는다.** 그중 **FIFO·특수 파일**은 아래 `size_cache_read` 에서
+/// **O(1) 로 닫았다**(같은 `metadata` 자리에서 파일 종류를 본다 · **추가 I/O 0**). **비정상적으로 느린
+/// 파일시스템의 기다림**은 이 상한으로 닫히지 않는다 — 그것은 **마감 없는 블로킹 시스템콜** 계열이고
+/// **A1(S22 설계 라운드)의 세 번째 노출면**으로 올라갔다(⛔내 범위가 아니다).
+pub const TRASH_SIZE_CACHE_MAX_BYTES: u64 = 256 * 1024;
+
 /// 봉인 접두 — 삭제 명령을 받은 항목은 먼저 이 이름으로 **봉인**된다(옛 이름으로 계속 쓰는 생산자가
 /// 봉인된 객체에 자동으로 닿지 못하게). 봉인 뒤에는 되돌리지 않는다(실패하면 봉인 상태로 남고
 /// 자동 재개는 없다).
@@ -879,19 +918,60 @@ pub fn size_cache_key(name: &str, dev: u64, ino: u64, mtime_bits: i64) -> String
     format!("{name}|{dev}|{ino}|{mtime_bits}")
 }
 fn size_cache_read(root: &Path) -> serde_json::Map<String, Value> {
-    std::fs::read_to_string(size_cache_path(root))
+    let path = size_cache_path(root);
+    // ★⒟-2: **읽기 전에** 크기를 본다 — 다 읽은 뒤 버리면 상한이 비용을 막지 못한다(이미 다 읽었다).
+    //   초과면 **캐시 부재와 똑같이** 빈 맵이다 ⇒ 호출자는 정상 경로(목록은 pending · 미리보기는 순회)로
+    //   간다. ⛔거부로 바꾸지 않는다. 판독 실패(권한·비UTF-8)도 종전처럼 빈 맵이다 — 같은 방향이다.
+    if let Ok(md) = std::fs::metadata(&path) {
+        if md.len() > TRASH_SIZE_CACHE_MAX_BYTES {
+            return serde_json::Map::new();
+        }
+        // ★S20A §2 ⒥ — **정규 파일이 아니면 캐시 부재와 동일**로 접는다(FIFO·장치·소켓·디렉터리).
+        //   왜: 크기 상한은 **읽는 양**을 묶지만 FIFO 의 `len()` 은 0 이라 상한을 통과하고, 그 뒤
+        //   `read_to_string` 이 **쓰는 쪽을 기다리며 영구히 선다** — 그 자리는 **오너 전용이 아닌**
+        //   `list_payload` 도 지나간다. ⒜`metadata` 는 **이미 불렀으니 추가 I/O 가 0** 이고
+        //   ⒝`stat` 자신은 FIFO 에서 블로킹하지 않는다(블로킹하는 것은 `open`/`read` 다) ⇒ **O(1)**.
+        //   ⛔거부가 아니다(캐시는 선택적 가속 · 목록은 그 항목을 `pending` 으로 보인다).
+        if !md.file_type().is_file() {
+            return serde_json::Map::new();
+        }
+    }
+    std::fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default()
 }
-fn size_cache_write(root: &Path, key: &str, c: &Certificate) {
+/// 유예된 크기 캐시 쓰기를 **한 번에** 반영한다.
+///
+/// ★⒟′-1(S20 §4 ⒤) — 이 함수는 **종단 판정 뒤에만** 불린다. 종전에는 인증 성공마다 순회 루프
+/// **안에서** 썼고, 그래서 **마지막 마감 검사 뒤 `Ready` 발행까지의 구간**에 캐시 파일 크기에 비례하는
+/// 작업(읽기+파싱+삽입+직렬화+쓰기 · ⒟-2 실측 **바이트당 약 33.8 ns**)이 **한 항목분 남아 있었다**.
+/// 그 작업을 그 구간 **밖으로** 옮긴 것이 ⒟′-1 이고, 결박 검체는
+/// `the_size_cache_is_not_written_until_the_terminal_decision_is_made` 다.
+///
+/// ★파급(제거·이동도 변경이므로 적는다):
+/// ⒜**캐시는 선택적 가속이다** — 발행과 이 호출 사이에 프로세스가 죽으면 다음 목록이 그 항목을
+///   `size.state = "pending"` 으로 보일 뿐이고, 원장·인증서·확인 레코드는 이 함수와 **무관**하다
+///   (⇒ 유예가 「정확성」을 건드리지 않는다. 같은 구간의 **원장 기록은 유예하지 않았다** — 그것은
+///   정확성이고, 그 선택은 `a_refusal_is_in_the_ledger_before_the_terminal_decision` 이 잠근다).
+/// ⒝읽기·자르기·쓰기를 **항목마다** 하던 것이 **한 번**으로 접혔다(N항목이면 파일 I/O 가 N벌 → 1벌).
+/// ⒞`pending` 이 비면 **아무 I/O 도 하지 않는다**(거부만 난 미리보기는 캐시 파일을 건드리지 않는다).
+/// ⒟`measured_at` 은 이제 **반영 시각**이다(종전엔 항목별 쓰기 시각) — 차이는 한 순회 안의 밀리초이고
+///   이 값의 쓰임새는 아래 **LRU 자르기 하나**다(`list_payload` 는 이 값을 읽지 않는다 · 전수 확인).
+fn size_cache_flush(root: &Path, pending: &[(String, Certificate)]) {
+    if pending.is_empty() {
+        return;
+    }
     let mut m = size_cache_read(root);
-    m.insert(
-        key.to_string(),
-        json!({"bytes": c.bytes, "nodes": c.nodes, "max_depth": c.max_depth,
-               "newest_mtime": c.newest_mtime, "measured_at": now_epoch(), "walk_secs": c.walk_secs}),
-    );
+    let at = now_epoch();
+    for (key, c) in pending {
+        m.insert(
+            key.clone(),
+            json!({"bytes": c.bytes, "nodes": c.nodes, "max_depth": c.max_depth,
+                   "newest_mtime": c.newest_mtime, "measured_at": at, "walk_secs": c.walk_secs}),
+        );
+    }
     // 유계: 최근 64개만 들고 있는다(휴지통 뿌리의 자식 수는 한 자리 수다 — 넉넉한 상한).
     if m.len() > 64 {
         let mut keys: Vec<(String, f64)> = m
@@ -1220,12 +1300,36 @@ enum NamesOutcome {
 /// 「막힘」 쪽을 새로 만드는 일이다. 그래서 예산은 **인자로만** 들어오고 호출자가 정한다.
 /// ★`on_progress` 는 **항목 경계**에서만 불린다 — 한 항목 안의 진행은 `certify_entry` 가 한 번의
 /// 호출로 순회하므로 보이지 않는다(정직한 한계 · 그래서 진행 수치는 항목 단위다).
+/// ★⒟′-1(S20 §4) — 크기 캐시 쓰기는 **여기서 하지 않는다**. 인증에 성공한 항목의 캐시 항목은
+/// `pending` 에 쌓이고, **종단 판정(그리고 `Ready` 발행·빗장 해제) 뒤에** 호출자가
+/// `size_cache_flush` 로 한 번에 반영한다. 이 겉면이 그 쌍(`결과`, `유예분`)을 한 값으로 묶어 돌려주므로
+/// **호출자가 유예분을 버리면 컴파일이 통과하지 않는다**(`.ok()` 로 숨겨진 MJR-2 와 같은 길을 막는다).
+///
+/// ★여기 **남겨 둔 것**과 그 이유: 거부의 **원장 기록**(`record_refusal` → `ledger_append` → `fsync`)은
+/// 유예하지 않았다. 유예하면 ⒜발행과 반영 사이에 프로세스가 죽을 때 **거부가 원장에 남지 않고**
+/// ⒝「원장을 쓸 수 없다」를 **거부 시점에** 알 수 없다(그 Err 가 `LedgerUnwritable` 로 잡 전체를
+/// 종결시키는 길이 사라진다) ⇒ 둘 다 **정확성** 문제이고, 캐시(가속)와 같은 급이 아니다
+/// (부서장 S20 §4 ⒟′-1 ⒥ 경고 그대로). 그 결과 구간에 남는 원장 쓰기는 **최대 1건**이다(아래
+/// `preview_outcome_phase` 머리의 불변식 ③).
 fn certify_names(
     root: &Path,
     state: &Path,
     names: &[String],
     session_deadline: Option<Instant>,
     on_progress: Option<&dyn Fn(usize)>,
+) -> (NamesOutcome, Vec<(String, Certificate)>) {
+    let mut pending: Vec<(String, Certificate)> = Vec::new();
+    let out = certify_names_into(root, state, names, session_deadline, on_progress, &mut pending);
+    (out, pending)
+}
+
+fn certify_names_into(
+    root: &Path,
+    state: &Path,
+    names: &[String],
+    session_deadline: Option<Instant>,
+    on_progress: Option<&dyn Fn(usize)>,
+    pending: &mut Vec<(String, Certificate)>,
 ) -> NamesOutcome {
     let now = now_epoch();
     let mut certs: HashMap<String, Certificate> = HashMap::new();
@@ -1268,7 +1372,9 @@ fn certify_names(
                 let recent = is_recent(c.newest_mtime, now, TRASH_RECENT_WINDOW_SECS);
                 if let Ok(md) = std::fs::symlink_metadata(&p) {
                     let (dev, ino) = dev_ino(&md);
-                    size_cache_write(root, &size_cache_key(name, dev, ino, mtime_bits(&md)), &c);
+                    // ★⒟′-1: 쓰지 않고 **쌓는다** — 이 자리의 쓰기가 마지막 항목에서는 「마감 검사 뒤
+                    //   `Ready` 까지」 구간에 들어가고, 그 비용은 **캐시 파일 크기에 비례**했다.
+                    pending.push((size_cache_key(name, dev, ino, mtime_bits(&md)), c.clone()));
                 }
                 nodes_done = nodes_done.saturating_add(c.nodes);
                 if let Some(f) = on_progress {
@@ -1367,6 +1473,42 @@ const INVALID_NAME_MSG: &str =
 /// 「예산을 넘긴 순회가 `Ready` 로 끝나는 길이 없다」이고, 그 「길」이 모이는 자리가 이 함수다.
 /// ⇒ `Ready` 로 가는 입구는 **`Done` 하나뿐**이고 `SessionExpired` 는 `Failed` 다(스레드 안에 두면
 /// 120 s 상수를 주입할 수 없어 어떤 검사도 이 매핑에 하중을 걸 수 없다).
+///
+/// ───────────────────────────────────────────────────────────────────────────────────────────
+/// ★⒟′-3(S20 §3·§4) — **잠근 기준의 처분**. 조용히 다시 읽지 않고 **결함이라고 적는다**.
+///
+/// ⛔**잠근 기준 「예산을 넘긴 순회가 `Ready` 로 끝나는 길이 **없다**」는 어떤 구현으로도 충족될 수
+/// 없다**(ε>0 · S20 M2). 마지막 마감 검사와 `Ready` 발행 사이에는 **항상** 일이 남고, 그 일 안에
+/// `fsync` 가 있을 수 있으므로(아래 ③) 그 ε 에 **ms 상한을 걸 수도 없다** — 디스크 지연은 무계다.
+/// ⇒ 기준 문면은 **고치지 않고**, 그 옆에 이 사실과 아래 **대체 불변식**을 적는다
+/// (레인 법칙 `a-locked-criteria-file-can-be-wrong-and-still-be-the-right-pin`).
+/// ⛔**「`Ready` = 모든 인증이 예산 안에」는 쓰지 않는다** — 그것은 부서장이 기각한 ⒝ 다(S20 M3).
+///
+/// ★**대체 불변식**: 마지막 마감 검사 뒤 `Ready` 발행까지의 잔여에는 **순회 입력에 비례하는 작업·루프가
+/// 없다** — **걷는 노드 수**·**캐시 파일 바이트**·**디렉터리 폭** 어디에도 비례하지 않는다.
+/// 그 구간에 실제로 남는 것은 셋이고, 셋 다 **읽어서 센 것**이다:
+/// ① **순회 꼬리 = 0 노드**(인증 성공 경로). 마감 검사가 순회 **종료 뒤에도** 한 번 더 있고
+///   (`certify_entry_until` 의 루프 밖 검사) 그 뒤에는 `dev_ino` 와 인증서 조립뿐이다.
+///   ★예외는 마지막 항목이 **자식 루프 안에서** 거부된 경로(`unreadable`·`desc_device`·`too_many`)이고,
+///   그때 꼬리는 **< `TRASH_CERTIFY_BUDGET_CHECK_NODES`(128) 노드** 다 — 검사 간격이 상한이므로
+///   **입력 크기와 무관한 상수**다.
+/// ② **선택된 이름 수 N 에 비례하는 「답 조립」** — `preview_payload` 의 `order_digest`(이름별 해시 1회)와
+///   `certs.keys()` 사본·정렬. ★**S20 §2 는 「항목 수」도 금지 목록에 넣었으므로 이 항은 그 문면을
+///   충족하지 못한다.** 내가 재서 찾았고 조용히 넘기지 않는다(부서장 판정 대기 · 이 자리의 고지가 그 보고다).
+///   없앨 수는 있다: `names` 를 **정렬·중복제거**해 루프 **안에서** 해시를 누적하면 꼬리가 `finalize()`
+///   하나로 준다. 하지 않은 이유는 파급이 **사용자가 보는 순서**이기 때문이다 — 지금 `entries` 는 오너가
+///   **고른 순서**(`ui/src/main.ts` 의 선택 Set 삽입 순 `trashSelectedNames()`)이고, 모달 목록·원장 행
+///   순서·삭제 집행 순서(`confirmNames = prev.entries.map(name)`)가 전부 그 순서를 따른다.
+///   ⇒ **순서를 바꾸는 판단은 부서장의 것**이고, 나는 측정과 선택지만 올린다.
+/// ③ **최대 1건의 원장 추가(= `fsync` 1회)** — 마지막 항목이 거부된 경우뿐이다(생산자 활성·최근 쓰기·
+///   인증 실패 세 분기가 각각 `record_refusal` 1회 뒤 `continue` 다). **건수는 입력에 따라 늘지 않고**,
+///   지연은 **무계**다. ★이것을 유예하지 않은 이유는 `certify_names` 머리에 적었다(정확성 ≠ 가속).
+///
+/// ★**결박 검체는 시간이 아니라 구조를 잰다**(S20 §2 · ⛔ms 단언 금지):
+/// `the_size_cache_is_not_written_until_the_terminal_decision_is_made`(캐시 바이트 항이 구간 밖임) ·
+/// `a_refusal_is_in_the_ledger_before_the_terminal_decision`(③을 유예로 「최적화」하면 빨개진다) ·
+/// (선존) `the_only_entrance_to_ready_is_a_completed_walk`(예산 초과가 `Ready` 로 못 간다 · **재협상 금지**).
+/// ───────────────────────────────────────────────────────────────────────────────────────────
 fn preview_outcome_phase(out: NamesOutcome) -> (PreviewPhase, Option<Value>, Option<Value>) {
     match out {
         NamesOutcome::Done {
@@ -1447,7 +1589,7 @@ fn preview_start(id: &Value, root: &Path, state: &Path, params: &Value) -> Reply
                 j.nodes = n;
             }
         };
-        let out = certify_names(
+        let (out, pending) = certify_names(
             &root_o,
             &state_o,
             &names,
@@ -1462,6 +1604,12 @@ fn preview_start(id: &Value, root: &Path, state: &Path, params: &Value) -> Reply
         }
         // ★완료·실패 **즉시** 빗장을 놓는다(상태 전이표 3·4행).
         preview_lock_release(&jid);
+        // ★⒟′-1 — 유예한 크기 캐시는 **여기서** 반영한다: 종단 판정 **뒤**이고 빗장 해제 **뒤**다.
+        //   ⒜「마지막 마감 검사 → `Ready` 발행」 구간에서 **캐시 파일 크기에 비례하는 작업**이 빠진다
+        //   ⒝빗장 밖이므로 이 I/O 가 **다음 미리보기를 기다리게 만들지 않는다**
+        //   ⒞실패·예산 소진으로 끝난 잡의 유예분도 반영한다 — 그 측정은 **참이고**, 버리면 다음 목록이
+        //     이유 없이 다시 걷는다(캐시는 가속이고, 잡의 결말과 캐시의 진실성은 별 축이다).
+        size_cache_flush(&root_o, &pending);
     });
     // ★MJR-2 — 생성 실패를 **버리지 않는다**. 버리면 ⒜잡이 영구 `Running` ⒝빗장이 영구 점유이고,
     //   빗장을 놓는 코드는 **실행되지 않는 클로저 안**이다 ⇒ 이후 모든 `preview_start` 가 영구
@@ -2493,7 +2641,7 @@ mod tests {
         assert_eq!(full.nodes, 3_000);
         // 그 절반을 예산으로 준다 ⇒ 순회는 반드시 예산 안에 끝나지 못한다.
         let dl = Instant::now() + whole / 2;
-        let out = certify_names(&root, &state, &[name.to_string()], Some(dl), None);
+        let (out, _pending) = certify_names(&root, &state, &[name.to_string()], Some(dl), None);
         // ★결말이 `Done` 이면 안 된다 — `Done` 은 `Ready` 의 **유일한 입구**이기 때문이다(⒟ 검체).
         //   ⚠선존 결함에서는 여기서 `Done` 이 나왔다(그 안의 항목은 `recent` 로 거부되지만 **단계는
         //   `Ready`** 다 — 예산을 넘긴 순회가 `Ready` 로 끝나는 바로 그 길이다).
@@ -2732,7 +2880,7 @@ mod tests {
         //   (`certify_names(.., None, None)` = 세션 예산 없는 동기 순회)을 **여기서 직접** 부른다.
         //   ⇒ 여전히 뮤턴트가 아니다: 비교 대상이 가설이 아니라 **살아 있는 생산 코드**다.
         let t3 = Instant::now();
-        let _ = certify_names(&root, &state, &[name.to_string()], None, None);
+        let (_out, _pending) = certify_names(&root, &state, &[name.to_string()], None, None);
         let sync_rtt = t3.elapsed();
         assert!(
             sync_rtt.as_millis() >= 50,
@@ -2781,5 +2929,289 @@ mod tests {
         for keep in ["\"preview_start\" => {", "\"preview_poll\" => {"] {
             assert!(prod.contains(keep), "{keep} 가 없다 — 퇴역이 미리보기 자체를 지웠다");
         }
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    // ★⒟-2 결박 — **상한을 넘긴 크기 캐시는 무시된다(거부가 아니다)**.
+    //   무엇을 재는가: ⒜상한 초과면 목록이 `pending` 으로 돌아간다(= 캐시를 읽지 않았다) ⒝그래도
+    //   응답은 **정상**이다(거부·오류가 아니다 · 항목이 그대로 보인다) ⒞같은 키를 **상한 아래** 크기로
+    //   두면 `measured` 가 된다 ⇒ ⒜의 원인이 **크기 상한**이고 키 불일치가 아니라는 증거
+    //   ⒟읽기는 그 파일을 **바꾸지 않는다**(읽기 경로의 부작용 0) ⒠쓰기가 지나가면 파일이 작아진다
+    //   (주석에 적은 자기 치유 — 목적이 아니라 부수효과임을 검체도 그렇게 적는다).
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    #[test]
+    fn a_size_cache_over_the_cap_is_ignored_and_the_list_stays_normal() {
+        let root = rig("d2-cap");
+        let name = "dept-9-1760000200";
+        let entry = root.join(name);
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("f0"), b"x").unwrap();
+        let state = root.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        // 이 항목에 **맞는** 캐시 키를 만든다(이름+장치+inode+mtime 비트).
+        let md = std::fs::symlink_metadata(&entry).unwrap();
+        let (dev, ino) = dev_ino(&md);
+        let key = size_cache_key(name, dev, ino, mtime_bits(&md));
+        let hit = json!({"bytes": 4242, "nodes": 7, "max_depth": 1,
+                         "newest_mtime": mtime_secs(&md), "measured_at": now_epoch(), "walk_secs": 0.01});
+
+        // ⒜ 상한을 **넘긴** 파일 — 같은 키가 들어 있어도 읽히지 않아야 한다.
+        // ★항목 수는 **계산해서 한 번에** 만든다(상한을 넘길 때까지 매번 직렬화하면 O(n²) 이고
+        //   검체가 느려진다 — 느린 검체는 다음 사람이 지운다). 한 항목은 약 160 B 이므로
+        //   2,000항목 ≈ 330 KB 로 256 KiB 를 넘긴다(실측: 2,000항목 = 329,781 B).
+        let mut big = serde_json::Map::new();
+        big.insert(key.clone(), hit.clone());
+        for i in 0..2_000usize {
+            big.insert(
+                format!("dept-{i}-1760000000|16777232|{i}|1760000000000"),
+                json!({"bytes":12345,"nodes":2572,"max_depth":7,
+                       "newest_mtime":1760000000.0,"measured_at":1760000000.0,"walk_secs":0.25}),
+            );
+        }
+        std::fs::write(size_cache_path(&root), Value::Object(big).to_string()).unwrap();
+        let over = std::fs::metadata(size_cache_path(&root)).unwrap().len();
+        assert!(over > TRASH_SIZE_CACHE_MAX_BYTES, "검체 전제: 파일이 상한을 넘겨야 한다({over})");
+
+        let v = list_payload(&root, &state);
+        let ents = v["entries"].as_array().expect("entries 배열");
+        let me = ents
+            .iter()
+            .find(|e| e["name"] == name)
+            .expect("항목이 목록에 그대로 있어야 한다(거부가 아니다)");
+        assert_eq!(
+            me["size"]["state"], "pending",
+            "상한을 넘긴 캐시가 읽혔다 — 읽는 비용이 파일 크기에 비례해 무계가 된다: {me}"
+        );
+        // ⒝ 응답은 정상이다 — 오류·거부 필드가 아니라 평소의 목록이다.
+        assert!(v["root"].is_string() && v["ledger_writable"].is_boolean(), "목록 응답이 평소 모양이어야 한다: {v}");
+        // ⒟ 읽기는 그 파일을 바꾸지 않는다.
+        assert_eq!(
+            std::fs::metadata(size_cache_path(&root)).unwrap().len(),
+            over,
+            "읽기 경로가 캐시 파일을 건드렸다"
+        );
+
+        // ⒞ 같은 키를 **상한 아래** 크기로 두면 `measured` 다 ⇒ 원인이 크기 상한이라는 증거.
+        let mut small = serde_json::Map::new();
+        small.insert(key.clone(), hit);
+        std::fs::write(size_cache_path(&root), Value::Object(small).to_string()).unwrap();
+        let under = std::fs::metadata(size_cache_path(&root)).unwrap().len();
+        assert!(under <= TRASH_SIZE_CACHE_MAX_BYTES, "검체 전제: 이번엔 상한 아래여야 한다({under})");
+        let v2 = list_payload(&root, &state);
+        let me2 = v2["entries"].as_array().unwrap().iter().find(|e| e["name"] == name).unwrap();
+        assert_eq!(
+            me2["size"]["state"], "measured",
+            "상한 아래인데 캐시가 안 읽혔다 — 키가 아니라 상한이 원인이라는 전제가 깨졌다: {me2}"
+        );
+        assert_eq!(me2["size"]["value"]["bytes"], 4242);
+
+        // ⒠ 자기 치유(부수효과): 다시 상한을 넘긴 뒤 쓰기가 지나가면 파일이 작아진다.
+        let mut big2 = serde_json::Map::new();
+        for j in 0..2_000usize {
+            big2.insert(
+                format!("dept-{j}-1760000000|16777232|{j}|1760000000000"),
+                json!({"bytes":12345,"nodes":2572,"max_depth":7,
+                       "newest_mtime":1760000000.0,"measured_at":1760000000.0,"walk_secs":0.25}),
+            );
+        }
+        std::fs::write(size_cache_path(&root), Value::Object(big2).to_string()).unwrap();
+        let over2 = std::fs::metadata(size_cache_path(&root)).unwrap().len();
+        assert!(over2 > TRASH_SIZE_CACHE_MAX_BYTES, "검체 전제: 다시 상한을 넘겨야 한다({over2})");
+        let c = certify_entry(&entry, &real_dev).unwrap();
+        size_cache_flush(&root, &[(key.clone(), c.clone())]);
+        let after = std::fs::metadata(size_cache_path(&root)).unwrap().len();
+        assert!(
+            after <= TRASH_SIZE_CACHE_MAX_BYTES,
+            "쓰기가 지나갔는데 파일이 여전히 상한 위다({after}) — 자기 치유 서술이 거짓이 된다"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    // ★⒟-4 — 「단일 플라이트가 인증자 **전체**를 1로 묶는다」는 **과장이었다**. 그 주장을 산문으로
+    //   두지 않고 **세어서** 잠근다: 집행 경로(쓸기·봉인)의 `certify_entry(&…)` 호출자는 **정확히 셋**이고,
+    //   그 셋은 빗장 밖이다. 넷째가 생기면 이 검사가 빨개져 **문면을 함께 고치게** 만든다.
+    //   ⛔이 검사는 「빗장을 넓혀라」가 아니다 — 넓히면 쓸기가 오너의 미리보기를 기다린다.
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    #[test]
+    fn the_enforcement_path_certifiers_outside_the_latch_are_exactly_three() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd/trash.rs"),
+        )
+        .expect("trash.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        // `certify_entry(&` 는 집행 경로의 호출만 잡는다 — 미리보기는 `certify_entry_until(&` 라 안 걸린다.
+        let callers = prod.matches("certify_entry(&").count();
+        assert_eq!(
+            callers, 3,
+            "집행 경로의 인증 호출자가 {callers}건이다 — 셋이 아니면 `certify_entry` 머리 주석의 범위 문면과 \
+             `src-tauri` 12.G 핀 주석을 **함께** 고쳐야 한다(단일 플라이트가 묶는 것은 미리보기 인증자다)"
+        );
+        // 그 범위 문면이 실제로 그 자리에 **있다**(산문이 사라지면 이 숫자가 뜻을 잃는다).
+        assert!(
+            prod.contains("단일 플라이트는 **미리보기 인증자**를 1로 묶는다"),
+            "`certify_entry` 머리의 범위 문면이 사라졌다 — 숫자만 남은 핀은 뜻을 잃는다"
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    // ★⒟′-1 결박 — **크기 캐시 쓰기가 「마지막 마감 검사 → `Ready` 발행」 구간에 없다**.
+    //   ⛔**시간을 재지 않는다**(S20 §2: fsync 지연이 무계라 어떤 ms 단언도 거짓이 된다) — 재는 것은
+    //   **구조** 둘이다:
+    //     ⒜**행위**: `certify_names` 가 돌아온 **그 순간**(= 종단 판정을 손에 쥔 시점) 캐시 파일이
+    //       아직 **없다**. 그리고 유예분을 `size_cache_flush` 에 넘기면 **그때** 생긴다
+    //       ⇒ 입력 바이트에 비례하는 그 작업이 구간 **밖**이라는 직접 증거다.
+    //     ⒝**순서**: 생산 코드에서 그 호출이 `preview_lock_release` **뒤**에 있다(발행→해제→반영).
+    //       ★왜 소스를 읽는가: 그 순서는 배경 스레드 안의 일이라 밖에서 **결정론으로 관측할 수 없다**
+    //       (경합 없이 끼어들 자리가 없다) ⇒ 관측 가능한 형태로 남은 것이 **원문 순서**다.
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    #[test]
+    fn the_size_cache_is_not_written_until_the_terminal_decision_is_made() {
+        let root = rig("dp1-defer");
+        let name = "dept-9-1760000300";
+        let entry = root.join(name);
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("f0"), b"xy").unwrap();
+        let state = root.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        assert!(
+            !size_cache_path(&root).exists(),
+            "검체 전제: 시작 시 캐시 파일이 없어야 한다"
+        );
+
+        // 예산 없이(= 마감이 순회를 끊지 않는 조건에서) 인증한다 — 갓 만든 항목이라 `recent` 로
+        // 거부되지만, **인증 자체는 성공**했으므로 유예분이 쌓인다(그 둘은 다른 축이다).
+        let (out, pending) = certify_names(&root, &state, &[name.to_string()], None, None);
+        match &out {
+            NamesOutcome::Done { shown, refusals, .. } => {
+                assert!(shown.is_empty() && refusals.len() == 1, "전제: 갓 만든 항목은 recent 거부다");
+            }
+            NamesOutcome::InvalidName => panic!("전제가 깨졌다 — 이름이 거부됐다"),
+            NamesOutcome::LedgerUnwritable => panic!("전제가 깨졌다 — 원장을 쓸 수 없다"),
+            NamesOutcome::SessionExpired(r) => {
+                panic!("전제가 깨졌다 — 예산 없이 불렀는데 세션 만료다: {}", r.code)
+            }
+        }
+        assert_eq!(pending.len(), 1, "인증에 성공했으면 유예분이 한 건이어야 한다");
+
+        // ⒜ 종단 판정을 손에 쥔 이 시점에 캐시 파일은 **아직 없다**.
+        assert!(
+            !size_cache_path(&root).exists(),
+            "인증 루프 안에서 캐시를 썼다 — 그 작업(파일 크기에 비례)이 「마감 검사 → Ready」 구간에 \
+             들어간다(⒟′-1 이 그것을 빼라고 한 바로 그 작업이다)"
+        );
+        size_cache_flush(&root, &pending);
+        let m = size_cache_read(&root);
+        assert_eq!(m.len(), 1, "반영 뒤에는 한 건이어야 한다: {m:?}");
+        assert!(m.contains_key(&pending[0].0), "유예분의 키가 반영되지 않았다: {m:?}");
+
+        // ⒞ 유예분이 비면 **I/O 가 아예 없다**(거부만 난 미리보기가 파일을 건드리지 않는다).
+        let root2 = rig("dp1-empty");
+        size_cache_flush(&root2, &[]);
+        assert!(
+            !size_cache_path(&root2).exists(),
+            "빈 유예분으로도 파일을 만들었다 — 쓸 것이 없을 때 쓰지 않는다는 서술이 거짓이 된다"
+        );
+
+        // ⒝ 원문 순서 — 발행·빗장 해제 **뒤에** 반영한다.
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd/trash.rs"),
+        )
+        .expect("trash.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        let i_rel = prod
+            .find("preview_lock_release(&jid);")
+            .expect("잡 본문의 빗장 해제가 사라졌다");
+        let i_flush = prod
+            .find("size_cache_flush(&root_o, &pending);")
+            .expect("잡 본문의 캐시 반영이 사라졌다 — 유예분을 버렸다면 측정이 영구히 pending 이 된다");
+        assert!(
+            i_rel < i_flush,
+            "캐시 반영이 빗장 해제보다 **앞**에 있다 — 그러면 그 I/O 가 다시 구간 안이고 빗장 안이다"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    // ★⒟′-1 의 **반대쪽** 결박 — 거부의 **원장 기록은 유예하지 않았다**.
+    //   왜 이 검체가 있는가: 위 검체는 「구간에서 일을 빼라」고 말하고, 그 압력은 다음 사람에게
+    //   **원장 쓰기도 모아서 발행 뒤에 하라**는 「최적화」로 보인다. 그렇게 하면 ⒜발행과 반영 사이에
+    //   죽을 때 **거부가 원장에 남지 않고** ⒝「원장을 쓸 수 없다」를 거부 시점에 알 수 없다
+    //   ⇒ 둘 다 **정확성** 문제다(부서장 S20 §4 ⒟′-1 ⒥ 경고). 그 길을 이 검체가 막는다.
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    #[test]
+    fn a_refusal_is_in_the_ledger_before_the_terminal_decision() {
+        let root = rig("dp1-ledger");
+        let name = "dept-9-1760000400";
+        let entry = root.join(name);
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("f0"), b"z").unwrap();
+        let state = root.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+
+        let (out, _pending) = certify_names(&root, &state, &[name.to_string()], None, None);
+        assert!(matches!(out, NamesOutcome::Done { .. }), "전제: Done");
+        // ★`certify_names` 가 돌아온 **직후** — 아직 어떤 반영도 하지 않은 지금 — 원장에 있어야 한다.
+        let rows = ledger_lines(&state);
+        let hit = rows.iter().find(|r| r["entry"] == name && r["kind"] == "refusal");
+        let hit = hit.unwrap_or_else(|| {
+            panic!("거부가 원장에 없다 — 기록을 발행 뒤로 미루면 거부가 사라지는 길이 생긴다: {rows:?}")
+        });
+        assert_eq!(hit["reason_code"], R_RECENT, "사유 코드가 다르다: {hit}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    // ★S20A §2 ⒥ 결박 — 크기 캐시 경로가 **FIFO** 면 캐시 부재와 동일로 접는다(열지 않는다).
+    //   왜 FIFO 로 재는가: **디렉터리로는 변이를 가릴 수 없다**(종류 검사를 지워도 `read_to_string` 이
+    //   실패해 같은 빈 맵이 되므로 검체가 **살아남는다**). FIFO 는 종류 검사를 지우면 `read_to_string`
+    //   이 **쓰는 쪽을 기다리며 선다** ⇒ 그 차이가 이 검체의 하중이다.
+    //   ★여기 쓰는 5초는 **주장이 아니라 하네스 장치**다(⛔응답성 상한을 단언하지 않는다 · S20A §2):
+    //   멈춤은 「느린 실패」가 아니라 **무한 대기**라서, 다른 스레드에서 돌리고 받지 못하면
+    //   **빨갛게 만들어야** 한다 — 그러지 않으면 변이가 「출력 없는 멈춤」으로 끝나 아무도 모른다.
+    //   ⛔`cfg(unix)`: `mkfifo` 가 없는 플랫폼에서는 이 자극 자체를 만들 수 없다(윈도우는 미측정이다).
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    #[cfg(unix)]
+    #[test]
+    fn a_size_cache_path_that_is_a_fifo_is_treated_as_absent_and_never_opened() {
+        let root = rig("s20a-fifo");
+        let name = "dept-9-1760000500";
+        std::fs::create_dir_all(root.join(name)).unwrap();
+        let state = root.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let fifo = size_cache_path(&root);
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo 실행");
+        assert!(st.success(), "검체 전제: mkfifo 가 성공해야 한다");
+        let md = std::fs::metadata(&fifo).expect("FIFO stat");
+        assert!(!md.file_type().is_file(), "검체 전제: 정규 파일이 아니어야 한다");
+        assert_eq!(md.len(), 0, "검체 전제: FIFO 의 len 은 0 이라 **크기 상한으로는 안 걸린다**");
+
+        let (root_t, state_t) = (root.clone(), state.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let v = list_payload(&root_t, &state_t);
+            let _ = tx.send(v);
+        });
+        let v = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "목록이 5초 안에 돌아오지 않았다({e}) — 캐시 경로를 **열었고** 쓰는 쪽을 기다리고 있다. \
+                     `size_cache_read` 의 파일 종류 검사가 그 길을 막는 자리다(S20A §2 ⒥)."
+                )
+            });
+        let me = v["entries"]
+            .as_array()
+            .expect("entries 배열")
+            .iter()
+            .find(|e| e["name"] == name)
+            .expect("항목이 목록에 그대로 있어야 한다(거부가 아니다)");
+        assert_eq!(me["size"]["state"], "pending", "캐시 부재와 동일이어야 한다: {me}");
+        let _ = std::fs::remove_file(&fifo);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
