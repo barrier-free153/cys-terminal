@@ -128,6 +128,7 @@ import {
   isBootGateRefusal,
   type ResetGateInput,
   type ResetPreview,
+  TRASH_KEEP_NOTICE,
   type ResetResult,
 } from "./resetconfirm";
 import {
