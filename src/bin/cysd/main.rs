@@ -55,6 +55,7 @@ mod severity;
 mod skillrun;
 mod state;
 mod teamtoken;
+mod trash;
 mod undo;
 mod usage;
 // ★U16(0.14.41) 팀 만들기 제안 데몬 잠금 핀 — 테스트 전용 모듈(프로덕션 코드 0).
