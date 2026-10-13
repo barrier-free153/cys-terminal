@@ -52,6 +52,16 @@ pub const TRASH_CERTIFY_MAX_SECS: u64 = 60;
 /// 제거가 길어질 때 **보고**만 하는 임계(초). 중단이 아니다(부서장 D2: report, never abort).
 pub const TRASH_REMOVE_STALL_REPORT_SECS: u64 = 120;
 
+/// ★미리보기 **세션** 상한(초) — 다수 항목을 한 잡에서 인증할 때의 전체 예산(델타 §1.3).
+/// ★`TRASH_REMOVE_STALL_REPORT_SECS` 와 **숫자가 같지만 다른 것**이다: 그것은 제거가 길어질 때
+///   **보고만** 하는 임계(중단 아님)이고, 이것은 **중단시키는 예산**이다. 숫자가 같다는 이유로
+///   두 상수를 합치지 않는다(이름이 닮은 상수를 합치면 한쪽의 의미가 조용히 사라진다).
+/// ★출처 구분: 세션 120 s = `DESIGN-S8.md:108` @ `68db0e9e…` · 항목별 60 s/5,000,000 =
+///   이 파일의 두 상수(코드가 정본이고 그 문서의 20 s/2,000,000 과 **다르다**).
+pub const TRASH_PREVIEW_SESSION_MAX_SECS: u64 = 120;
+/// 미조회 만료(초) — 마지막 폴링 뒤 이만큼 아무도 묻지 않으면 잡을 버리고 빗장을 놓는다.
+pub const TRASH_PREVIEW_JOB_TTL_SECS: u64 = 120;
+
 /// 봉인 접두 — 삭제 명령을 받은 항목은 먼저 이 이름으로 **봉인**된다(옛 이름으로 계속 쓰는 생산자가
 /// 봉인된 객체에 자동으로 닿지 못하게). 봉인 뒤에는 되돌리지 않는다(실패하면 봉인 상태로 남고
 /// 자동 재개는 없다).
@@ -76,6 +86,15 @@ pub const R_REMOVE_ERROR: &str = "removal_error";
 pub const R_NOT_OWNER: &str = "owner_gui_required";
 pub const R_NOT_BASE: &str = "base_daemon_only";
 pub const R_PRODUCER_ACTIVE: &str = "producer_active";
+/// ★S8 재착륙 §1 — 비동기 미리보기 잡의 세 코드.
+/// ★표기: 델타는 산문에서 `refused:` 접두를 붙여 쓰지만, 이 모듈의 기존 코드는 접두 없는 **맨 코드**다
+///   (`R_PRODUCER_ACTIVE` = `producer_active` ↔ 델타 `refused:producer_active`). **기존 관례를 따른다.**
+/// 다수 항목 미리보기의 **세션** 상한 초과 — 항목별 상한(`R_TOO_SLOW`)과 **다른 것**이다.
+pub const R_SESSION_TOO_SLOW: &str = "cannot_certify_in_time";
+/// 단일 플라이트: 이미 도는 미리보기 잡이 있다(기다리지 않고 즉시 거부한다 — 대기가 곧 stall 이다).
+pub const R_PREVIEW_BUSY: &str = "preview_busy";
+/// 그 `job_id` 를 이 데몬이 모른다(만료됐거나 데몬이 다시 떴다).
+pub const R_JOB_UNKNOWN: &str = "job_unknown";
 
 /// 휴지통 뿌리 — 생산자 셋(cys-dept:94 · javis_org.py:564 · factory_reset.rs:299)과 같은 규약 경로.
 pub fn trash_root() -> PathBuf {
@@ -136,6 +155,22 @@ pub fn real_dev(_p: &Path, _md: &std::fs::Metadata) -> u64 {
 /// 거부 조건(하나라도 걸리면 항목 전체 거부): ①어떤 노드든 장치가 뿌리와 다르다 ②어떤 노드든 lstat·
 /// 디렉터리 열기가 실패한다 ③노드 수 상한 초과 ④시간 상한 초과. ★`clock`·`dev_of` 는 주입점이다.
 pub fn certify_entry(root: &Path, dev_of: DevOf) -> CertifyResult {
+    certify_entry_until(root, dev_of, None)
+}
+
+/// `certify_entry` 와 같되 **세션 마감**을 함께 받는다(★S8 재착륙 §1).
+///
+/// ★왜 별 함수인가: 기존 `certify_entry` 의 호출자가 6자리이고 그 중 검체가 있다 — 서명을 바꾸면
+/// 무관한 자리가 함께 붉어진다. **가산(additive)** 으로 두고 기존 함수는 이 함수에 위임한다.
+/// ★마감은 **항목별 상한과 별개**다: 항목별은 `TRASH_CERTIFY_MAX_SECS`(이 항목만 거부),
+/// 세션 마감은 넘으면 `R_SESSION_TOO_SLOW` 로 거부하고 **잡 전체를 종결**시킨다.
+/// 마감 검사는 순회 루프의 **매 디렉터리마다** 걸리므로 진행 중인 순회가 **중단된다**
+/// (델타 §1.3 「세션 상한 도달 시 진행 중인 순회는 중단되고」).
+pub fn certify_entry_until(
+    root: &Path,
+    dev_of: DevOf,
+    session_deadline: Option<Instant>,
+) -> CertifyResult {
     let t0 = Instant::now();
     let root_md = std::fs::symlink_metadata(root).map_err(|e| Refusal {
         code: R_UNREADABLE,
@@ -160,6 +195,18 @@ pub fn certify_entry(root: &Path, dev_of: DevOf) -> CertifyResult {
     // 순회 순서는 결정론으로 두되(진단 가능), 요약은 순서에 의존하지 않는다.
     let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
     while let Some((dir, depth)) = stack.pop() {
+        // ★세션 마감 먼저 — 항목별 상한보다 상위다(넘으면 잡 전체가 끝난다).
+        if let Some(dl) = session_deadline {
+            if Instant::now() >= dl {
+                return Err(Refusal {
+                    code: R_SESSION_TOO_SLOW,
+                    boundary: Some(dir.display().to_string()),
+                    detail: format!(
+                        "미리보기 세션 상한 {TRASH_PREVIEW_SESSION_MAX_SECS}s 초과 — 순회를 중단했다(이 항목은 삭제 대상이 아니다)"
+                    ),
+                });
+            }
+        }
         if t0.elapsed().as_secs() > TRASH_CERTIFY_MAX_SECS {
             return Err(Refusal {
                 code: R_TOO_SLOW,
@@ -403,11 +450,110 @@ fn deleter_release() {
     DELETER_BUSY.store(false, std::sync::atomic::Ordering::Release);
 }
 
+// ─── 미리보기 잡(비동기) — ★S8 재착륙 §1 · Option A ────────────────────────────────────────────
+// 델타 §1.1: `trash.delete` → `order_id` 즉시 반환 → `trash.order` 폴링과 **같은 꼴**로 조립한다.
+// 그 선례가 이 파일에 실재하므로(`orders()` · `OrderState`) 새 패턴을 발명하지 않는다.
+// ★최상위 불변식(선언 파일 ⒥): **어떤 RPC 도 순회에 블로킹되지 않는다.** `preview_start` ·
+// `preview_poll` 은 둘 다 맵 잠금만 잡고 즉시 돌아온다 — 순회는 배경 스레드의 것이다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewPhase {
+    Running,
+    Ready,
+    Failed,
+    /// 미조회 만료 — **묘비로 남긴다**(지우지 않는다). 지워 버리면 다음 폴링이 `job_unknown` 을 받아
+    /// 「데몬이 다시 떴다」와 「내가 늦었다」를 **구별할 수 없다**(상태 전이표가 그 둘을 다른 행으로 둔다).
+    Expired,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreviewJob {
+    pub job_id: String,
+    pub phase: PreviewPhase,
+    pub started: Instant,
+    pub last_polled: Instant,
+    /// 지금까지 인증을 마친 노드 수(항목 경계마다 갱신 — 한 항목 **안**의 진행은 보이지 않는다).
+    pub nodes: usize,
+    pub result: Option<Value>,
+    pub refusal: Option<Value>,
+}
+
+fn preview_jobs() -> &'static Mutex<HashMap<String, PreviewJob>> {
+    static P: OnceLock<Mutex<HashMap<String, PreviewJob>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 단일 플라이트 빗장 — 도는 잡의 `job_id` 를 쥔다(델타 §1.3 상태 전이표 셋째 칸: `Some(job_id)`/`None`).
+/// ★**기다리지 않는다**: 이미 쥐어져 있으면 즉시 `preview_busy` 로 거부한다(대기가 곧 stall 이다).
+/// ★이 뮤텍스는 **순회를 건너 쥐지 않는다** — 쥐었다 놓는 구간이 둘 다 상수시간이다.
+static PREVIEW_LOCK: Mutex<Option<String>> = Mutex::new(None);
+
+fn preview_lock_try_acquire(job_id: &str) -> bool {
+    let mut g = PREVIEW_LOCK.lock().unwrap();
+    if g.is_some() {
+        return false;
+    }
+    *g = Some(job_id.to_string());
+    true
+}
+
+/// 그 잡이 쥔 경우에만 놓는다 — 남의 빗장을 놓지 않는다.
+fn preview_lock_release(job_id: &str) {
+    let mut g = PREVIEW_LOCK.lock().unwrap();
+    if g.as_deref() == Some(job_id) {
+        *g = None;
+    }
+}
+
+/// 미조회 만료 소거(게으른 쓸기 — 타이머 스레드를 만들지 않는다).
+/// `running` 인 잡은 **만료시키지 않는다**(배경 스레드가 아직 그것을 쓰고 있다 · 상태 전이표의
+/// 「모달 닫기」 행이 「60s 상한까지 완주 후 자동 폐기」라고 적는다).
+fn preview_sweep_expired() {
+    let ttl = std::time::Duration::from_secs(TRASH_PREVIEW_JOB_TTL_SECS);
+    let mut m = preview_jobs().lock().unwrap();
+    let mut newly_expired: Vec<String> = Vec::new();
+    m.retain(|_, j| {
+        let idle = j.last_polled.elapsed();
+        match j.phase {
+            // 묘비를 한 TTL 더 들고 있다가 버린다(그 뒤의 폴링은 job_unknown 이 맞다).
+            PreviewPhase::Expired => idle < ttl.saturating_mul(2),
+            PreviewPhase::Running => true,
+            _ => {
+                if idle >= ttl {
+                    newly_expired.push(j.job_id.clone());
+                }
+                true
+            }
+        }
+    });
+    for id in &newly_expired {
+        if let Some(j) = m.get_mut(id) {
+            j.phase = PreviewPhase::Expired;
+            j.result = None;
+            j.refusal = None;
+        }
+    }
+    drop(m);
+    for id in &newly_expired {
+        preview_lock_release(id);
+    }
+}
+
+fn preview_status_str(p: PreviewPhase) -> &'static str {
+    match p {
+        PreviewPhase::Running => "running",
+        PreviewPhase::Ready => "ready",
+        PreviewPhase::Failed => "failed",
+        PreviewPhase::Expired => "expired",
+    }
+}
+
 /// 시험 전용 — 모듈 전역 상태를 비운다(검체 간 격리).
 #[cfg(test)]
 pub fn reset_state_for_test() {
     confirms().lock().unwrap().clear();
     orders().lock().unwrap().clear();
+    preview_jobs().lock().unwrap().clear();
+    *PREVIEW_LOCK.lock().unwrap() = None;
 }
 
 /// ★시험 전용 단계 훅(R2 §3.5 의 `after_seal`) — 봉인과 대조 **사이**에 끼어드는 쓰기를 만든다.
@@ -711,11 +857,28 @@ pub fn handle(
         // 읽기 전용 · 어떤 로컬 호출자든 — 감사자가 거부당하지 않게(에이전트는 이미 `ls` 할 수 있고
         // 비밀은 돌려주지 않는다). ★걷지 않는다: 깊이 1 과 캐시만 읽는다.
         "list" => Reply::Single(ok_response(id, list_payload(&root, &state))),
+        // ⚠퇴역 중 — 동기 미리보기(§1 이 아래 두 동사로 대체한다 · MJR-6 의 자리).
         "preview" => {
             if !owner_ok {
                 return Reply::Single(err_response(id, R_NOT_OWNER, OWNER_REQUIRED_MSG));
             }
             preview(id, &root, &state, params)
+        }
+        // ★S8 재착륙 §1 — 비동기 미리보기. 두 동사 모두 **삭제 동사와 같은 오너 GUI 전용 계급**이다
+        //   (§3.1: `trash.preview_start`·`trash.preview_poll`·`trash.delete` 는 오너 GUI 직접 발화만).
+        //   계급을 여기서 **완화하지 않는다** — `owner_ok` 는 `handlers.rs` 의 `trash_owner_grade_ok`
+        //   (operator_token 전용 + pane 무귀속)가 판정한 값이고 이 모듈은 그것을 받기만 한다.
+        "preview_start" => {
+            if !owner_ok {
+                return Reply::Single(err_response(id, R_NOT_OWNER, OWNER_REQUIRED_MSG));
+            }
+            preview_start(id, &root, &state, params)
+        }
+        "preview_poll" => {
+            if !owner_ok {
+                return Reply::Single(err_response(id, R_NOT_OWNER, OWNER_REQUIRED_MSG));
+            }
+            preview_poll(id, params)
         }
         "delete" => {
             if !owner_ok {
@@ -738,7 +901,9 @@ pub fn handle(
         other => Reply::Single(err_response(
             id,
             "unknown_method",
-            &format!("trash.{other} 는 없는 동사다 — list|preview|delete|order"),
+            &format!(
+                "trash.{other} 는 없는 동사다 — list|preview|preview_start|preview_poll|delete|order"
+            ),
         )),
     }
 }
@@ -892,28 +1057,53 @@ fn ledger_writable(state: &Path) -> bool {
 
 /// 미리보기 — 오너가 고른 이름들을 인증하고, 확인(confirm) 레코드를 발급한다.
 /// ★거부는 여기서 끝난다: 인증할 수 없는 항목은 **확인에 담기지 않으므로** 명령의 대상이 될 수 없다.
-fn preview(id: &Value, root: &Path, state: &Path, params: &Value) -> Reply {
-    let names = match str_list(params, "names") {
-        Some(v) if !v.is_empty() => v,
-        _ => {
-            return Reply::Single(err_response(
-                id,
-                "invalid_params",
-                "names 가 없다 — 미리보기는 이름을 하나씩 받는다(전체선택은 없다)",
-            ))
-        }
-    };
+/// 이름별 인증의 결과 — 동기·비동기 **공용 본문**의 반환값.
+enum NamesOutcome {
+    Done {
+        shown: Vec<Value>,
+        refusals: Vec<Value>,
+        certs: HashMap<String, Certificate>,
+    },
+    InvalidName,
+    LedgerUnwritable,
+    /// 세션 예산 소진 — **잡 전체를 종결**시킨다(항목별 거부와 다르다).
+    SessionExpired(Refusal),
+}
+
+/// 이름들을 인증한다 — **동기 경로와 비동기 잡이 같은 본문을 쓴다**(문면이 두 벌이 되지 않게).
+///
+/// ★`session_deadline` 이 `None` 이면 세션 예산이 **없다**. 부서장 판정 4⒜대로 **동기 경로에 루프
+/// 예산을 끼워 넣지 않는다** — 그 경로는 §1 이 퇴역시키는 대상이고, 죽을 코드에 중단을 다는 것은
+/// 「막힘」 쪽을 새로 만드는 일이다. 그래서 예산은 **인자로만** 들어오고 호출자가 정한다.
+/// ★`on_progress` 는 **항목 경계**에서만 불린다 — 한 항목 안의 진행은 `certify_entry` 가 한 번의
+/// 호출로 순회하므로 보이지 않는다(정직한 한계 · 그래서 진행 수치는 항목 단위다).
+fn certify_names(
+    root: &Path,
+    state: &Path,
+    names: &[String],
+    session_deadline: Option<Instant>,
+    on_progress: Option<&dyn Fn(usize)>,
+) -> NamesOutcome {
     let now = now_epoch();
     let mut certs: HashMap<String, Certificate> = HashMap::new();
     let mut shown = Vec::new();
     let mut refusals = Vec::new();
-    for name in &names {
+    let mut nodes_done = 0usize;
+    for name in names {
         if !safe_name(name) {
-            return Reply::Single(err_response(
-                id,
-                "invalid_params",
-                "이름에 경로 구분자·상대 성분이 있다 — 휴지통 뿌리의 직속 자식 이름만 받는다",
-            ));
+            return NamesOutcome::InvalidName;
+        }
+        // ★항목을 **시작하기 전에** 세션 마감을 본다(시작해 놓고 중간에 끊는 것보다 싸다).
+        if let Some(dl) = session_deadline {
+            if Instant::now() >= dl {
+                return NamesOutcome::SessionExpired(Refusal {
+                    code: R_SESSION_TOO_SLOW,
+                    boundary: Some(root.join(name).display().to_string()),
+                    detail: format!(
+                        "미리보기 세션 상한 {TRASH_PREVIEW_SESSION_MAX_SECS}s 초과 — 남은 항목을 시작하지 않았다"
+                    ),
+                });
+            }
         }
         let p = root.join(name);
         // D-r2-5 M3: 생산자가 돌고 있으면(또는 생존 판정 불가면) 이 항목은 거부한다.
@@ -925,17 +1115,21 @@ fn preview(id: &Value, root: &Path, state: &Path, params: &Value) -> Reply {
                 detail: format!("생산자 표식 상태: {} — 거부", producer_chip(&pst)),
             };
             if record_refusal(state, "(preview)", name, &r).is_err() {
-                return Reply::Single(err_response(id, R_LEDGER_UNWRITABLE, LEDGER_FAIL_MSG));
+                return NamesOutcome::LedgerUnwritable;
             }
             refusals.push(refusal_json(name, &r));
             continue;
         }
-        match certify_entry(&p, &real_dev) {
+        match certify_entry_until(&p, &real_dev, session_deadline) {
             Ok(c) => {
                 let recent = is_recent(c.newest_mtime, now, TRASH_RECENT_WINDOW_SECS);
                 if let Ok(md) = std::fs::symlink_metadata(&p) {
                     let (dev, ino) = dev_ino(&md);
                     size_cache_write(root, &size_cache_key(name, dev, ino, mtime_bits(&md)), &c);
+                }
+                nodes_done = nodes_done.saturating_add(c.nodes);
+                if let Some(f) = on_progress {
+                    f(nodes_done);
                 }
                 if recent {
                     let r = Refusal {
@@ -946,7 +1140,7 @@ fn preview(id: &Value, root: &Path, state: &Path, params: &Value) -> Reply {
                         ),
                     };
                     if record_refusal(state, "(preview)", name, &r).is_err() {
-                        return Reply::Single(err_response(id, R_LEDGER_UNWRITABLE, LEDGER_FAIL_MSG));
+                        return NamesOutcome::LedgerUnwritable;
                     }
                     refusals.push(refusal_json(name, &r));
                     continue;
@@ -958,20 +1152,36 @@ fn preview(id: &Value, root: &Path, state: &Path, params: &Value) -> Reply {
                 certs.insert(name.clone(), c);
             }
             Err(r) => {
+                // ★세션 마감이 원인이면 **이 항목의 거부로 끝내지 않는다** — 잡 전체가 종결된다.
+                if r.code == R_SESSION_TOO_SLOW {
+                    let _ = record_refusal(state, "(preview)", name, &r);
+                    return NamesOutcome::SessionExpired(r);
+                }
                 // ★C-R1 + C-R2: 인증 실패 = 그 항목 **전체** 거부, 그리고 그 거부는 원장에 남는다.
                 if record_refusal(state, "(preview)", name, &r).is_err() {
-                    return Reply::Single(err_response(id, R_LEDGER_UNWRITABLE, LEDGER_FAIL_MSG));
+                    return NamesOutcome::LedgerUnwritable;
                 }
                 refusals.push(refusal_json(name, &r));
             }
         }
     }
+    NamesOutcome::Done {
+        shown,
+        refusals,
+        certs,
+    }
+}
+
+/// 인증 결과를 미리보기 페이로드로 만든다(성공분이 있으면 `confirm` 을 발급해 등록한다).
+/// 동기 경로와 비동기 잡이 **같은 모양의 결과**를 돌려주도록 이 자리를 공용으로 둔다.
+fn preview_payload(
+    shown: Vec<Value>,
+    refusals: Vec<Value>,
+    certs: HashMap<String, Certificate>,
+) -> Value {
     if certs.is_empty() {
-        return Reply::Single(ok_response(
-            id,
-            json!({"confirm_id": Value::Null, "entries": shown, "refused": refusals,
-                   "digest": Value::Null, "confirm_ttl_secs": TRASH_CONFIRM_TTL_SECS}),
-        ));
+        return json!({"confirm_id": Value::Null, "entries": shown, "refused": refusals,
+                      "digest": Value::Null, "confirm_ttl_secs": TRASH_CONFIRM_TTL_SECS});
     }
     let digest = order_digest(&certs);
     let cid = new_id("cf");
@@ -989,12 +1199,175 @@ fn preview(id: &Value, root: &Path, state: &Path, params: &Value) -> Reply {
             certs,
         },
     );
-    Reply::Single(ok_response(
-        id,
-        json!({"confirm_id": cid, "entries": shown, "refused": refusals, "digest": digest,
-               "confirm_ttl_secs": TRASH_CONFIRM_TTL_SECS,
-               "delete_supported": delete_supported()}),
-    ))
+    json!({"confirm_id": cid, "entries": shown, "refused": refusals, "digest": digest,
+           "confirm_ttl_secs": TRASH_CONFIRM_TTL_SECS,
+           "delete_supported": delete_supported()})
+}
+
+fn names_param(id: &Value, params: &Value) -> Result<Vec<String>, Reply> {
+    match str_list(params, "names") {
+        Some(v) if !v.is_empty() => Ok(v),
+        _ => Err(Reply::Single(err_response(
+            id,
+            "invalid_params",
+            "names 가 없다 — 미리보기는 이름을 하나씩 받는다(전체선택은 없다)",
+        ))),
+    }
+}
+
+const INVALID_NAME_MSG: &str =
+    "이름에 경로 구분자·상대 성분이 있다 — 휴지통 뿌리의 직속 자식 이름만 받는다";
+
+/// ⚠**퇴역 중(deprecated)** — 동기 미리보기. §1(Option A)이 이것을 `preview_start`/`preview_poll` 로
+/// 대체한다. ★이 함수가 **MJR-6 의 자리**다: 순회를 디스패치 경로에서 돌려 그 동안의 GUI 입력을
+/// 뒤에 세운다. 남겨 둔 이유는 **한 판에서 와이어를 끊지 않기 위해서**이고(구판 앱이 이 동사를 부른다),
+/// 세션 예산은 **일부러 걸지 않는다**(부서장 판정 4⒜ — 죽을 코드에 중단을 달지 않는다).
+fn preview(id: &Value, root: &Path, state: &Path, params: &Value) -> Reply {
+    let names = match names_param(id, params) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    match certify_names(root, state, &names, None, None) {
+        NamesOutcome::Done {
+            shown,
+            refusals,
+            certs,
+        } => Reply::Single(ok_response(id, preview_payload(shown, refusals, certs))),
+        NamesOutcome::InvalidName => {
+            Reply::Single(err_response(id, "invalid_params", INVALID_NAME_MSG))
+        }
+        NamesOutcome::LedgerUnwritable => {
+            Reply::Single(err_response(id, R_LEDGER_UNWRITABLE, LEDGER_FAIL_MSG))
+        }
+        // 동기 경로에는 마감을 주지 않으므로 여기 올 수 없다 — 그래도 조용히 삼키지 않는다.
+        NamesOutcome::SessionExpired(r) => {
+            Reply::Single(err_response(id, r.code, &r.detail))
+        }
+    }
+}
+
+/// `trash.preview_start` — 배경 잡을 띄우고 **즉시** `job_id` 를 돌려준다(순회를 기다리지 않는다).
+///
+/// ★최상위 불변식: 이 함수는 파일을 **한 번도 걷지 않는다**. 하는 일은 이름 안전성 검사와 맵 등록뿐이다.
+/// ★선언 고지(설계와 다른 자리 · 조용히 고르지 않는다): 델타 §1.3 은 「이름 안전성 **및 생산자 표식**
+/// 사전 검증 통과 시」 잡을 만들라고 적는다. 생산자 표식 검증은 **배경 순회 안에서** 한다 —
+/// 여기서 한 번 더 하면 같은 거부가 **원장에 두 번** 적히고(그 검사는 `record_refusal` 을 부른다),
+/// 두 번 적힌 거부는 원장을 읽는 사람에게 **두 번 거부당한 것**으로 보인다. 이름 안전성만 선검사한다
+/// (그것은 원장에 쓰지 않는다).
+fn preview_start(id: &Value, root: &Path, state: &Path, params: &Value) -> Reply {
+    let names = match names_param(id, params) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if names.iter().any(|n| !safe_name(n)) {
+        return Reply::Single(err_response(id, "invalid_params", INVALID_NAME_MSG));
+    }
+    preview_sweep_expired();
+    let job_id = new_id("pv");
+    if !preview_lock_try_acquire(&job_id) {
+        return Reply::Single(err_response(
+            id,
+            R_PREVIEW_BUSY,
+            "이미 도는 미리보기가 있다 — 기다리지 않고 거부한다(그것이 끝나거나 만료된 뒤 다시 누르십시오)",
+        ));
+    }
+    let now_i = Instant::now();
+    preview_jobs().lock().unwrap().insert(
+        job_id.clone(),
+        PreviewJob {
+            job_id: job_id.clone(),
+            phase: PreviewPhase::Running,
+            started: now_i,
+            last_polled: now_i,
+            nodes: 0,
+            result: None,
+            refusal: None,
+        },
+    );
+    let root_o = root.to_path_buf();
+    let state_o = state.to_path_buf();
+    let jid = job_id.clone();
+    // ★순회는 **여기서부터 디스패치 경로 밖**이다(D4 stall pair).
+    std::thread::Builder::new()
+        .name("trash-preview".into())
+        .spawn(move || {
+            let deadline =
+                Instant::now() + std::time::Duration::from_secs(TRASH_PREVIEW_SESSION_MAX_SECS);
+            let prog_id = jid.clone();
+            let prog = move |n: usize| {
+                if let Some(j) = preview_jobs().lock().unwrap().get_mut(&prog_id) {
+                    j.nodes = n;
+                }
+            };
+            let out = certify_names(
+                &root_o,
+                &state_o,
+                &names,
+                Some(deadline),
+                Some(&prog as &dyn Fn(usize)),
+            );
+            let (phase, result, refusal) = match out {
+                NamesOutcome::Done {
+                    shown,
+                    refusals,
+                    certs,
+                } => (
+                    PreviewPhase::Ready,
+                    Some(preview_payload(shown, refusals, certs)),
+                    None,
+                ),
+                NamesOutcome::InvalidName => (
+                    PreviewPhase::Failed,
+                    None,
+                    Some(json!({"code": "invalid_params", "detail": INVALID_NAME_MSG})),
+                ),
+                NamesOutcome::LedgerUnwritable => (
+                    PreviewPhase::Failed,
+                    None,
+                    Some(json!({"code": R_LEDGER_UNWRITABLE, "detail": LEDGER_FAIL_MSG})),
+                ),
+                NamesOutcome::SessionExpired(r) => (
+                    PreviewPhase::Failed,
+                    None,
+                    Some(refusal_json("(session)", &r)),
+                ),
+            };
+            if let Some(j) = preview_jobs().lock().unwrap().get_mut(&jid) {
+                j.phase = phase;
+                j.result = result;
+                j.refusal = refusal;
+            }
+            // ★완료·실패 **즉시** 빗장을 놓는다(상태 전이표 3·4행).
+            preview_lock_release(&jid);
+        })
+        .ok();
+    Reply::Single(ok_response(id, json!({"job_id": job_id})))
+}
+
+/// `trash.preview_poll` — 맵만 읽고 **즉시** 돌아온다(순회를 기다리지 않는다).
+fn preview_poll(id: &Value, params: &Value) -> Reply {
+    preview_sweep_expired();
+    let jid = params.get("job_id").and_then(Value::as_str).unwrap_or("");
+    let mut m = preview_jobs().lock().unwrap();
+    let Some(j) = m.get_mut(jid) else {
+        return Reply::Single(err_response(
+            id,
+            R_JOB_UNKNOWN,
+            "그 job_id 를 이 데몬이 모른다 — 만료됐거나 데몬이 다시 떴다(새 미리보기를 시작하십시오)",
+        ));
+    };
+    j.last_polled = Instant::now();
+    let mut out = json!({
+        "status": preview_status_str(j.phase),
+        "progress": {"nodes": j.nodes, "elapsed_secs": j.started.elapsed().as_secs()},
+    });
+    if let Some(r) = &j.result {
+        out["result"] = r.clone();
+    }
+    if let Some(r) = &j.refusal {
+        out["refusal"] = r.clone();
+    }
+    Reply::Single(ok_response(id, out))
 }
 
 pub const LEDGER_FAIL_MSG: &str = "거부를 원장에 기록할 수 없어 진행하지 않았다 — \
