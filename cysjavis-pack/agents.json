@@ -55,7 +55,7 @@
     ]
   },
   "codex": {
-    "cmd": "codex --dangerously-bypass-approvals-and-sandbox",
+    "cmd": "codex --no-daemon --dangerously-bypass-approvals-and-sandbox",
     "inject_delay_secs": 12,
     "ready_marker": "? for shortcuts",
     "prompt_marker": ["›", "»"],
