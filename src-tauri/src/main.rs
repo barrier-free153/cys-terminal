@@ -16391,9 +16391,10 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
     /// 1로 묶는다」가 **GUI 경로에 대해서도 거짓**이었다. 퇴역 전에 호출자를 셌다: UI 0(핀 두 줄만
     /// 부재를 단언한다) · Tauri 0 · `cys` CLI 0. ⚠오너 등급 우회는 아니었다(두 경로 모두 오너 게이트
     /// 뒤다) — 그래서 major 가 아니라 minor 였다.
-    /// ★남은 정직한 한계: **데몬의 `trash.preview` 동사 자체는 남아 있다**(raw RPC 로만 닿는다).
-    /// 그러므로 단일 플라이트가 1로 묶는 것은 **GUI 경로 전체**이고 raw RPC 를 포함한 시스템 전체가
-    /// 아니다 — 그 동사의 처분은 이 티켓의 범위가 아니다(보고 대상이다).
+    /// ★**그 한계는 뒤이어 닫혔다**: 내가 「데몬 동사 `trash.preview` 는 남아 있다(raw RPC 전용)」고
+    /// 보고했고, 부서장이 **퇴역을 판정**해 그 동사와 함수가 **같은 판에서** 제거됐다(별 커밋 ·
+    /// `src/bin/cysd/trash.rs` 의 `the_synchronous_preview_verb_is_retired_and_cannot_come_back` 가
+    /// 재출현을 잠근다). ⇒ 단일 플라이트가 1로 묶는 것이 이제 **인증자 전체**다.
     #[test]
     fn s8_trash_commands_are_registered_and_the_token_attach_list_is_the_locked_set() {
         // 경계는 기존 배선 핀(c2_feed_reply_and_list_all_wiring)과 같은 식으로 잡는다.
@@ -16457,10 +16458,24 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
                 "삭제가 Class 2 를 코드로 표시하지 않는다"
             );
             // ★화면 쪽 정의처와 **같은 문자열**인가(두 자리가 어긋나면 수신증이 조용히 거부로 떨어진다).
+            // ★문면이 아니라 **값**에 걸린다: 상수 이름이 있는 줄을 찾아 그 줄이 값을 품는지만 본다
+            //   (따옴표 종류·공백·줄바꿈을 포맷터가 바꿔도 적색이 되지 않는다).
             let ui = include_str!("../../ui/src/trashconfirm.ts");
+            let decl = ui
+                .lines()
+                .find(|l| l.contains("TRASH_DELETE_UNCERTAIN_CODE") && l.contains('='));
+            let decl = decl.unwrap_or_else(|| {
+                panic!(
+                    "ui 쪽 TRASH_DELETE_UNCERTAIN_CODE 선언 줄을 찾지 못했다 — \
+                     ★이름이 바뀐 것일 수 있다(문면 변경)이고 계약 위반과는 다르다. \
+                     두 자리의 **값**이 같은지 손으로 확인한 뒤 이 핀의 찾는 이름을 고쳐라."
+                )
+            });
             assert!(
-                ui.contains("export const TRASH_DELETE_UNCERTAIN_CODE = \"transport_uncertain\";"),
-                "ui 쪽 TRASH_DELETE_UNCERTAIN_CODE 가 데몬측 표식과 다르다"
+                decl.contains(TRASH_DELETE_UNCERTAIN_CODE),
+                "ui 쪽 표식 값이 데몬측과 다르다({decl}) — ★선언 줄의 **문면**이 바뀐 것일 수 있으니 \
+                 계약 위반(값이 실제로 다름)과 구별하라: 값이 같다면 이 핀을 고치는 것이 맞고, \
+                 다르다면 전송 불확실이 조용히 거부로 떨어진다는 뜻이다"
             );
             assert_eq!(TRASH_DELETE_UNCERTAIN_CODE, "transport_uncertain");
         }

@@ -858,7 +858,8 @@ pub fn execute_one(
 
 // ─── 크기 캐시 — ★`trash.list` 는 **걷지 않는다**(DESIGN-S8 4.1) ─────────────────────────────
 /// `size-cache.json` — 이름 + 장치 + inode + mtime 으로 키를 만든다. 키가 바뀌면 캐시는 무효다.
-/// 걷기는 `trash.preview` 가 할 때만 일어나고(오너가 그 항목을 고른 순간) 그 결과가 여기 쌓인다.
+/// 걷기는 `trash.preview_start` 의 배경 잡이 할 때만 일어나고(오너가 그 항목을 고른 순간) 그 결과가
+/// 여기 쌓인다.
 /// 그래서 3.5 GB 합계 계산이 목록 때문에 일어나지 않는다 — 창이 멈추지 않는 이유는 이 한 줄이다.
 pub fn size_cache_path(root: &Path) -> PathBuf {
     root.join("size-cache.json")
@@ -988,13 +989,11 @@ pub fn handle(
         // 읽기 전용 · 어떤 로컬 호출자든 — 감사자가 거부당하지 않게(에이전트는 이미 `ls` 할 수 있고
         // 비밀은 돌려주지 않는다). ★걷지 않는다: 깊이 1 과 캐시만 읽는다.
         "list" => Reply::Single(ok_response(id, list_payload(&root, &state))),
-        // ⚠퇴역 중 — 동기 미리보기(§1 이 아래 두 동사로 대체한다 · MJR-6 의 자리).
-        "preview" => {
-            if !owner_ok {
-                return Reply::Single(err_response(id, R_NOT_OWNER, OWNER_REQUIRED_MSG));
-            }
-            preview(id, &root, &state, params)
-        }
+        // ★퇴역 완료 — 동기 미리보기 동사 `trash.preview` 는 **없다**(§1 마지막 조각 · 부서장 판정).
+        //   그것은 `certify_names(root, state, &names, None, None)` 을 불러 **세션 예산도 빗장도 양보도
+        //   없이** 걷던 **두 번째 인증자**였고, 살아 있는 동안 「`Ready` 는 예산 안에서 인증됨」과
+        //   「단일 플라이트」가 **문면으로만** 참이었다. 아래 비동기 두 동사가 그 자리를 대신한다.
+        //   (재출현 금지는 `the_synchronous_preview_verb_is_retired_and_cannot_come_back` 가 잠근다.)
         // ★S8 재착륙 §1 — 비동기 미리보기. 두 동사 모두 **삭제 동사와 같은 오너 GUI 전용 계급**이다
         //   (§3.1: `trash.preview_start`·`trash.preview_poll`·`trash.delete` 는 오너 GUI 직접 발화만).
         //   계급을 여기서 **완화하지 않는다** — `owner_ok` 는 `handlers.rs` 의 `trash_owner_grade_ok`
@@ -1033,7 +1032,9 @@ pub fn handle(
             id,
             "unknown_method",
             &format!(
-                "trash.{other} 는 없는 동사다 — list|preview|preview_start|preview_poll|delete|order"
+                // ★`preview`(동기)는 목록에서 **빠졌다** — 그 동사가 퇴역했으므로 안내가 없는 것을
+                //   가리키면 구판 호출자가 그것을 다시 쓰려 한다.
+                "trash.{other} 는 없는 동사다 — list|preview_start|preview_poll|delete|order"
             ),
         )),
     }
@@ -1348,34 +1349,6 @@ fn names_param(id: &Value, params: &Value) -> Result<Vec<String>, Reply> {
 
 const INVALID_NAME_MSG: &str =
     "이름에 경로 구분자·상대 성분이 있다 — 휴지통 뿌리의 직속 자식 이름만 받는다";
-
-/// ⚠**퇴역 중(deprecated)** — 동기 미리보기. §1(Option A)이 이것을 `preview_start`/`preview_poll` 로
-/// 대체한다. ★이 함수가 **MJR-6 의 자리**다: 순회를 디스패치 경로에서 돌려 그 동안의 GUI 입력을
-/// 뒤에 세운다. 남겨 둔 이유는 **한 판에서 와이어를 끊지 않기 위해서**이고(구판 앱이 이 동사를 부른다),
-/// 세션 예산은 **일부러 걸지 않는다**(부서장 판정 4⒜ — 죽을 코드에 중단을 달지 않는다).
-fn preview(id: &Value, root: &Path, state: &Path, params: &Value) -> Reply {
-    let names = match names_param(id, params) {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    match certify_names(root, state, &names, None, None) {
-        NamesOutcome::Done {
-            shown,
-            refusals,
-            certs,
-        } => Reply::Single(ok_response(id, preview_payload(shown, refusals, certs))),
-        NamesOutcome::InvalidName => {
-            Reply::Single(err_response(id, "invalid_params", INVALID_NAME_MSG))
-        }
-        NamesOutcome::LedgerUnwritable => {
-            Reply::Single(err_response(id, R_LEDGER_UNWRITABLE, LEDGER_FAIL_MSG))
-        }
-        // 동기 경로에는 마감을 주지 않으므로 여기 올 수 없다 — 그래도 조용히 삼키지 않는다.
-        NamesOutcome::SessionExpired(r) => {
-            Reply::Single(err_response(id, r.code, &r.detail))
-        }
-    }
-}
 
 /// 잡 결과 → (단계, 결과, 거부) 매핑.
 ///
@@ -2288,7 +2261,16 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cys.rs"),
         )
         .expect("cys.rs");
-        for needle in ["trash.delete", "trash.preview", "trash.order", "trash.list"] {
+        // ★`trash.preview` 가 이 배열에서 빠진 이유: 그 **동사 자체가 퇴역**해 이제 어떤 층에도 없다
+        //   (바늘을 남겨 두면 「CLI 에 없다」는 참이지만 **무엇에 대해 참인지**가 거짓이 된다).
+        //   비동기 두 동사는 아래 줄이 함께 잠근다.
+        for needle in [
+            "trash.delete",
+            "trash.preview_start",
+            "trash.preview_poll",
+            "trash.order",
+            "trash.list",
+        ] {
             assert!(!cys.contains(needle), "cys.rs 에 {needle} 가 있다 — 에이전트 경로가 열린다");
         }
     }
@@ -2734,13 +2716,16 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        // ★음성 대조 — **동기 경로**(퇴역 중)의 왕복은 순회 전체다.
+        // ★음성 대조 — 디스패치 **스레드에서 직접** 걷는 비용. 종전에는 퇴역한 동사
+        //   `trash.preview` 를 불러 쟀는데 그 동사가 없어졌으므로, 그것이 부르던 **같은 본문**
+        //   (`certify_names(.., None, None)` = 세션 예산 없는 동기 순회)을 **여기서 직접** 부른다.
+        //   ⇒ 여전히 뮤턴트가 아니다: 비교 대상이 가설이 아니라 **살아 있는 생산 코드**다.
         let t3 = Instant::now();
-        let _ = single(preview(&json!(4), &root, &state, &json!({"names": [name]})));
+        let _ = certify_names(&root, &state, &[name.to_string()], None, None);
         let sync_rtt = t3.elapsed();
         assert!(
             sync_rtt.as_millis() >= 50,
-            "동기 경로의 왕복이 {sync_rtt:?} — 이 기계에서는 음성 대조가 성립하지 않는다(리그를 키워라)"
+            "동기 순회의 왕복이 {sync_rtt:?} — 이 기계에서는 음성 대조가 성립하지 않는다(리그를 키워라)"
         );
         println!(
             "LATENCY-MEASURE walk_ms={:.1} start_rtt_us={} worst_poll_us={} list_base_us={} worst_list_us={} sync_rtt_ms={:.1}",
@@ -2753,5 +2738,37 @@ mod tests {
         );
         reset_state_for_test();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ★§1 마지막 조각 — **동기 미리보기 동사는 돌아올 수 없다**(부서장 판정 2026-10-13 23:0x).
+    ///
+    /// 왜 이 핀이 있는가: `trash.preview` 는 `certify_names(root, state, &names, None, None)` 을 불러
+    /// **세션 예산도 빗장도 양보도 없이** 걷는 **두 번째 인증자**였다. 그것이 살아 있는 동안
+    /// 「`Ready` 는 예산 안에서 인증됨」과 「단일 플라이트가 인증자를 1로 묶는다」는 R4 선언의 두
+    /// 불변식이 **문면으로만** 참이었다(codex MIN-2 의 잔여). 퇴역 전 호출자는 **0**이었다:
+    /// UI 0 · Tauri 0 · `cys` CLI 0 · 트리 전체에서 그 문자열은 **검사 배열 1건**뿐이었다.
+    #[test]
+    fn the_synchronous_preview_verb_is_retired_and_cannot_come_back() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd/trash.rs"),
+        )
+        .expect("trash.rs");
+        let prod = &src[..src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("테스트 모듈 경계 소실")];
+        // ⒜ 디스패치 팔이 없다.
+        assert!(
+            !prod.lines().any(|l| l.trim() == "\"preview\" => {"),
+            "동기 미리보기 디스패치 팔이 다시 생겼다 — 빗장에 참여하지 않는 두 번째 인증자다"
+        );
+        // ⒝ 그 함수가 없다.
+        assert!(
+            !prod.contains("fn preview(id: &Value"),
+            "동기 미리보기 함수가 되살아났다 — 예산 없는 순회 경로가 다시 열린다"
+        );
+        // ⒞ 그리고 **대신 서는 둘**은 그대로 있다(퇴역이 기능을 지운 것이 아님을 같은 자리에서 말한다).
+        for keep in ["\"preview_start\" => {", "\"preview_poll\" => {"] {
+            assert!(prod.contains(keep), "{keep} 가 없다 — 퇴역이 미리보기 자체를 지웠다");
+        }
     }
 }
