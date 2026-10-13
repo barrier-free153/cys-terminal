@@ -2635,4 +2635,123 @@ mod tests {
         reset_yields_for_test();
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    // ★결박 검사 ⒜ — **느린 미리보기 동안 입력이 뒤에 줄 서지 않는다**(티켓 §1 5⒜ · MJR-6).
+    //   무엇을 재는가: ⑴기동 RPC 자체의 왕복 ⑵★**순회 배리어 안에서** 다른 동사들의 왕복
+    //   ⑶배리어가 실제로 열려 있었다는 증거(`running` 을 봤다).
+    //   ★음성 대조는 **뮤턴트가 아니다**: 퇴역 중인 **동기 경로를 그대로 불러** 같은 리그에서
+    //   같은 자를 들이댄다 — 동기 경로의 왕복은 순회 전체이므로 같은 단언이 FAIL 한다.
+    //   (뮤턴트로 코드를 되돌리는 것보다 강하다: 비교 대상이 가설이 아니라 **살아 있는 코드**다.)
+    //   ⚠못 보는 것: 이것은 **데몬 디스패치 경로**의 왕복이다. Tauri 의 공유 연결 셀
+    //   (`conn_cell`)은 요청 1건의 수명만큼만 잠기므로(`rpc_full`), 데몬이 상수시간에 답하면
+    //   GUI 입력이 그 뒤에 줄 서지 않는다 — 그 연결 셀 자체는 이 검체가 보지 못한다.
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    #[test]
+    fn test_gui_input_latency_during_slow_preview() {
+        let _g = PREVIEW_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let root = rig("latency");
+        let name = "dept-9-1760000004";
+        let entry = root.join(name);
+        std::fs::create_dir_all(&entry).unwrap();
+        let state = root.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        for i in 0..30_000 {
+            std::fs::write(entry.join(format!("f{i:05}")), b"x").unwrap();
+        }
+        // ★배리어가 성립하는지 **먼저 재서 확인한다** — 순회가 빠르면 이 검체는 아무 것도 재지 못한다.
+        let t = Instant::now();
+        let c = certify_entry(&entry, &real_dev).expect("기준 순회");
+        let whole = t.elapsed();
+        assert_eq!(c.nodes, 30_000);
+        assert!(
+            whole.as_millis() >= 100,
+            "리그가 너무 빨라 배리어가 성립하지 않는다({whole:?}) — 파일 수를 늘려야 한다"
+        );
+        reset_state_for_test();
+        // ★기준선 — 순회가 **돌지 않는** 동안의 `list` 왕복. 이 동사는 깊이 1 자식을 열거하므로
+        //   그 자체로 비싸다(30,000 자식). 배리어 안의 값을 **이 기준선과 비교**해야 「순회가
+        //   지연을 **더했는가**」를 재는 것이 된다 — 절대값만 재면 비싼 동사를 탓하게 된다.
+        let tb = Instant::now();
+        let _ = single(Reply::Single(ok_response(&json!(0), list_payload(&root, &state))));
+        let list_base = tb.elapsed();
+
+        // ⑴ 기동 — 순회를 기다리지 않는다.
+        let t0 = Instant::now();
+        let v = single(preview_start(&json!(1), &root, &state, &json!({"names": [name]})));
+        let start_rtt = t0.elapsed();
+        assert_eq!(v["ok"], true, "기동이 거부됐다: {v}");
+        assert!(
+            start_rtt.as_millis() < 50,
+            "preview_start 왕복이 {start_rtt:?} — 순회를 기다린다(기동은 상수시간이어야 한다)"
+        );
+        let jid = v["result"]["job_id"].as_str().expect("job_id").to_string();
+
+        // ⑵⑶ 배리어 **안에서** 왕복을 잰다 — 폴링과, 미리보기와 무관한 동사(list) 둘 다.
+        let mut saw_running = false;
+        let mut worst_poll = std::time::Duration::ZERO;
+        let mut worst_list = std::time::Duration::ZERO;
+        for _ in 0..8 {
+            // ⒤ 화면이 대기 중에 실제로 부르는 동사 — 500ms 마다 이것 하나다.
+            let t1 = Instant::now();
+            let p = single(preview_poll(&json!(2), &json!({"job_id": jid})));
+            worst_poll = worst_poll.max(t1.elapsed());
+            if p["result"]["status"] == "running" {
+                saw_running = true;
+            }
+            // ⒥ 미리보기와 **무관한** 동사 — 순회가 다른 요청을 막지 않는가.
+            let t2 = Instant::now();
+            let _ = single(Reply::Single(ok_response(&json!(3), list_payload(&root, &state))));
+            worst_list = worst_list.max(t2.elapsed());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            saw_running,
+            "순회가 이미 끝나 있었다 — 배리어 **안에서** 재지 못했다(이 검체는 그러면 무의미하다)"
+        );
+        assert!(
+            worst_poll.as_millis() < 50,
+            "배리어 안의 폴링 왕복 최악이 {worst_poll:?} — 입력이 순회 뒤에 줄 서고 있다"
+        );
+        // ★비싼 동사는 **기준선 대비**로 본다: 순회가 지연을 더했다면 몇 배로 벌어진다.
+        assert!(
+            worst_list < list_base * 3 + std::time::Duration::from_millis(10),
+            "배리어 안의 list 왕복 {worst_list:?} 가 기준선 {list_base:?} 대비 3배를 넘었다 — 순회가 다른 요청을 막고 있다"
+        );
+
+        // 배경 일꾼이 끝나기를 기다린다(다음 단락의 동기 호출과 디스크를 다투지 않게).
+        let w = Instant::now();
+        while w.elapsed().as_secs() < 10 {
+            let running = preview_jobs()
+                .lock()
+                .unwrap()
+                .get(&jid)
+                .map(|j| j.phase == PreviewPhase::Running)
+                .unwrap_or(false);
+            if !running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // ★음성 대조 — **동기 경로**(퇴역 중)의 왕복은 순회 전체다.
+        let t3 = Instant::now();
+        let _ = single(preview(&json!(4), &root, &state, &json!({"names": [name]})));
+        let sync_rtt = t3.elapsed();
+        assert!(
+            sync_rtt.as_millis() >= 50,
+            "동기 경로의 왕복이 {sync_rtt:?} — 이 기계에서는 음성 대조가 성립하지 않는다(리그를 키워라)"
+        );
+        println!(
+            "LATENCY-MEASURE walk_ms={:.1} start_rtt_us={} worst_poll_us={} list_base_us={} worst_list_us={} sync_rtt_ms={:.1}",
+            whole.as_secs_f64() * 1e3,
+            start_rtt.as_micros(),
+            worst_poll.as_micros(),
+            list_base.as_micros(),
+            worst_list.as_micros(),
+            sync_rtt.as_secs_f64() * 1e3
+        );
+        reset_state_for_test();
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
