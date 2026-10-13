@@ -135,6 +135,8 @@ import {
   trashAgeLines,
   trashChips,
   trashMismatchHint,
+  TRASH_PREVIEW_EXPIRED_CODE,
+  TRASH_PREVIEW_WAIT_LINE,
   trashModalLines,
   trashOrderProgressText,
   trashOrderSeverity,
@@ -1140,12 +1142,27 @@ let trashOrderTimer: number | undefined;
 let trashDeleting = false; // 두 번 누름 방지(데몬도 `busy` 로 거절한다 — 여기선 창의 중복 명령만 막는다)
 const TRASH_POLL_MS = 1000;
 const TRASH_POLL_MAX = 1200; // 20분 — 그 뒤엔 '성공'도 '실패'도 주장하지 않고 원장을 가리킨다
+// ★S8 재착륙 §1 — 미리보기 폴링(델타 상태 전이표 「500ms 타이머 폴링 시작, 스피너 표시」).
+const TRASH_PREVIEW_POLL_MS = 500;
+let trashPreviewTimer: number | undefined;
+let trashPreviewGen = 0; // 모달을 닫으면 올라가 낡은 폴링 연쇄가 스스로 끝난다
 
 function trashStopPoll() {
   trashOrderGen++;
   if (trashOrderTimer !== undefined) {
     clearTimeout(trashOrderTimer);
     trashOrderTimer = undefined;
+  }
+}
+
+// ★모달 닫기 / 취소 행 — **폴링 타이머를 취소하고 결과를 무시한다**(델타 상태 전이표).
+//   데몬에 취소를 보내지 않는다: 그런 동사가 없고, 배경 순회는 자기 상한까지 완주한 뒤
+//   빗장을 놓고 스스로 폐기된다(그 설계가 「취소가 또 하나의 막힘이 되지 않게」 한 자리다).
+function trashStopPreviewPoll() {
+  trashPreviewGen++;
+  if (trashPreviewTimer !== undefined) {
+    clearTimeout(trashPreviewTimer);
+    trashPreviewTimer = undefined;
   }
 }
 
@@ -1307,54 +1324,185 @@ async function refreshTrash() {
 // 확인 모달 — factoryResetConfirmModal 규약 계승(textContent 주입·자동교정 차단·불일치 사유 표시).
 // ★기본 포커스는 **취소**다(설계 6.2 3항): Enter 한 번이 삭제로 이어지는 길을 두지 않는다.
 // ★`confirm()` 은 이 WebView 에서 억제되므로 DOM 모달만 쓴다(설계 6.3).
-function trashConfirmModal(
-  entries: TrashEntry[],
-  refused: { name: string; reason_code: string; detail: string }[],
-  names: string[],
-): Promise<boolean> {
+type TrashPreview = {
+  confirm_id?: string | null;
+  digest?: string | null;
+  entries?: { name: string; nodes: number; bytes: number }[];
+  refused?: { name: string; reason_code: string; boundary: string | null; detail: string }[];
+};
+
+// ★미리보기 + 확인 모달 — **모달은 기다린다. 그러나 막는 방식으로 기다리지 않는다**(2단계 심사 판정문).
+//   열리는 즉시 스피너와 진행 수치를 보이고, `trash_preview_start` 로 잡을 띄운 뒤 500ms 타이머로
+//   `trash_preview_poll` 을 돈다. 타이핑은 **ready 에서만** 열린다(대기 중엔 입력이 비활성이다).
+//   상태 전이표 그대로다(`DESIGN-S8-DELTA-RELAND-1-R2.md:67`~`:74`):
+//     running → 진행 갱신 · ready → 요약 + 타이핑 활성 · failed → 사유 + 재시도 안내 ·
+//     expired → 만료 고지 + 「다시 미리보기」 · job_unknown(데몬 재시작) → 새 미리보기 요구 ·
+//     모달 닫기 → 폴링 타이머 취소 · 중복 요청 → `preview_busy`(기다리지 않고 거부).
+//   ★사유 문구는 **전부 순수 모듈의 표**에서 온다 — 화면이 사유를 다시 지어내지 않는다.
+function trashConfirmModal(names: string[]): Promise<{ ok: boolean; prev: TrashPreview | null }> {
   return new Promise((resolve) => {
     const ov = document.createElement("div");
     ov.className = "modal-overlay";
     ov.innerHTML =
       `<div class="modal"><h3></h3>` +
+      `<div class="ct-wait"><span class="dept-spinner"></span><span class="ct-wait-text"></span></div>` +
       `<p class="modal-label" style="white-space:pre-wrap;max-height:46vh;overflow-y:auto"></p>` +
-      `<input class="modal-input" type="text" />` +
+      `<input class="modal-input" type="text" disabled />` +
       `<div class="modal-hint" aria-live="polite"></div>` +
       `<div class="modal-btns"><button class="modal-no">취소</button>` +
       `<button class="modal-yes" disabled>삭제</button></div></div>`;
     (ov.querySelector("h3") as HTMLElement).textContent = "휴지통에서 삭제 — 되돌릴 수 없습니다";
-    const lines = [...trashModalLines(entries, Date.now() / 1000)];
-    if (refused.length) {
-      lines.push("");
-      lines.push("이번에 지우지 않는 것(데몬이 거부했습니다):");
-      for (const r of refused) lines.push(`• ${r.name} — ${trashRefusalText(r.reason_code).text}`);
-    }
-    lines.push("");
-    lines.push(`계속하려면 아래에 그대로 입력하세요: ${trashRequiredPhrase(names)}`);
-    (ov.querySelector(".modal-label") as HTMLElement).textContent = lines.join("\n");
+    const waitRow = ov.querySelector(".ct-wait") as HTMLElement;
+    const waitText = ov.querySelector(".ct-wait-text") as HTMLElement;
+    const label = ov.querySelector(".modal-label") as HTMLElement;
     const inp = ov.querySelector(".modal-input") as HTMLInputElement;
     const yes = ov.querySelector(".modal-yes") as HTMLButtonElement;
     const no = ov.querySelector(".modal-no") as HTMLButtonElement;
     const hint = ov.querySelector(".modal-hint") as HTMLElement;
     for (const [k, v] of PURGE_INPUT_GUARDS) inp.setAttribute(k, v);
-    inp.placeholder = trashRequiredPhrase(names);
-    inp.addEventListener("input", () => {
-      yes.disabled = !trashPhraseMatches(inp.value, names);
-      hint.textContent = trashMismatchHint(inp.value, names);
-    });
-    const done = (v: boolean) => {
+    label.textContent = TRASH_PREVIEW_WAIT_LINE;
+    waitText.textContent = "확인하는 중…";
+    const gen = ++trashPreviewGen;
+    const done = (ok: boolean, prev: TrashPreview | null) => {
+      trashStopPreviewPoll();
       ov.remove();
-      resolve(v);
+      resolve({ ok, prev });
     };
-    yes.addEventListener("click", () => {
-      if (!yes.disabled) done(true);
-    });
-    no.addEventListener("click", () => done(false));
+    // 대기 표시를 끝낸다(스피너는 **끝날 때만** 사라진다 — 끝나지 않았는데 사라지면 멈춘 것처럼 보인다).
+    const stopWaiting = () => {
+      waitRow.hidden = true;
+    };
+    // 거부·만료·모르는 잡 — 사유는 순수 모듈의 표에서, 행동 안내는 그 표의 `action` 에서 온다.
+    const refuse = (code: string, detail: string) => {
+      const r = trashRefusalText(code);
+      stopWaiting();
+      const again =
+        r.action === "preview_again"
+          ? "다시 미리보기를 하세요 — 아무 것도 지우지 않았습니다."
+          : "아무 것도 지우지 않았습니다.";
+      label.textContent = detail ? `${r.text}\n${again}\n\n(${detail})` : `${r.text}\n${again}`;
+      inp.disabled = true;
+      yes.disabled = true;
+      trashSetStatus(r.text);
+      stickyToast("trash-preview", "watchdog", "휴지통 — 확인하지 못했습니다", `${r.text}\n${detail}`);
+    };
+    // ready — 데몬이 **확인한 항목만** 보여주고, 그때 비로소 타이핑을 연다.
+    const ready = (prev: TrashPreview) => {
+      stopWaiting();
+      dismissToast("trash-preview");
+      const shown = prev.entries ?? [];
+      const refused = prev.refused ?? [];
+      if (!prev.confirm_id || !prev.digest || shown.length === 0) {
+        // 하나도 확인되지 않았다 — 사유만 적고 타이핑을 열지 않는다(모달에 '그래도 지우기'가 없다).
+        const why = refused.map((r) => `${r.name} — ${trashRefusalText(r.reason_code).text}`).join("\n");
+        label.textContent = why || "확인된 항목이 없습니다 — 지우지 않았습니다.";
+        inp.disabled = true;
+        yes.disabled = true;
+        trashSetStatus(why || "확인된 항목이 없습니다 — 지우지 않았습니다.");
+        if (why) stickyToast("trash-preview", "watchdog", "휴지통 — 지우지 않았습니다", why);
+        return;
+      }
+      const confirmNames = shown.map((s) => s.name);
+      const modalEntries: TrashEntry[] = confirmNames.map((n) => {
+        const base = trashEntries.find((x) => x.name === n);
+        const m = shown.find((s) => s.name === n)!;
+        return {
+          ...(base ?? {
+            name: n,
+            interrupted_deleting: false,
+            deletable: true,
+            root_mtime_age_secs: 0,
+            stamp_epoch: null,
+            old_by_stamp: false,
+            children_depth1: [],
+            children_total: 0,
+            sole_copy_advisory: false,
+            producer_chip: "",
+            size: { state: "pending" },
+          }),
+          size: { state: "measured", value: { bytes: m.bytes, nodes: m.nodes } },
+        };
+      });
+      const lines = [...trashModalLines(modalEntries, Date.now() / 1000)];
+      if (refused.length) {
+        lines.push("");
+        lines.push("이번에 지우지 않는 것(데몬이 거부했습니다):");
+        for (const r of refused) lines.push(`• ${r.name} — ${trashRefusalText(r.reason_code).text}`);
+      }
+      lines.push("");
+      lines.push(`계속하려면 아래에 그대로 입력하세요: ${trashRequiredPhrase(confirmNames)}`);
+      label.textContent = lines.join("\n");
+      inp.disabled = false;
+      inp.placeholder = trashRequiredPhrase(confirmNames);
+      inp.addEventListener("input", () => {
+        yes.disabled = !trashPhraseMatches(inp.value, confirmNames);
+        hint.textContent = trashMismatchHint(inp.value, confirmNames);
+      });
+      yes.addEventListener("click", () => {
+        if (!yes.disabled) done(true, prev);
+      });
+      trashSetStatus("확인 문구를 입력하면 삭제합니다.");
+    };
+    // 폴링 연쇄 — 새 setInterval 0(setTimeout 연쇄 · 탭 틱 수 핀 불변).
+    const poll = async (jobId: string) => {
+      if (gen !== trashPreviewGen) return;
+      let st: {
+        status?: string;
+        progress?: { nodes: number; elapsed_secs: number };
+        result?: TrashPreview;
+        refusal?: { reason_code?: string; detail?: string };
+      };
+      try {
+        st = (await invoke("trash_preview_poll", { jobId })) as typeof st;
+      } catch (e) {
+        // 데몬이 다시 떴거나 잡이 사라졌다 — 새 미리보기를 요구한다(옛 결과를 짜맞추지 않는다).
+        if (gen !== trashPreviewGen) return;
+        refuse(String(e).split(":")[0], String(e));
+        return;
+      }
+      if (gen !== trashPreviewGen) return;
+      if (st.status === "running") {
+        const pg = st.progress;
+        waitText.textContent = pg
+          ? `확인하는 중… 노드 ${pg.nodes.toLocaleString()} · ${pg.elapsed_secs}초`
+          : "확인하는 중…";
+        trashPreviewTimer = setTimeout(() => void poll(jobId), TRASH_PREVIEW_POLL_MS) as unknown as number;
+        return;
+      }
+      if (st.status === "ready" && st.result) {
+        ready(st.result);
+        return;
+      }
+      if (st.status === "expired") {
+        refuse(TRASH_PREVIEW_EXPIRED_CODE, "");
+        return;
+      }
+      refuse(st.refusal?.reason_code ?? "unknown", st.refusal?.detail ?? "");
+    };
+    const start = async () => {
+      let job: { job_id?: string };
+      try {
+        job = (await invoke("trash_preview_start", { names })) as { job_id?: string };
+      } catch (e) {
+        // 단일 플라이트 거부(`preview_busy`)도 이 길로 온다 — 기다리지 않고 사유를 적는다.
+        if (gen !== trashPreviewGen) return;
+        refuse(String(e).split(":")[0], String(e));
+        return;
+      }
+      if (gen !== trashPreviewGen) return;
+      if (!job?.job_id) {
+        refuse("unknown", "데몬이 job_id 를 주지 않았습니다");
+        return;
+      }
+      void poll(job.job_id);
+    };
+    no.addEventListener("click", () => done(false, null));
     ov.addEventListener("click", (ev) => {
-      if (ev.target === ov) done(false);
+      if (ev.target === ov) done(false, null);
     });
     document.body.appendChild(ov);
     setTimeout(() => no.focus(), 50);
+    void start();
   });
 }
 
@@ -1430,65 +1578,20 @@ async function trashDeleteFlow() {
   if (names.length === 0) return;
   trashDeleting = true;
   trashSyncDeleteButton(true);
+  // 무피드백이면 재클릭을 부른다 — 모달이 열리기 **전에** 상태줄이 먼저 말한다(12.U ③).
   trashSetStatus("고른 항목을 확인하는 중입니다(크기를 재고 있습니다)…");
-  let prev: {
-    confirm_id?: string | null;
-    digest?: string | null;
-    entries?: { name: string; nodes: number; bytes: number }[];
-    refused?: { name: string; reason_code: string; boundary: string | null; detail: string }[];
-  };
-  try {
-    prev = (await invoke("trash_preview", { names })) as typeof prev;
-  } catch (e) {
+  // ★미리보기는 **모달 안에서** 기다린다(비동기 잡 + 500ms 폴링). 이 `await` 가 기다리는 것은
+  //   사람의 판정이고, 그 동안 어떤 RPC 도 파일 순회에 묶여 있지 않다(델타 §1.4 큐 쌍 ⒤).
+  const { ok, prev } = await trashConfirmModal(names);
+  if (!ok || !prev?.confirm_id || !prev?.digest) {
     trashDeleting = false;
-    const code = String(e).split(":")[0];
-    const r = trashRefusalText(code);
-    trashSetStatus(r.text);
-    stickyToast("trash-preview", "watchdog", "휴지통 — 확인하지 못했습니다", `${r.text}\n${e}`);
-    await refreshTrash();
-    return;
-  }
-  dismissToast("trash-preview");
-  const refused = prev?.refused ?? [];
-  const shown = prev?.entries ?? [];
-  if (!prev?.confirm_id || !prev?.digest || shown.length === 0) {
-    // 하나도 확인되지 않았다 — 사유만 적고 멈춘다(모달을 띄우지 않는다).
-    trashDeleting = false;
-    const why = refused.map((r) => `${r.name} — ${trashRefusalText(r.reason_code).text}`).join("\n");
-    trashSetStatus(why || "확인된 항목이 없습니다 — 지우지 않았습니다.");
-    if (why) stickyToast("trash-preview", "watchdog", "휴지통 — 지우지 않았습니다", why);
-    await refreshTrash();
-    return;
-  }
-  // 모달은 **데몬이 확인한 항목만** 보여준다(크기는 그 걷기의 실측값으로 채운다).
-  const confirmNames = shown.map((s) => s.name);
-  const modalEntries: TrashEntry[] = confirmNames.map((n) => {
-    const base = trashEntries.find((x) => x.name === n);
-    const m = shown.find((s) => s.name === n)!;
-    return {
-      ...(base ?? {
-        name: n,
-        interrupted_deleting: false,
-        deletable: true,
-        root_mtime_age_secs: 0,
-        stamp_epoch: null,
-        old_by_stamp: false,
-        children_depth1: [],
-        children_total: 0,
-        sole_copy_advisory: false,
-        producer_chip: "",
-        size: { state: "pending" },
-      }),
-      size: { state: "measured", value: { bytes: m.bytes, nodes: m.nodes } },
-    };
-  });
-  const ok = await trashConfirmModal(modalEntries, refused, confirmNames);
-  if (!ok) {
-    trashDeleting = false;
-    trashSetStatus("취소했습니다 — 아무 것도 지우지 않았습니다.");
+    // 거부·만료·확인 0건의 사유는 **모달과 상태줄에 이미** 적혔다 — 취소만 여기서 말한다.
+    if (prev === null) trashSetStatus("취소했습니다 — 아무 것도 지우지 않았습니다.");
     trashSyncDeleteButton(true);
+    await refreshTrash();
     return;
   }
+  const confirmNames = (prev.entries ?? []).map((e) => e.name);
   trashSetStatus("삭제 명령을 보냈습니다…");
   let ordered: { order_id?: string };
   try {

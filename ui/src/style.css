@@ -983,6 +983,13 @@ body.cc-glance #cc-view-feed .feed-item button { font-size: 16px; padding: 10px 
 .dept-idle-btn:disabled { opacity: .5; cursor: default; }
 /* ★U2(0.14.41) 보류 중인 역할 칸(구멍) — [새 셸 열기]·[칸 비우기] 두 손잡이 사이 간격만 더한다(나머지는 dept-pending 재사용). */
 .role-slot .dept-idle-btn + .dept-idle-btn { margin-left: 8px; }
+/* ★S8 재착륙 §1 — 미리보기를 기다리는 모달의 한 줄(스피너 + 진행 수치).
+   스피너는 `dept-spinner` 를 그대로 쓰고 **크기만** 모달 눈금으로 줄인다(회전 키프레임·
+   prefers-reduced-motion 처리를 두 벌로 만들지 않는다 — 아래 미디어 쿼리가 둘 다 덮는다).
+   ★움직임을 줄인 환경에서는 회전이 멈추므로 **대기를 말하는 것은 글자**다(노드 수·경과 초). */
+.ct-wait { display: flex; align-items: center; gap: 8px; margin: 4px 0 8px; font-size: 12px; opacity: .85; }
+.ct-wait .dept-spinner { width: 14px; height: 14px; margin: 0; border-width: 2px; }
+.ct-wait[hidden] { display: none; }
 @media (prefers-reduced-motion: reduce) {
   .ws-tab-spinner, .dept-spinner { animation: none; border-top-color: var(--accent); }
 }

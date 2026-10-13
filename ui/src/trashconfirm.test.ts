@@ -21,6 +21,7 @@ import {
   type TrashEntry,
   type TrashEntryOutcome,
   type TrashOrder,
+  TRASH_PREVIEW_EXPIRED_CODE,
 } from "./trashconfirm";
 
 const E = (o: Partial<TrashEntry> = {}): TrashEntry => ({
@@ -100,6 +101,12 @@ test("거부 문구는 되돌릴 수 없는 쪽으로 가는 선택지를 주지
     "producer_active",
     "refusal_record_unwritable",
     "busy",
+    // ★S8 재착륙 §1 — 비동기 미리보기 잡의 코드 다섯(기본값으로 떨어지면 사유가 코드 문자열로 샌다).
+    "preview_busy",
+    "job_unknown",
+    TRASH_PREVIEW_EXPIRED_CODE,
+    "cannot_certify_in_time",
+    "preview_worker_unavailable",
   ]) {
     const r = trashRefusalText(code);
     expect(r.text.length).toBeGreaterThan(0);
@@ -109,6 +116,15 @@ test("거부 문구는 되돌릴 수 없는 쪽으로 가는 선택지를 주지
   }
   expect(trashRefusalText("uncertifiable-descendant-device").text).toContain("한 바이트도 지우지 않았습니다");
   expect(trashRefusalText("removal_error").text).toContain("남은 것이 있을 수 있습니다");
+  // ★다섯 코드가 **기본값이 아니다**: 기본값은 코드 문자열을 괄호에 넣어 보여주므로 그것으로 가려낸다.
+  for (const code of ["preview_busy", "job_unknown", TRASH_PREVIEW_EXPIRED_CODE, "cannot_certify_in_time",
+                      "preview_worker_unavailable"]) {
+    expect(trashRefusalText(code).text).not.toContain(code);
+    expect(trashRefusalText(code).action).toBe("preview_again");
+  }
+  // 세션 상한 초과는 **한 번에 더 적게 고르라**고 말한다(같은 선택을 다시 눌러도 같은 결과다).
+  expect(trashRefusalText("cannot_certify_in_time").text).toContain("더 적게");
+  expect(trashRefusalText("preview_busy").text).toContain("다른 미리보기");
 });
 
 test("데몬이 낡으면 빈 휴지통이 아니라 오류를 보여준다", () => {

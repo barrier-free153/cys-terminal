@@ -96,6 +96,12 @@ export function trashSelectable(e: TrashEntry): boolean {
 }
 
 /// 데몬 오류 코드 → 사람 문구와 **단 하나의 행동**. 되돌릴 수 없는 쪽으로 가는 선택지는 없다.
+/// 대기 중 모달이 보여주는 줄 — ★화면은 **멈춘 것이 아니라 기다리는 것**임을 말한다.
+export const TRASH_PREVIEW_WAIT_LINE =
+  "고른 항목을 확인하는 중입니다 — 크기를 재고 있습니다(창은 멈추지 않습니다).";
+/// 폴링이 받은 `status: "expired"` 를 사유 표에 넣기 위한 **화면 합성 코드**(데몬 문자열이 아니다).
+export const TRASH_PREVIEW_EXPIRED_CODE = "preview_expired";
+
 export function trashRefusalText(code: string): { text: string; action: "preview_again" | "none" } {
   switch (code) {
     case "confirm_expired":
@@ -132,6 +138,22 @@ export function trashRefusalText(code: string): { text: string; action: "preview
       return { text: "휴지통은 기계에 하나입니다 — 기본 데몬에서만 다룹니다.", action: "none" };
     case "owner_gui_required":
       return { text: "이 창에서만 내리는 명령입니다.", action: "none" };
+    // ★S8 재착륙 §1 — 비동기 미리보기 잡의 코드 넷. 앞의 셋은 데몬이 보내는 문자열이고
+    //   `preview_expired` 는 **화면이 합성한다**(폴링이 `status: "expired"` 를 받았을 때 —
+    //   그 상태에는 거부 몸체가 없다. 사유 문구를 이 표 밖에서 짓지 않으려고 코드로 만든다).
+    case "preview_busy":
+      return { text: "다른 미리보기가 돌고 있습니다 — 그것이 끝난 뒤 다시 누르세요.", action: "preview_again" };
+    case "job_unknown":
+      return { text: "미리보기를 이어서 읽을 수 없습니다(데몬이 다시 떴거나 시간이 지났습니다).", action: "preview_again" };
+    case TRASH_PREVIEW_EXPIRED_CODE:
+      return { text: "미리보기가 만료됐습니다 — 결과를 쓰지 않았습니다.", action: "preview_again" };
+    case "cannot_certify_in_time":
+      return {
+        text: "고른 항목 전체를 정해진 시간 안에 확인하지 못했습니다 — 한 번에 더 적게 고르세요.",
+        action: "preview_again",
+      };
+    case "preview_worker_unavailable":
+      return { text: "확인 작업을 시작하지 못했습니다 — 잠시 뒤 다시 누르세요.", action: "preview_again" };
     default:
       return { text: `처리하지 못했습니다 (${code}).`, action: "none" };
   }

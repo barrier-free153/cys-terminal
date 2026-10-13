@@ -59,33 +59,77 @@ describe("탭 전환과 주기 갱신의 배선(main.ts)", () => {
     expect(code.includes('document.getElementById("btn-cc-trash-delete")?.addEventListener("click", () => void trashDeleteFlow());')).toBe(true);
   });
   it("새 setInterval 0 — 결과 읽기는 setTimeout 연쇄다(탭 틱 수 핀 불변)", () => {
-    for (const f of ["refreshTrash", "trashDeleteFlow", "trashPollOrder", "trashStopPoll", "renderTrash"])
+    for (const f of ["refreshTrash", "trashDeleteFlow", "trashPollOrder", "trashStopPoll", "renderTrash",
+                     "trashConfirmModal", "trashStopPreviewPoll"])
       expect({ 함수: f, setInterval: fnBody(f).includes("setInterval(") }).toEqual({ 함수: f, setInterval: false });
     expect(fnBody("trashPollOrder").includes("setTimeout(")).toBe(true);
   });
 });
 
-describe("데몬이 부르는 네 명령만 쓰고, 이름은 그대로 돌려보낸다", () => {
-  it("invoke 는 trash_list·trash_preview·trash_delete·trash_order 넷뿐이다", () => {
+describe("데몬이 부르는 명령만 쓰고, 이름은 그대로 돌려보낸다 (★S8 재착륙 §1 — 동기 미리보기 퇴역)", () => {
+  it("invoke 집합은 trash_list·trash_order·trash_delete + **비동기** preview 둘이고, 동기 trash_preview 는 없다", () => {
     const block = code.slice(code.indexOf("function trashStopPoll("), code.indexOf("async function refreshBoard("));
     const calls = [...block.matchAll(/invoke\("([a-z_]+)"/g)].map((m) => m[1]);
-    expect([...new Set(calls)].sort()).toEqual(["trash_delete", "trash_list", "trash_order", "trash_preview"]);
+    expect([...new Set(calls)].sort()).toEqual([
+      "trash_delete",
+      "trash_list",
+      "trash_order",
+      "trash_preview_poll",
+      "trash_preview_start",
+    ]);
+    // ★퇴역의 증거는 **이 파일 전체**에서 동기 이름이 사라진 것이다(모듈 어디서도 부르지 않는다).
+    expect(/invoke\("trash_preview"/.test(code)).toBe(false);
   });
-  it("미리보기·명령은 **고른 이름만** 보내고, 명령은 미리보기가 준 confirm_id·digest 를 되보낸다", () => {
+  it("미리보기 기동은 **고른 이름만** 보내고, 명령은 미리보기가 준 confirm_id·digest 를 되보낸다", () => {
+    const m = fnBody("trashConfirmModal");
+    expect(m.includes('invoke("trash_preview_start", { names })')).toBe(true);
+    expect(m.includes('invoke("trash_preview_poll", { jobId })')).toBe(true);
     const f = fnBody("trashDeleteFlow");
-    expect(f.includes('invoke("trash_preview", { names })')).toBe(true);
     expect(f.includes("confirmId: prev.confirm_id")).toBe(true);
     expect(f.includes("digest: prev.digest")).toBe(true);
     expect(f.includes("names: confirmNames")).toBe(true);
+  });
+  it("★폴링은 500ms 타이머 연쇄다 — 새 setInterval 0 이고, 모달을 닫으면 타이머가 취소된다", () => {
+    const m = fnBody("trashConfirmModal");
+    expect(m.includes("setInterval(")).toBe(false);
+    expect(m.includes("setTimeout(() => void poll(jobId), TRASH_PREVIEW_POLL_MS)")).toBe(true);
+    expect(code.includes("const TRASH_PREVIEW_POLL_MS = 500;")).toBe(true);
+    // 닫기·취소의 유일한 출구(`done`)가 폴링을 끊는다 — 낡은 연쇄는 세대 번호로도 한 번 더 막힌다.
+    expect(m.includes("trashStopPreviewPoll();")).toBe(true);
+    expect(fnBody("trashStopPreviewPoll").includes("clearTimeout(trashPreviewTimer);")).toBe(true);
+    expect((m.match(/if \(gen !== trashPreviewGen\) return;/g) ?? []).length).toBeGreaterThanOrEqual(4);
+  });
+  it("★대기는 **보인다**: 스피너와 진행 수치(노드·경과초)가 모달 안에 있고, 타이핑은 ready 에서만 열린다", () => {
+    const m = fnBody("trashConfirmModal");
+    expect(m.includes('<span class="dept-spinner"></span>')).toBe(true);
+    expect(m.includes('<input class="modal-input" type="text" disabled />')).toBe(true);
+    expect(m.includes("노드 ${pg.nodes.toLocaleString()} · ${pg.elapsed_secs}초")).toBe(true);
+    // 입력을 **여는** 곳은 ready 하나다(대기·거부 쪽에서는 전부 다시 잠근다).
+    expect((m.match(/inp\.disabled = false;/g) ?? []).length).toBe(1);
+    const iReady = m.indexOf("const ready = (prev: TrashPreview) => {");
+    const iOpen = m.indexOf("inp.disabled = false;");
+    expect(iReady >= 0 && iOpen > iReady).toBe(true);
+    expect(m.includes("TRASH_PREVIEW_WAIT_LINE")).toBe(true);
+  });
+  it("★상태 전이표의 네 끝(ready·failed·expired·job_unknown)이 전부 다뤄진다", () => {
+    const m = fnBody("trashConfirmModal");
+    expect(m.includes('if (st.status === "running")')).toBe(true);
+    expect(m.includes('if (st.status === "ready" && st.result)')).toBe(true);
+    expect(m.includes('if (st.status === "expired")')).toBe(true);
+    expect(m.includes("refuse(TRASH_PREVIEW_EXPIRED_CODE")).toBe(true);
+    // job_unknown·preview_busy 는 Tauri 가 "code: message" 로 던지므로 코드만 떼어 표에 넣는다.
+    expect((m.match(/refuse\(String\(e\)\.split\(":"\)\[0\]/g) ?? []).length).toBe(2);
+    expect(m.includes('refuse(st.refusal?.reason_code ?? "unknown", st.refusal?.detail ?? "")')).toBe(true);
   });
 });
 
 describe("확인 관문 — 클릭만으로 넘어가는 길이 없다", () => {
   const modal = fnBody("trashConfirmModal");
   it("타이핑 확인은 순수 모듈의 판정으로만 열린다(자동교정 차단 · 불일치 사유 표시)", () => {
-    expect(modal.includes("trashPhraseMatches(inp.value, names)")).toBe(true);
+    // ★이름은 **데몬이 확인한 집합**(`confirmNames`)이다 — 고른 것 전부가 아니다(거부는 빠진다).
+    expect(modal.includes("trashPhraseMatches(inp.value, confirmNames)")).toBe(true);
     expect(modal.includes("yes.disabled = !trashPhraseMatches")).toBe(true);
-    expect(modal.includes("trashMismatchHint(inp.value, names)")).toBe(true);
+    expect(modal.includes("trashMismatchHint(inp.value, confirmNames)")).toBe(true);
     expect(modal.includes("for (const [k, v] of PURGE_INPUT_GUARDS) inp.setAttribute(k, v);")).toBe(true);
     expect(modal.includes('<button class="modal-yes" disabled>')).toBe(true);
   });
@@ -102,7 +146,10 @@ describe("확인 관문 — 클릭만으로 넘어가는 길이 없다", () => {
     const ivEnd = modal.indexOf("(ov.querySelector(\"h3\")", iv);
     expect(iv >= 0 && ivEnd > iv).toBe(true);
     expect(modal.slice(iv, ivEnd).includes("${")).toBe(false);
-    expect(modal.includes(').textContent = lines.join("\\n");')).toBe(true);
+    // ★뼈대를 한 번만 만들고(대기 상태), 내용은 **나중에** textContent 로 들어간다 — ready 에서
+    //   값이 섞인 innerHTML 을 다시 쓰지 않는다(이름은 파일 이름이다).
+    expect(modal.includes('label.textContent = lines.join("\\n");')).toBe(true);
+    expect((modal.match(/innerHTML/g) ?? []).length).toBe(1);
     for (const f of ["renderTrash", "renderTrashResult", "renderTrashUnavailable"])
       expect({ 함수: f, innerHTML: fnBody(f).includes("innerHTML") }).toEqual({ 함수: f, innerHTML: false });
     expect(fnBody("renderTrash").includes("name.textContent = e.name;")).toBe(true);
@@ -112,7 +159,7 @@ describe("확인 관문 — 클릭만으로 넘어가는 길이 없다", () => {
     const iModal = f.indexOf("await trashConfirmModal(");
     const iOrder = f.indexOf('invoke("trash_delete"');
     expect(iModal >= 0 && iOrder > iModal).toBe(true);
-    expect(f.includes("if (!ok) {")).toBe(true);
+    expect(f.includes("if (!ok || !prev?.confirm_id || !prev?.digest) {")).toBe(true);
     expect(f.includes("취소했습니다 — 아무 것도 지우지 않았습니다.")).toBe(true);
   });
   it("★선택은 항목마다 손으로 한다 — 선택 집합에 넣는 곳은 체크박스 처리기 **하나**다(전체선택이 코드에도 없다)", () => {
@@ -128,8 +175,14 @@ describe("걷는 동안 · 데몬이 없을 때 · 결과를 못 읽을 때 (12.
   it("미리보기 전에 '확인하는 중' 안내를 띄운다(무피드백이면 재클릭을 부른다)", () => {
     const f = fnBody("trashDeleteFlow");
     const iStatus = f.indexOf("고른 항목을 확인하는 중입니다");
-    const iPrev = f.indexOf('invoke("trash_preview"');
-    expect(iStatus >= 0 && iPrev > iStatus).toBe(true);
+    const iModal = f.indexOf("await trashConfirmModal(names)");
+    expect(iStatus >= 0 && iModal > iStatus).toBe(true);
+    // ★모달 쪽에서도 대기가 먼저다: 뼈대를 붙이고 대기 줄을 적은 **뒤에** 잡을 띄운다
+    //   (먼저 띄우면 ready 가 즉시 와도 화면이 한 프레임 비어 있다).
+    const m = fnBody("trashConfirmModal");
+    const iWait = m.indexOf("TRASH_PREVIEW_WAIT_LINE");
+    const iStart = m.indexOf('invoke("trash_preview_start"');
+    expect(iWait >= 0 && iStart > iWait).toBe(true);
   });
   it("★목록 실패는 **빈 휴지통으로 보이지 않는다** — 순수 모듈의 문구를 그대로 쓴다(R-7)", () => {
     const f = fnBody("refreshTrash");
@@ -149,8 +202,11 @@ describe("걷는 동안 · 데몬이 없을 때 · 결과를 못 읽을 때 (12.
     expect(iOk >= 0 && iBad > iOk).toBe(true);
   });
   it("거부 코드는 순수 모듈의 표로만 문구가 된다(화면이 사유를 다시 지어내지 않는다)", () => {
-    const f = fnBody("trashDeleteFlow");
-    expect((f.match(/trashRefusalText\(/g) ?? []).length).toBeGreaterThanOrEqual(3);
-    expect(f.includes("String(e).split(\":\")[0]")).toBe(true);
+    // ★자리가 옮겼다: 미리보기의 거부는 이제 **모달 안에서** 문구가 된다(동기 경로 퇴역).
+    const m = fnBody("trashConfirmModal");
+    expect((m.match(/trashRefusalText\(/g) ?? []).length).toBeGreaterThanOrEqual(3);
+    expect(m.includes("String(e).split(\":\")[0]")).toBe(true);
+    // 명령(삭제) 쪽의 거부도 같은 표를 쓴다.
+    expect(fnBody("trashDeleteFlow").includes("trashRefusalText(code)")).toBe(true);
   });
 });
