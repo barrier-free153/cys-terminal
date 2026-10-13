@@ -4990,6 +4990,44 @@ async fn trash_preview(names: Vec<String>) -> Result<Value, String> {
     }
 }
 
+/// ★S8 재착륙 §1 — 비동기 미리보기 **기동**. 오너 등급. 즉시 `{job_id}` 로 돌아온다.
+///
+/// ★이 명령은 **순회를 기다리지 않는다**: 데몬이 배경 스레드를 띄우고 바로 응답하므로 이 호출이
+/// 쥐는 공유 연결 셀(`conn_cell(&default_socket())`)의 점유는 **상수시간**이다. 그것이 MJR-6 을
+/// 닫는 기제다 — 종전 동기 `trash_preview` 는 순회가 끝날 때까지 그 셀을 쥐고 있어서 그 동안
+/// 오너의 키 입력·`surface.send_text`·제어센터 폴링이 **그 뒤에 줄을 섰다**.
+#[tauri::command]
+async fn trash_preview_start(names: Vec<String>) -> Result<Value, String> {
+    let sock = default_socket();
+    let mut params = json!({"names": names, "client": "tauri-app"});
+    if let Some(tok) = read_operator_token_for(&sock) {
+        params["operator_token"] = json!(tok);
+    }
+    let resp = rpc_full(&sock, "trash.preview_start", params).await?;
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(resp["result"].clone())
+    } else {
+        Err(trash_err(&resp))
+    }
+}
+
+/// ★S8 재착륙 §1 — 비동기 미리보기 **폴링**. 오너 등급. 즉시 상태로 돌아온다.
+/// 화면은 500 ms 타이머로 이것을 부른다(델타 §1.3 상태 전이표 넷째 칸).
+#[tauri::command]
+async fn trash_preview_poll(job_id: String) -> Result<Value, String> {
+    let sock = default_socket();
+    let mut params = json!({"job_id": job_id, "client": "tauri-app"});
+    if let Some(tok) = read_operator_token_for(&sock) {
+        params["operator_token"] = json!(tok);
+    }
+    let resp = rpc_full(&sock, "trash.preview_poll", params).await?;
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(resp["result"].clone())
+    } else {
+        Err(trash_err(&resp))
+    }
+}
+
 /// 명령 — 오너 등급. 미리보기가 준 `confirm_id` 와 `digest` 를 그대로 되보낸다(한 번만 쓰인다).
 /// 즉시 `order_id` 로 돌아오고, 결과는 `trash_order` 로 읽는다.
 #[tauri::command]
@@ -8161,6 +8199,8 @@ fn main() {
             trash_list,
             trash_order,
             trash_preview,
+            trash_preview_start,
+            trash_preview_poll,
             trash_delete,
             start_master,
             start_dept_master,
@@ -16300,14 +16340,22 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
         let cys_rs = include_str!("../../src/bin/cys.rs");
         assert!(!cys_rs.contains("operator_token"), "cys CLI 에 조작자 토큰이 생겼다");
     }
-    /// ★S8 12.G — 휴지통 네 명령의 등재와 **토큰을 붙이는 명령의 목록**을 잠근다.
+    /// ★S8 12.G — 휴지통 명령의 등재와 **토큰을 붙이는 명령의 목록**을 잠근다.
     ///
     /// 두 가지를 지킨다: ①읽기 둘(`trash_list`·`trash_order`)에는 토큰이 실리지 않는다(감사자가
-    /// 거부당하지 않는 면이다) ②토큰을 붙이는 명령은 **정확히 네 개**다 — `send_input`·`feed_reply`·
-    /// `trash_preview`·`trash_delete`. 다섯째가 생기면 이 시험이 빨개진다: 부착면이 넓어지는 것은
-    /// S8 이 의존하는 등급이 넓어지는 것과 같다(설계 §5 B2 · H3).
+    /// 거부당하지 않는 면이다) ②토큰을 붙이는 명령은 **잠근 그 목록과 정확히 같다**. 목록에 없는
+    /// 이름이 하나라도 생기면 이 시험이 빨개진다: 부착면이 넓어지는 것은 S8 이 의존하는 등급이
+    /// 넓어지는 것과 같다(설계 §5 B2 · H3).
+    ///
+    /// ★**개정(S8 재착륙 · 델타 §4 파급)**: 종전 이 시험의 이름과 문면은 「**정확히 네 개**」였다.
+    /// §1(Option A)이 `trash_preview_start`·`trash_preview_poll` 을 들여오고 **둘 다 델타 §1.3 의
+    /// 인증 봉투(= 삭제와 같은 오너 등급)를 요구**하므로 부착면은 **여섯**이 된다. 이 시험은 그
+    /// 넓어짐을 **막는 장치가 아니라 의식하게 만드는 장치**이고, 지금 그것이 의식적으로 일어났다.
+    /// ⇒ 숫자를 올리는 대신 **이름을 「잠근 목록」으로 바꿨다**: 수치가 이름에 박히면 다음 개정마다
+    /// 이름이 거짓이 되고, 이 시험이 실제로 재는 것은 **개수가 아니라 집합**이다.
+    /// ★`trash_preview`(동기)는 **퇴역 예정**이라 목록에서 곧 빠진다 — 그때 이 목록도 함께 줄어든다.
     #[test]
-    fn s8_trash_commands_are_registered_and_the_token_attach_list_is_exactly_four() {
+    fn s8_trash_commands_are_registered_and_the_token_attach_list_is_the_locked_set() {
         // 경계는 기존 배선 핀(c2_feed_reply_and_list_all_wiring)과 같은 식으로 잡는다.
         let src = include_str!("main.rs");
         let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
@@ -16317,7 +16365,14 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
         };
         let i = prod.find("tauri::generate_handler![").expect("invoke_handler 소실");
         let reg = &prod[i..i + prod[i..].find("\n        ])").expect("핸들러 목록 끝")];
-        for name in ["trash_list", "trash_order", "trash_preview", "trash_delete"] {
+        for name in [
+            "trash_list",
+            "trash_order",
+            "trash_preview",
+            "trash_preview_start",
+            "trash_preview_poll",
+            "trash_delete",
+        ] {
             assert!(reg.lines().any(|l| l.trim() == format!("{name},")), "{name} 미등재");
         }
         for ro in ["async fn trash_list(", "async fn trash_order("] {
@@ -16325,7 +16380,12 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
             assert!(!body.contains("read_operator_token_for") && !body.contains("\"operator_token\""),
                     "{ro} 읽기 전용인데 토큰이 실린다");
         }
-        for rw in ["async fn trash_preview(", "async fn trash_delete("] {
+        for rw in [
+            "async fn trash_preview(",
+            "async fn trash_preview_start(",
+            "async fn trash_preview_poll(",
+            "async fn trash_delete(",
+        ] {
             let body: &str = seg(rw);
             assert!(body.contains("read_operator_token_for(&sock)"), "{rw} 토큰을 매번 새로 읽어야 한다");
             assert!(body.contains("rpc_full("), "{rw} 데몬의 error.code 가 화면까지 살아야 한다");
@@ -16358,9 +16418,11 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
                 "feed_reply".to_string(),
                 "send_input".to_string(),
                 "trash_delete".to_string(),
-                "trash_preview".to_string()
+                "trash_preview".to_string(),
+                "trash_preview_poll".to_string(),
+                "trash_preview_start".to_string()
             ],
-            "operator token 부착 명령 목록이 넷이 아니다(부착면이 넓어지면 삭제 등급도 넓어진다)"
+            "operator token 부착 명령 목록이 잠근 집합과 다르다(부착면이 넓어지면 삭제 등급도 넓어진다)"
         );
     }
 
