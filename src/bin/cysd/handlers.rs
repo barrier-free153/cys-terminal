@@ -9404,8 +9404,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     //   시계)다 — 다른 자이므로 재사용하지 않는다(델타 §5.2 m2).
                     //   ★판독은 **순수 peek** 다: `quiescing_window_peek` 은 해제하는 판독기
                     //   (`effective_quiescing_since`)를 부르지 않으므로 상태 조회가 상태를 바꾸지 않는다.
+                    //   ★(0.14.51 · U2 MIN-2) **창 신원(`since`)을 함께 들고 간다** — 이 판독과 아래 상태 복제는
+                    //   `agent_status` 락을 **따로** 잡으므로 그 사이에 라벨이 바뀔 수 있다. 신원을 버리면 `working`
+                    //   행에 옛 창이 붙어 위 "라벨이 `quiescing` 일 때만"이라는 약속이 깨진다. 묶는 판정은 순수 술어
+                    //   `governance::window_binds_to_status` 다(와이어 키는 **늘지 않는다** — `since` 는 싣지 않는다).
                     let window = crate::governance::quiescing_window_peek(daemon, s)
-                        .map(|w| w.to_wire());
+                        .map(|w| (w.since, w.to_wire()));
                     // ★(0.14.51 · S2 §5.1) 가드만 어긋난 경우(라벨은 없는데 가드가 `cycling`)도 보이지 않으면
                     //   안 된다 — 그때만 가산 키 `window_reading: "guard-only"` 를 얹는다. 라벨이 있는 어긋남은
                     //   위 `status.window.reading` 이 싣는다(두 자리가 겹치지 않는다). 가드 배선
@@ -9427,8 +9431,19 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     let status = s.agent_status.lock().unwrap().clone().map(|st| {
                         let mut row = json!({"state": st.state, "context_pct": st.context_pct,
                                "task": st.task, "age_secs": (now - st.updated_at).max(0.0) as u64});
-                        if let Some(w) = window {
-                            row["window"] = w;
+                        // ★(0.14.51 · U2 MIN-2) 세대가 맞을 때만 싣는다 — 창이 있다 ⇒ **이 행의 라벨이 그 창을
+                        //   만든 그 quiescing** 이다. 어긋나면 키가 **없다**(null 아님 · 가산 키의 부재는 종전처럼
+                        //   '모름' 이고 **'풀렸다' 가 아니다**). 그 판정은 종전 경로(큐 틱 접촉·해제 호출) 그대로다.
+                        //   ★큐 쌍 3항: ①막는 폭주 = 없음(진단 키 1개의 게재 여부일 뿐 발행·배달 경로가 아니다) ·
+                        //   ②세울 수 있는 정상 배달 = **없음**(이 자리는 `org.status` **응답 조립**이고, 큐 틱·배달·
+                        //   제출 판정은 이 값을 읽지 않는다 — 창은 출력 전용이라고 `QuiescingWindow` 문서가 못박는다) ·
+                        //   ③세우지 않음의 확인 근거 = 락을 **새로 잡지 않고**(이미 쥔 `st` 의 필드만 본다) 비교 2회만
+                        //   더한다(문자열 1 · f64 1) · 같은 아크의 좌석 맵 가드 해제 순서(`c5_org_status_remedy_…` 핀)와
+                        //   진단 호출 횟수(1회)는 불변이다.
+                        if let Some((since, w)) = window {
+                            if crate::governance::window_binds_to_status(&st.state, st.updated_at, since) {
+                                row["window"] = w;
+                            }
                         }
                         row
                     });
@@ -17808,11 +17823,23 @@ mod tests {
         let guard_only = c5_agent_seat(&daemon, "worker-3", pid + 2, 0);
         // 라벨 하나(묶지 않은 창 = 자기보고와 구별 불가) · 하나는 working · 하나는 라벨 없이 가드만 cycling.
         let now = crate::state::now_epoch();
+        // ★(0.14.51 · U2 MIN-3) 옛 4키를 **비사소한 값**으로 심는다 — `None`·`None` 로는 "값까지 그대로"를
+        //   재지 못한다(가산 키가 옛 값을 **덮는** 변이가 `None` 위에서는 보이지 않는다). `updated_at` 을
+        //   `now - 1234.5` 로 두는 이유: 상태행의 `age_secs` 는 `(핸들러의 now_epoch() - updated_at) as u64`
+        //   라 **정수 절단**이고, 0.5 를 깔아 두면 검체 지연이 500ms 미만인 동안 절단값이 **정확히 1234** 다
+        //   (지연이 500ms 를 넘으면 1235 로 보여 이 단정이 **깨진다** — 숨기지 않고 그렇게 두었다. 그 실패는
+        //   느린 기계의 신호이지 제품 결함이 아니므로, 깨지면 이 주석을 읽고 판단한다).
+        let q_ctx: u8 = 61;
+        let q_task = "U2 MIN-3 비사소 옛값";
+        let q_age_secs: u64 = 1234;
         *quiescing.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
-            state: "quiescing".into(), context_pct: None, task: None, updated_at: now,
+            state: "quiescing".into(),
+            context_pct: Some(q_ctx),
+            task: Some(q_task.to_string()),
+            updated_at: now - (q_age_secs as f64) - 0.5,
         });
         *plain.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
-            state: "working".into(), context_pct: None, task: None, updated_at: now,
+            state: "working".into(), context_pct: Some(7), task: Some("라벨 없는 좌석".into()), updated_at: now,
         });
         guard_only
             .ctx_loop_guard
@@ -17853,10 +17880,37 @@ mod tests {
         // 묶지 않은 창이므로 저장소가 아는 것만 말한다.
         assert_eq!(w["source"], json!("unbound-or-self-report"), "{w}");
         assert_eq!(w["owner"], json!("unknown"), "{w}");
-        // ⓑ 기존 4키는 값까지 불변(가산 키가 옛 키를 건드리지 않는다).
+        // ⓑ 기존 4키는 **값까지** 불변(가산 키가 옛 키를 건드리지 않는다).
+        // ★(0.14.51 · U2 MIN-3) 종전 문면은 `state` 하나만 정확히 보고 나머지 셋은 **존재**만 봤다 —
+        //   그래서 `context_pct`·`task` 를 덮거나 비우는 변이가 살아남았다. 네 키를 모두 심은 값과
+        //   **정확히** 대조한다(키 집합도 함께 못박아, 조용히 키가 늘거나 사라지는 것을 잡는다).
         assert_eq!(q["status"]["state"], json!("quiescing"), "{q}");
+        assert_eq!(q["status"]["context_pct"], json!(q_ctx), "심은 context_pct 가 아니다: {q}");
+        assert_eq!(q["status"]["task"], json!(q_task), "심은 task 가 아니다: {q}");
+        assert_eq!(q["status"]["age_secs"], json!(q_age_secs), "age_secs 절단값이 어긋났다(검체 지연 500ms+ 이면 1235): {q}");
         for k in ["state", "context_pct", "task", "age_secs"] {
             assert!(q["status"].get(k).is_some(), "기존 키 {k} 가 사라졌다: {q}");
+        }
+        let mut q_keys: Vec<&str> = q["status"].as_object().unwrap().keys().map(String::as_str).collect();
+        q_keys.sort_unstable();
+        assert_eq!(
+            q_keys,
+            vec!["age_secs", "context_pct", "state", "task", "window"],
+            "라벨 있는 좌석의 status 키 집합 = 옛 4키 + 가산 1키: {q}"
+        );
+        // ★(0.14.51 · U2 MIN-2) 창은 **그 행의 세대에 묶여** 실렸다 — 순수 술어를 여기서도 불러
+        //   "이 행에 붙는 것이 맞다"를 독립으로 다시 센다(값을 베끼지 않고 함수를 부른다).
+        let q_since = quiescing.agent_status.lock().unwrap().as_ref().map(|st| st.updated_at).expect("라벨");
+        assert!(
+            crate::governance::window_binds_to_status("quiescing", q_since, q_since),
+            "전제: 같은 세대는 묶인다"
+        );
+        // ★라벨 없는 좌석의 옛 키도 값까지 불변이다(ⓒ 가 '창 없음' 만 보던 자리에 값을 붙인다).
+        {
+            let pl0 = seat(plain.id);
+            assert_eq!(pl0["status"]["state"], json!("working"), "{pl0}");
+            assert_eq!(pl0["status"]["context_pct"], json!(7), "{pl0}");
+            assert_eq!(pl0["status"]["task"], json!("라벨 없는 좌석"), "{pl0}");
         }
         // ⓒ 라벨 없는 좌석에는 window 키가 **없다**(null 아님).
         let pl = seat(plain.id);
@@ -17871,6 +17925,85 @@ mod tests {
                 "라벨이 있는 어긋남은 status.window 가 싣는다: {q}");
         // ⓕ ★조회가 아무것도 바꾸지 않았다 — 순수 peek.
         assert_eq!(b0, b1, "org.status 조회가 라벨·소유자 기록을 바꿨다(읽기가 쓰기가 됐다)");
+    }
+
+    /// ★(0.14.51 · U2 MIN-2) **배선**의 행동 검체 — 창은 **그 행의 세대에만** 실린다.
+    ///
+    /// 【무엇을 재는가】 다른 스레드가 라벨을 `quiescing` ↔ `working` 으로 뒤집는 동안 `org.status` 를
+    /// 반복 호출해, 모든 응답 행에서 불변식 **`status.window` 가 있으면 그 행의 `state` 는 `quiescing`
+    /// 이다** 를 센다. 수리 전에는 창 판독과 상태 복제가 `agent_status` 락을 **따로** 잡으므로 그 사이에
+    /// 뒤집히면 `working` 행에 옛 창이 실렸다.
+    ///
+    /// 【이 검체의 성질 — 숨기지 않는다】 경합은 **결정론으로 만들 수 없다**(두 판독 사이에 끼어들 지점이
+    /// 생산 코드 안이다). 그래서 이것은 **양성만 내는** 검체다: 경합이 걸리면 반드시 잡고, 안 걸리면
+    /// 침묵한다 — 거짓 적색은 구조적으로 나지 않는다(불변식이 참인 응답만 통과시킨다). 다만 **침묵한
+    /// 초록**이 '덮였다' 로 읽히지 않도록, 두 극(창 있음·창 없음)을 **모두 관측했는지** 함께 단정한다.
+    /// 한쪽만 보였으면 이 실행은 아무것도 재지 않은 것이므로 **적색**으로 알린다(공허한 초록 금지).
+    #[test]
+    fn s2_min2_org_status_never_shows_a_window_on_a_non_quiescing_row() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("s2-min2-race", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_874;
+        let seat = c5_agent_seat(&daemon, "worker-1", pid, 0);
+        let flip_seat = seat.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_w = stop.clone();
+        // 뒤집는 쪽 — 생산 writer 와 같은 모양(구조체 전체 교체 · 새 `updated_at`).
+        let flipper = std::thread::spawn(move || {
+            let mut quiescing = true;
+            while !stop_w.load(Ordering::Relaxed) {
+                *flip_seat.agent_status.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(crate::state::AgentStatus {
+                        state: if quiescing { "quiescing".into() } else { "working".into() },
+                        context_pct: Some(61),
+                        task: None,
+                        updated_at: crate::state::now_epoch(),
+                    });
+                quiescing = !quiescing;
+                // ★뒤집는 **속도**가 이 검체의 감도를 정한다(실측 2026-10-13): `yield_now()` 로 쉼 없이
+                //   뒤집으면 판독과 상태 복제 사이에 거의 매번 새 세대가 끼어들어 창이 **600/600 보류**됐다
+                //   — 바인딩이 거짓말 대신 침묵하는 쪽으로 실패한다는 뜻이라 안전하지만, 그 실행은 '창 있음'
+                //   극을 한 번도 보지 못해 아무것도 재지 못한다. 짧게 쉬어 **안정 구간**을 만든다.
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        });
+        let mut with_window = 0usize;
+        let mut without_window = 0usize;
+        let mut violations: Vec<Value> = Vec::new();
+        for _ in 0..1200 {
+            let resp = d12_rpc(&daemon, pid, "org.status", json!({}));
+            let Some(rows) = resp["result"]["surfaces"].as_array() else {
+                continue;
+            };
+            for row in rows {
+                if row["surface_id"] != json!(seat.id) {
+                    continue;
+                }
+                let st = &row["status"];
+                if st.get("window").is_some() {
+                    with_window += 1;
+                    if st["state"] != json!("quiescing") {
+                        violations.push(row.clone());
+                    }
+                } else if st.is_object() {
+                    without_window += 1;
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        flipper.join().expect("뒤집는 스레드");
+        d12_cleanup(&daemon, &dir);
+        assert!(
+            violations.is_empty(),
+            "quiescing 아닌 행에 창이 실렸다 {}건 — 창이 그 행의 세대에 묶이지 않았다. 첫 건: {}",
+            violations.len(),
+            violations.first().map(ToString::to_string).unwrap_or_default()
+        );
+        // ★공허한 초록 금지 — 두 극을 모두 봤을 때만 이 실행이 무언가를 쟀다고 말할 수 있다.
+        assert!(
+            with_window > 0 && without_window > 0,
+            "이 실행은 경합을 재지 못했다(창 있음 {with_window}건 · 창 없음 {without_window}건) —              초록을 '배선이 덮였다' 로 읽지 마라"
+        );
     }
 
     /// `org.status` 소스 핀 — 조치 코드(파서 읽기)는 `surfaces` 가드를 **놓은 뒤**에 계산한다(좌석 맵 락을 쥔 채 파서 락을 잡지 않는다).

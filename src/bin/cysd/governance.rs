@@ -6745,6 +6745,30 @@ impl QuiescingWindow {
     }
 }
 
+/// ★(0.14.51 · U2 MIN-2) 판독한 창을 **지금 내보내는 상태행에 붙여도 되는가** — 순수 술어.
+///
+/// 【왜 필요한가】 `org.status` 는 창을 한 번 읽고([`quiescing_window_peek`]) **그 뒤에 따로** 상태를 복제해
+/// 내보낸다(두 판독 사이에 `agent_status` 락이 풀린다). 그 사이에 라벨이 바뀌면 `working` 행에 **옛 창**이
+/// 붙어 "저장된 라벨이 `quiescing` 일 때만 붙인다"는 약속이 깨진다. 이 술어는 **창 신원**(`since` = 그 창을
+/// 만든 라벨의 `updated_at` 생값)과 **지금 싣는 행의 세대**가 같을 때만 참이므로, 약속의 방향
+/// — **창이 있다 ⇒ 그 행의 라벨은 그 창을 만든 그 quiescing 이다** — 를 참으로 만든다.
+///
+/// 【세대가 라벨을 함의하는 근거】 `agent_status` 의 생산 writer 는 둘뿐이고(`status.set` ·
+/// `surface.quiesce on|off`) **둘 다 `AgentStatus` 전체를 새 `updated_at` 으로 교체**한다 — 제자리에서
+/// `state` 만 바꾸는 경로가 없다. 그럼에도 라벨을 **함께** 보는 이유: 같은 벽시계 f64 값에 두 번 쓰이는
+/// 경우를 배제하지 않는다(검사 1회가 싸고, 틀릴 때 안전한 쪽으로 틀린다).
+///
+/// 【유한하지 않은 표지】 `since` 나 `updated_at` 이 NaN 이면 `==` 가 거짓이라 창을 **붙이지 않는다** —
+/// 묶을 수 없을 때 말하지 않는 쪽이 안전한 방향이다(어떤 생산 writer 도 NaN 표지를 저장하지 않으며,
+/// 형제 디바운스 `stale_seen` 의 `Some(&NaN) != Some(&NaN)` 과 같은 성질이다).
+///
+/// 【이 술어는 권위가 아니다】 반환값이 정하는 것은 **진단 키를 실을지**뿐이다. 창의 부재는 "이 판독에서
+/// 일관된 창을 얻지 못했다"는 뜻이고 **"풀렸다"가 아니다** — 해제·배달·보류 판정은 종전 경로 그대로다
+/// (미래의 자동 소비자가 이 키의 유무를 해제 권위로 읽지 않게 하는 것이 MIN-2 의 두 번째 요구다).
+pub(crate) fn window_binds_to_status(state: &str, updated_at: f64, since: f64) -> bool {
+    state == "quiescing" && updated_at == since
+}
+
 /// ★(S2) quiescing 창의 **순수 판독**(peek) — 저장된 생값과 소유자 기록만 읽고 **아무것도 쓰지 않는다**.
 ///
 /// 【왜 별 함수인가】 기존 판독기 [`effective_quiescing_since`] 는 세대가 맞는 죽은 소유자를 보면 그 자리에서
@@ -28983,10 +29007,21 @@ mod h_machine_hold_tests {
     }
 
     /// [H0] quiescing 상한 — 599s 보류 · 700s 무시 · 노브 0 무시 · 시계 역행은 절댓값.
+    /// ★(0.14.51 · U2 MIN-3) **등호 경계**를 여기에 둔다. 술어는 `|age| < hold` 이므로 `|age| == hold` 는
+    /// 보류가 **아니다**(게이트 열림). 이 칸이 없으면 `<` → `<=` 변이가 살아남는다 — 격자
+    /// (`s2_at_r2_3_…`)로는 맞출 수 없다: 그 쪽 나이는 `ctx_guard_now()`/`now_epoch()` 를 **두 번** 읽은
+    /// 차이라 심은 값보다 ε 만큼 크고, 등호에 정확히 내려앉지 않는다. 등호는 **순수 입력**으로만 정확하다.
     #[test]
     fn h0_quiescing_stale_bound() {
         assert!(quiesce_hold_active(Some(599.0), 600));
         assert!(!quiesce_hold_active(Some(700.0), 600));
+        // ★(U2 MIN-3) 양수 상한의 등호 — 양방향(미래·역행) 모두 '상한 안이 아니다'.
+        assert!(!quiesce_hold_active(Some(600.0), 600), "|age| == hold 는 보류가 아니다(술어는 < 다)");
+        assert!(!quiesce_hold_active(Some(-600.0), 600), "역행 등호도 절댓값으로 같은 판정이다");
+        // 등호 바로 아래는 보류다 — 경계가 한 칸 어긋나면 이 짝이 깨진다(f64 이웃 값으로 못박는다).
+        let just_inside = f64::from_bits(600.0_f64.to_bits() - 1);
+        assert!(just_inside < 600.0 && quiesce_hold_active(Some(just_inside), 600), "등호 직전은 보류다: {just_inside}");
+        assert!(!quiesce_hold_active(Some(20.0), 20), "다른 상한에서도 등호는 같다(격자 상한 20 칸과 같은 자)");
         assert!(!quiesce_hold_active(Some(10.0), 0), "노브 0 = 축 끔");
         assert!(!quiesce_hold_active(None, 600), "결측(quiescing 아님)은 보류가 아니다");
         assert!(quiesce_hold_active(Some(-10.0), 600), "작은 역행은 상한 안");
@@ -30220,6 +30255,74 @@ mod h1_queue_quiesce_tests {
             "격자가 라벨을 풀었다"
         );
         let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// ★(0.14.51 · U2 MIN-3) **같은 맵·다음 창은 다시 장전된다.** 격자 검체(`s2_at_r2_3_…`)는 셀마다
+    /// `seen` 맵을 새로 만들고 같은 창으로 두 번 불러 **반복 억제**만 덮었다 — 맵을 그대로 들고 **창이
+    /// 바뀌었을 때** 다시 알리는지는 어느 검체도 재지 않았다. 디바운스 키는 `(좌석 id, 창 표지 since)` 이므로
+    /// 그 키를 `(좌석 id)` 로 줄이는 변이(예: `stale_seen.contains_key(&s.id)`)는 격자에서 **살아남는다**:
+    /// 그 변이는 '한 좌석에 평생 한 번만 알린다' 가 되어 새 창을 영구히 침묵시킨다.
+    ///
+    /// 음성 대조를 같은 검체에 붙인다 — ⒜같은 창 재호출 = 0건 ⒝새 창 = 1건 ⒞그 새 창 재호출 = 0건.
+    #[test]
+    fn s2_min3_same_map_rearms_on_a_next_window() {
+        let _k = HKnobGuard::set(&[("CYS_QUEUE_QUIESCE_HOLD_SECS", "20")]);
+        let (d, s) = rig("s2-rearm");
+        let mut seen = HashMap::new();
+        // 상한(20s)을 넘긴 창 하나 — 자격이 선다(묶지 않은 창: 나이는 벽시계).
+        assert!(s2_arm(&d, &s, S2Owner::Unbound, 700.0), "묶지 않은 창은 늘 심을 수 있다");
+        let w1 = quiescing_window_peek(&d, &s).expect("창 1");
+        assert!(w1.hold_secs > 0 && w1.queue_gate_open, "전제: 자격이 선 창이다 ({w1:?})");
+        let base = s2_events(&d, "surface.quiescing_stale");
+        check_quiescing_stale(&d, &mut seen);
+        assert_eq!(s2_events(&d, "surface.quiescing_stale") - base, 1, "첫 창에 알리지 않았다");
+        // ⒜ 같은 창 · 같은 맵 = 침묵(종전 디바운스).
+        check_quiescing_stale(&d, &mut seen);
+        assert_eq!(s2_events(&d, "surface.quiescing_stale") - base, 1, "같은 창에 두 번 알렸다");
+        // ⒝ **새 창**(표지가 바뀐다) · **같은 맵** = 다시 알린다.
+        assert!(s2_arm(&d, &s, S2Owner::Unbound, 701.0), "두 번째 창을 심는다");
+        let w2 = quiescing_window_peek(&d, &s).expect("창 2");
+        assert_ne!(w1.since, w2.since, "전제: 두 창의 표지가 달라야 이 검체가 뜻을 가진다");
+        assert!(w2.queue_gate_open, "전제: 두 번째 창도 자격이 선다 ({w2:?})");
+        check_quiescing_stale(&d, &mut seen);
+        assert_eq!(
+            s2_events(&d, "surface.quiescing_stale") - base,
+            2,
+            "같은 맵을 들고 **새 창**을 만났는데 다시 알리지 않았다 — 디바운스 키가 창 표지를 잃었다"
+        );
+        // ⒞ 새 창도 두 번은 알리지 않는다(장전이 억제를 깨뜨리지 않았다).
+        check_quiescing_stale(&d, &mut seen);
+        assert_eq!(s2_events(&d, "surface.quiescing_stale") - base, 2, "두 번째 창에 두 번 알렸다");
+        // 맵에 남은 것은 **마지막 창의 표지** 하나다(좌석당 1행 · 표지가 갱신된다).
+        assert_eq!(seen.get(&s.id), Some(&w2.since), "맵이 마지막 창 표지를 들고 있지 않다: {seen:?}");
+        // 이 검체도 라벨을 풀지 않았다(틱 검사는 관측뿐이다).
+        assert_eq!(
+            s.agent_status.lock().unwrap().as_ref().map(|st| st.state.clone()).as_deref(),
+            Some("quiescing"),
+            "재장전 검체가 창을 풀었다"
+        );
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// ★(0.14.51 · U2 MIN-2) 창을 **상태행에 묶는** 순수 술어 `window_binds_to_status` — `org.status` 가
+    /// 창을 읽은 뒤 상태를 **따로** 복제하는 사이에 라벨이 바뀌어도 `working` 행에 옛 창이 붙지 않는다.
+    /// 세대 비교를 지우는 변이(`state == "quiescing"` 만 남기기)는 ⒝에서 죽고, 라벨 비교를 지우는 변이는
+    /// ⒞에서 죽는다. 두 단정이 서로를 대신하지 못한다.
+    #[test]
+    fn s2_min2_window_binds_only_to_its_own_generation() {
+        let g1 = 1_791_858_000.5_f64;
+        let g2 = 1_791_858_007.25_f64;
+        // ⒜ 같은 세대 · quiescing = 붙인다.
+        assert!(window_binds_to_status("quiescing", g1, g1));
+        // ⒝ 라벨은 quiescing 인데 **세대가 다르다**(새 quiescing 창이 옛 행에, 또는 그 반대) = 붙이지 않는다.
+        assert!(!window_binds_to_status("quiescing", g2, g1), "세대가 어긋난 창을 붙였다");
+        // ⒞ 세대는 같은데 **라벨이 quiescing 이 아니다** = 붙이지 않는다(같은 f64 에 두 번 쓰인 경우).
+        assert!(!window_binds_to_status("working", g1, g1), "quiescing 아닌 행에 창을 붙였다");
+        assert!(!window_binds_to_status("waiting", g1, g1));
+        // ⒟ 유한하지 않은 표지는 묶을 수 없다 = 붙이지 않는다(말하지 않는 쪽이 안전하다).
+        assert!(!window_binds_to_status("quiescing", f64::NAN, f64::NAN), "NaN 을 같은 세대로 봤다");
+        assert!(!window_binds_to_status("quiescing", g1, f64::NAN));
+        assert!(!window_binds_to_status("quiescing", f64::NAN, g1));
     }
 
     /// ★AT-R2-4 — **종전 경로 무변경** 핀. 고아 창(세대가 맞는 죽은 소유자) + 큐 항목 하나는 종전처럼
