@@ -95,6 +95,9 @@ pub const R_SESSION_TOO_SLOW: &str = "cannot_certify_in_time";
 pub const R_PREVIEW_BUSY: &str = "preview_busy";
 /// 그 `job_id` 를 이 데몬이 모른다(만료됐거나 데몬이 다시 떴다).
 pub const R_JOB_UNKNOWN: &str = "job_unknown";
+/// ★MJR-2 — 미리보기 **일꾼(배경 스레드)** 을 띄우지 못했다. 잡은 그 자리에서 `Failed` 로 종결되고
+/// 빗장은 **즉시** 풀린다(놓지 않으면 데몬 수명 동안 미리보기가 죽는다 = 삭제의 선행조건이 죽는다).
+pub const R_PREVIEW_NO_WORKER: &str = "preview_worker_unavailable";
 
 /// 휴지통 뿌리 — 생산자 셋(cys-dept:94 · javis_org.py:564 · factory_reset.rs:299)과 같은 규약 경로.
 pub fn trash_root() -> PathBuf {
@@ -538,6 +541,32 @@ fn preview_sweep_expired() {
     }
 }
 
+/// 미리보기 일꾼을 띄운다 — **시험 주입점**이다(스레드 생성 실패는 실물로 만들 수 없다).
+/// ★`Result` 를 **돌려준다**: 호출자가 `Err` 를 처리하지 않으면 컴파일이 통과하지 않도록
+/// `.ok()` 를 이 안에 숨기지 않는다(MJR-2 는 바로 그 `.ok()` 에서 났다).
+fn preview_spawn<F: FnOnce() + Send + 'static>(body: F) -> std::io::Result<()> {
+    #[cfg(test)]
+    if PREVIEW_SPAWN_FAILS.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "주입된 스레드 생성 실패(시험 전용)",
+        ));
+    }
+    std::thread::Builder::new()
+        .name("trash-preview".into())
+        .spawn(body)
+        .map(|_| ())
+}
+
+/// 시험 전용 — 다음 `preview_spawn` 을 실패시킨다(MJR-2 경로를 밟는 유일한 길).
+#[cfg(test)]
+static PREVIEW_SPAWN_FAILS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+pub fn set_preview_spawn_fails(v: bool) {
+    PREVIEW_SPAWN_FAILS.store(v, std::sync::atomic::Ordering::Release);
+}
+
 fn preview_status_str(p: PreviewPhase) -> &'static str {
     match p {
         PreviewPhase::Running => "running",
@@ -554,6 +583,7 @@ pub fn reset_state_for_test() {
     orders().lock().unwrap().clear();
     preview_jobs().lock().unwrap().clear();
     *PREVIEW_LOCK.lock().unwrap() = None;
+    set_preview_spawn_fails(false);
 }
 
 /// ★시험 전용 단계 훅(R2 §3.5 의 `after_seal`) — 봉인과 대조 **사이**에 끼어드는 쓰기를 만든다.
@@ -1288,59 +1318,74 @@ fn preview_start(id: &Value, root: &Path, state: &Path, params: &Value) -> Reply
     let state_o = state.to_path_buf();
     let jid = job_id.clone();
     // ★순회는 **여기서부터 디스패치 경로 밖**이다(D4 stall pair).
-    std::thread::Builder::new()
-        .name("trash-preview".into())
-        .spawn(move || {
-            let deadline =
-                Instant::now() + std::time::Duration::from_secs(TRASH_PREVIEW_SESSION_MAX_SECS);
-            let prog_id = jid.clone();
-            let prog = move |n: usize| {
-                if let Some(j) = preview_jobs().lock().unwrap().get_mut(&prog_id) {
-                    j.nodes = n;
-                }
-            };
-            let out = certify_names(
-                &root_o,
-                &state_o,
-                &names,
-                Some(deadline),
-                Some(&prog as &dyn Fn(usize)),
-            );
-            let (phase, result, refusal) = match out {
-                NamesOutcome::Done {
-                    shown,
-                    refusals,
-                    certs,
-                } => (
-                    PreviewPhase::Ready,
-                    Some(preview_payload(shown, refusals, certs)),
-                    None,
-                ),
-                NamesOutcome::InvalidName => (
-                    PreviewPhase::Failed,
-                    None,
-                    Some(json!({"code": "invalid_params", "detail": INVALID_NAME_MSG})),
-                ),
-                NamesOutcome::LedgerUnwritable => (
-                    PreviewPhase::Failed,
-                    None,
-                    Some(json!({"code": R_LEDGER_UNWRITABLE, "detail": LEDGER_FAIL_MSG})),
-                ),
-                NamesOutcome::SessionExpired(r) => (
-                    PreviewPhase::Failed,
-                    None,
-                    Some(refusal_json("(session)", &r)),
-                ),
-            };
-            if let Some(j) = preview_jobs().lock().unwrap().get_mut(&jid) {
-                j.phase = phase;
-                j.result = result;
-                j.refusal = refusal;
+    let spawned = preview_spawn(move || {
+        let deadline =
+            Instant::now() + std::time::Duration::from_secs(TRASH_PREVIEW_SESSION_MAX_SECS);
+        let prog_id = jid.clone();
+        let prog = move |n: usize| {
+            if let Some(j) = preview_jobs().lock().unwrap().get_mut(&prog_id) {
+                j.nodes = n;
             }
-            // ★완료·실패 **즉시** 빗장을 놓는다(상태 전이표 3·4행).
-            preview_lock_release(&jid);
-        })
-        .ok();
+        };
+        let out = certify_names(
+            &root_o,
+            &state_o,
+            &names,
+            Some(deadline),
+            Some(&prog as &dyn Fn(usize)),
+        );
+        let (phase, result, refusal) = match out {
+            NamesOutcome::Done {
+                shown,
+                refusals,
+                certs,
+            } => (
+                PreviewPhase::Ready,
+                Some(preview_payload(shown, refusals, certs)),
+                None,
+            ),
+            NamesOutcome::InvalidName => (
+                PreviewPhase::Failed,
+                None,
+                Some(json!({"code": "invalid_params", "detail": INVALID_NAME_MSG})),
+            ),
+            NamesOutcome::LedgerUnwritable => (
+                PreviewPhase::Failed,
+                None,
+                Some(json!({"code": R_LEDGER_UNWRITABLE, "detail": LEDGER_FAIL_MSG})),
+            ),
+            NamesOutcome::SessionExpired(r) => (
+                PreviewPhase::Failed,
+                None,
+                Some(refusal_json("(session)", &r)),
+            ),
+        };
+        if let Some(j) = preview_jobs().lock().unwrap().get_mut(&jid) {
+            j.phase = phase;
+            j.result = result;
+            j.refusal = refusal;
+        }
+        // ★완료·실패 **즉시** 빗장을 놓는다(상태 전이표 3·4행).
+        preview_lock_release(&jid);
+    });
+    // ★MJR-2 — 생성 실패를 **버리지 않는다**. 버리면 ⒜잡이 영구 `Running` ⒝빗장이 영구 점유이고,
+    //   빗장을 놓는 코드는 **실행되지 않는 클로저 안**이다 ⇒ 이후 모든 `preview_start` 가 영구
+    //   `preview_busy`, 모든 `preview_poll` 이 영구 `Running`, 빠져나오는 길은 데몬 재시작뿐이다
+    //   (= 한 번의 생성 실패가 데몬 수명 동안 휴지통 미리보기를 죽인다).
+    // ★그래서 셋을 **이 자리(스레드 본문 밖)** 에서 한다: 잡을 `Failed` 로 종결 · 빗장 즉시 해제 ·
+    //   호출자에게 거부를 **지금** 돌려준다(job_id 를 주고 영원히 폴링하게 두지 않는다).
+    if let Err(e) = spawned {
+        let detail = format!(
+            "미리보기 일꾼을 띄우지 못했다: {e} — 잡을 즉시 종결하고 빗장을 놓았다(다시 시도하십시오)"
+        );
+        if let Some(j) = preview_jobs().lock().unwrap().get_mut(&job_id) {
+            j.phase = PreviewPhase::Failed;
+            j.result = None;
+            j.refusal = Some(json!({"code": R_PREVIEW_NO_WORKER, "detail": detail}));
+        }
+        preview_lock_release(&job_id);
+        return Reply::Single(err_response(id, R_PREVIEW_NO_WORKER, &detail));
+    }
     Reply::Single(ok_response(id, json!({"job_id": job_id})))
 }
 
@@ -2169,5 +2214,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    // ★MJR-2 결박 — 일꾼 생성 실패가 **빗장을 영구 점유하지 않는다**.
+    //   무엇을 재는가: ⒜호출자가 즉시 거부를 받는다 ⒝빗장이 **스레드 본문 밖에서** 풀린다
+    //   ⒞잡이 `Failed` + 거부 코드로 종결된다 ⒟**다음** 미리보기가 막히지 않는다.
+    //   ⒟가 핵이다 — 열린 결함의 증상이 「데몬 수명 동안 영구 `preview_busy`」였다.
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    /// 미리보기 전역(빗장·잡 맵·주입 플래그)을 만지는 검체끼리 섞이지 않게 직렬화한다.
+    static PREVIEW_TEST_SERIAL: Mutex<()> = Mutex::new(());
+    fn single(r: Reply) -> Value {
+        match r {
+            Reply::Single(v) => v,
+            _ => panic!("preview 동사는 Reply::Single 만 돌려준다"),
+        }
+    }
+
+    #[test]
+    fn a_worker_that_cannot_be_spawned_fails_the_job_and_releases_the_latch() {
+        let _g = PREVIEW_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let root = rig("spawn-fail");
+        let state = root.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        reset_state_for_test();
+
+        set_preview_spawn_fails(true);
+        let params = json!({"names": ["dept-9-1760000000"]});
+        let v = single(preview_start(&json!(1), &root, &state, &params));
+        // ⒝ ★먼저 **빗장**을 본다(결함의 본체다 · 뮤턴트는 여기서 FAIL 해야 한다) —
+        //    스레드 본문은 돌지 않았으므로 「본문 밖에서 풀렸다」는 것만이 증거다.
+        assert!(
+            PREVIEW_LOCK.lock().unwrap().is_none(),
+            "일꾼이 뜨지 못했는데 빗장이 쥐여 있다 = 데몬 수명 동안 미리보기가 죽는다"
+        );
+        // ⒞ 잡은 영구 `Running` 이 아니라 `Failed` 묘비다(폴링이 이유를 읽는다).
+        {
+            let m = preview_jobs().lock().unwrap();
+            assert_eq!(m.len(), 1, "잡 하나만 등록돼 있어야 한다");
+            let j = m.values().next().unwrap();
+            assert_eq!(j.phase, PreviewPhase::Failed, "생성 실패 잡이 Running 으로 남았다");
+            assert_eq!(j.refusal.as_ref().expect("거부가 있어야 한다")["code"], R_PREVIEW_NO_WORKER);
+        }
+
+        // ⒜ 호출자는 **지금** 거부를 받는다(job_id 를 받고 영원히 폴링하지 않는다).
+        assert_eq!(v["ok"], false, "생성 실패인데 성공 응답이 나갔다");
+        assert_eq!(v["error"]["code"], R_PREVIEW_NO_WORKER);
+
+        // ⒟ ★다음 미리보기가 막히지 않는다 — 한 번의 생성 실패가 기능을 죽이지 않는다.
+        set_preview_spawn_fails(false);
+        let v2 = single(preview_start(&json!(2), &root, &state, &params));
+        assert_eq!(
+            v2["ok"], true,
+            "생성 실패 뒤의 미리보기가 거부됐다({}) = 빗장이 회수되지 않았다",
+            v2["error"]["code"]
+        );
+        let jid2 = v2["result"]["job_id"].as_str().expect("job_id").to_string();
+        // 배경 일꾼이 끝나기를 기다린다(검체가 리그를 지우기 전에 — 최대 5s).
+        let t = Instant::now();
+        loop {
+            let done = preview_jobs()
+                .lock()
+                .unwrap()
+                .get(&jid2)
+                .map(|j| j.phase != PreviewPhase::Running)
+                .unwrap_or(true);
+            if done || t.elapsed().as_secs() >= 5 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        reset_state_for_test();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
