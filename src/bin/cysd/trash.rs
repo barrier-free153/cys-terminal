@@ -983,7 +983,23 @@ fn size_cache_flush(root: &Path, pending: &[(String, Certificate)]) {
             m.remove(&k);
         }
     }
-    let _ = std::fs::write(size_cache_path(root), Value::Object(m).to_string());
+    // ★⒟′-5(부서장 2026-10-14 01:3x · 근거 = S22 심사에서 gemini 가 짚은 기제) — **원자적 쓰기**다.
+    //   종전 `std::fs::write` 는 **제자리 truncate** 라 읽고-고쳐-쓰기 경쟁에서 두 축이 열려 있었다:
+    //   ⒤**잃은 갱신**(두 쓰기가 겹치면 한 쪽 항목이 사라진다) ⒥**찢긴 파일**(쓰는 중에 읽히면 파싱이
+    //   실패한다). ★이 한 줄이 없애는 것은 **⒥ 하나**다 — tmp 에 쓰고 fsync 한 뒤 **rename 으로 교체**하므로
+    //   독자는 **옛 파일 전체나 새 파일 전체**만 본다. ⛔**⒤는 남는다**(읽기-쓰기 사이의 창은 그대로다).
+    //   ★그래도 손실 등급은 **「가용성·속도」이고 「정확성」이 아니다**: 캐시 키가
+    //   `name|dev|ino|mtime_bits`(`size_cache_key`)라서 **낡은 항목이 바뀐 항목으로 오인될 수 없고**,
+    //   파싱 실패는 `size_cache_read` 가 **빈 맵으로 접는다** ⇒ ⒤의 영향은 **「다시 재야 한다」뿐**이다.
+    //   ⛔**tmp+rename 을 손으로 짜지 않았다** — 같은 일을 하는 공개 함수가 이미 있다:
+    //   `cys::pack::write_atomic`(`src/pack.rs` · 같은 디렉터리 tmp → fsync → rename → 디렉터리 fsync ·
+    //   tmp 이름은 **호출마다 유일**해서 같은 프로세스의 두 호출도 섞이지 않는다 · H-CONC-3).
+    //   ★`Err` 는 종전처럼 **버린다**: 캐시는 선택적 가속이고, 못 썼으면 다음 목록이 `pending` 을 보일 뿐이다
+    //   (그래서 **파일 부재는 「인증이 돈 적 없다」의 증거가 아니다** — codex N6 이 바로 그 추론을 깼다).
+    //   ★파급: 교체가 **rename** 이므로 ⒜`size-cache.json` 의 **inode 가 매번 바뀐다**(이 값을 읽는 코드 0건) ·
+    //   ⒝**휴지통 뿌리 디렉터리의 mtime 이 매 반영마다** 바뀐다(종전엔 파일 생성 때만) — 뿌리 디렉터리 mtime 으로
+    //   판정하는 코드는 **없다**(`root_sane` 은 `symlink_metadata` 의 **종류**만 보고, 쓸기는 **자식**의 mtime 을 본다).
+    let _ = cys::pack::write_atomic(&size_cache_path(root), Value::Object(m).to_string().as_bytes());
 }
 
 /// ★**조언용** 유일본 표지(advisory only · 아무 것도 막지 않는다).
@@ -3212,6 +3228,55 @@ mod tests {
             .expect("항목이 목록에 그대로 있어야 한다(거부가 아니다)");
         assert_eq!(me["size"]["state"], "pending", "캐시 부재와 동일이어야 한다: {me}");
         let _ = std::fs::remove_file(&fifo);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    // ★⒟′-5 결박 — 캐시 쓰기가 **원자적**이다(찢긴 파일 축이 닫혔다).
+    //   ⒜**구조**: 생산 코드에 `std::fs::write(size_cache_path` 가 **0건**이고
+    //     `cys::pack::write_atomic(&size_cache_path(` 가 **1건**이다. ★행위로는 가릴 수 없다 —
+    //     원자성은 **경쟁 중에만** 보이고, 경쟁을 결정론으로 만들면 그것은 더 이상 경쟁이 아니다.
+    //   ⒝**행위(곁다리로 얻는 것)**: 반영 뒤 뿌리에 **tmp 잔존이 0** 이고 파일은 **읽을 수 있다**
+    //     (손으로 짠 tmp+rename 이 잔존을 남기는 길을 함께 막는다).
+    //   ⛔이 검체는 **잃은 갱신을 막지 않는다**(그 축은 남아 있고, 영향은 「다시 재야 한다」뿐이다).
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    #[test]
+    fn the_size_cache_write_is_atomic_so_a_torn_file_is_not_a_reachable_state() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd/trash.rs"),
+        )
+        .expect("trash.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        assert_eq!(
+            prod.matches("std::fs::write(size_cache_path").count(),
+            0,
+            "캐시를 **제자리 truncate** 로 쓴다 — 쓰는 중에 읽히면 찢긴 파일이 보인다(⒟′-5)"
+        );
+        assert_eq!(
+            prod.matches("cys::pack::write_atomic(&size_cache_path(").count(),
+            1,
+            "원자적 쓰기 호출이 하나가 아니다 — 쓰는 자리가 둘이면 한쪽이 옛 방식으로 남는다"
+        );
+
+        let root = rig("dp5-atomic");
+        let name = "dept-9-1760000600";
+        let entry = root.join(name);
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("f0"), b"q").unwrap();
+        let md = std::fs::symlink_metadata(&entry).unwrap();
+        let (dev, ino) = dev_ino(&md);
+        let key = size_cache_key(name, dev, ino, mtime_bits(&md));
+        let c = certify_entry(&entry, &real_dev).unwrap();
+        size_cache_flush(&root, &[(key.clone(), c)]);
+        let m = size_cache_read(&root);
+        assert!(m.contains_key(&key), "원자적 쓰기 뒤 캐시를 읽을 수 없다: {m:?}");
+        let leftovers: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .filter(|n| n.contains("size-cache") && n != "size-cache.json")
+            .collect();
+        assert!(leftovers.is_empty(), "tmp 잔존이 있다: {leftovers:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
