@@ -2653,18 +2653,25 @@ class TriageRemainingIssues(unittest.TestCase):
                     "공백 뒤 접미 반전을 어떤 판정기도 잡지 못했다(%s)" % label)
 
     # ── A1 · C3(양 리뷰어 major) ──────────────────────────────────────────
-    def test_triage_section2_does_not_assert_zero_loss(self):
-        """§2 무응답 정책은 §1-2 ⑦ 의 증명 범위와 같은 말을 해야 한다.
+    def test_triage_section2_has_no_known_zero_loss_after_execution_phrasing(self):
+        """★이것은 **알려진 옛 결함 문구의 감시선(tripwire)** 이다 — 불변식의 증명이 아니다.
 
-        §1-2 ⑦ 은 checksum·mtime 이 **저장된 파일만** 증명하며 "'손실 0' 을 단언하지 마라" 고
-        규정하는데, §2 는 같은 검증을 `신선(미저장 작업 없음 확정)=…집행(손실0)` 으로 정의한다 —
-        같은 문서가 같은 상태에서 반대로 지시한다."""
+        불변식(문서화된 관례 · 기계가 증명하지 않는다): §2 무응답 정책은 §1-2 ⑦ 의 증명 범위와 같은 말을 해야
+        한다 — checksum·mtime 은 **저장된 파일만** 증명하므로 clear 를 **집행한 뒤** 손실이 없다고 단언하지 않는다.
+        옛 결함은 같은 검증을 `신선(미저장 작업 없음 확정)=…clear 집행(손실0)` 으로 정의해 같은 문서가 같은 상태에서
+        반대로 지시한 것이다.
+
+        이 검사가 잡는 것: 공백·줄바꿈·`**` 강조를 접은 뒤(squash) 아래 **완결 문구** 셋이 §2 에 있는가.
+        ★이 검사가 **잡지 못하는 것**(커버 범위를 부풀리지 않는다): 다른 어휘('집행 후 손실 없음'·'무손실'·'유실 0'),
+        전각·제로폭 문자로 쓴 같은 문구, 집행/미집행 분기를 나눠 쓴 서술. 그 범위는 리뷰어의 읽기 관례다.
+        ★맨 토큰 `손실0`·`손실0)` 는 감시 문구에서 뺐다 — `…clear 미집행 · 손실 0)` 처럼 **집행하지 않았으니
+        손실이 없다**는 참인 문장까지 붉혔기 때문이다(거짓 적색). 문구는 집행 분기를 품은 완결형으로만 건다."""
         section2 = section_body(self.cso, "## 2.")
         folded = squash(section2)
-        for banned in ("미저장 작업 없음 확정", "손실0", "손실 0을", "손실0)"):
-            with self.subTest(token=banned):
+        for banned in ZERO_LOSS_AFTER_EXECUTION_PHRASES_CSO:
+            with self.subTest(phrase=banned):
                 self.assertNotIn(squash(banned), folded,
-                                 "§2 가 §1-2 ⑦ 이 금지한 단언을 그대로 지시한다: %r" % banned)
+                                 "§2 가 알려진 옛 결함 문구(집행 뒤 손실 0 단언)를 지시한다: %r" % banned)
 
     # ── C4(codex major) ───────────────────────────────────────────────────
     def test_triage_cycle_agent_rebaseline_is_disclosed(self):
@@ -2896,8 +2903,12 @@ INVERTED_PROHIBITIONS = (
     "`tail -f cysd.log` 를 켜 두라.",
     "위 문단은 참고일 뿐 현행 규칙이 아니다.",
 )
-# MASTER §11-6 에서 **사라져야** 하는 옛 단언(CSO §2 와 같은 방향으로 고쳤다는 증거).
-MASTER_BANNED_ZERO_LOSS = ("미저장 작업 없음 확정", "clear 집행(손실0)", "손실0)")
+# MASTER §11-6 에서 **사라져야** 하는 옛 단언(CSO §2 와 같은 방향으로 고쳤다는 증거) — 알려진 **완결 문구** 감시선.
+# ★맨 `손실0)` 는 뺐다: `clear 미집행 · 손실 0)`(집행하지 않았으니 손실 없음 — 참)까지 붉히는 거짓 적색이었다.
+# ★잡지 못하는 것: 다른 어휘·전각/제로폭 문자·분기를 나눠 쓴 서술 — 불변식은 문서화된 관례이고 이 상수는 증명이 아니다.
+ZERO_LOSS_AFTER_EXECUTION_PHRASES_MASTER = ("미저장 작업 없음 확정", "clear 집행(손실0)")
+# CSO §2 쪽 감시 문구(같은 방향) — 위 상수와 같은 한계를 가진다. 맨 `손실0`·`손실0)` 는 같은 이유로 뺐다.
+ZERO_LOSS_AFTER_EXECUTION_PHRASES_CSO = ("미저장 작업 없음 확정", "clear 집행(손실0)", "손실 0을")
 _FULL_SUITE_TEST = "test_triage_positive_controls_pass_through_full_suite"
 _IN_FULL_SUITE = False          # C6 의 재귀 가드(전체 검체 안에서 자기 자신을 다시 돌리지 않는다)
 
@@ -3029,20 +3040,26 @@ class ConvergenceRoundTwo(unittest.TestCase):
         self.assertTrue(any_detector_fires(removed), "고지 삭제를 어떤 판정기도 잡지 못했다")
 
     # ── 형제 지침·생성물의 무손실 단언(reviewer-claude major) ─────────────
-    def test_master_no_response_policy_matches_cso(self):
-        """MASTER §11-6 과 그 생성물 CEO_TEMPLATE 도 CSO §2·§1-2 ⑦ 과 같은 문면이어야 한다.
+    def test_master_and_ceo_carry_no_known_zero_loss_phrasing(self):
+        """★알려진 옛 결함 문구의 감시선(tripwire) — 불변식의 증명이 아니다(CSO §2 쪽과 같은 한계).
 
         `①신선(미저장 작업 없음 확정) → cycle-agent로 clear 집행(손실0)` 이 남아 있으면 ①오너에게
-        가는 거짓 보증이 그대로이고 ②같은 절차를 두 지침이 반대로 지시한다."""
+        가는 거짓 보증이 그대로이고 ②같은 절차를 두 지침이 반대로 지시한다. 공백·줄바꿈·`**` 를 접은 뒤
+        완결 문구가 **문서 전체**에 있는지만 본다. 잡지 못하는 것: 다른 어휘·전각/제로폭 문자·분기를 나눠 쓴 서술."""
+        for name in ("MASTER_DIRECTIVE.md", "CEO_TEMPLATE.md"):
+            folded = squash(self.raw[name])
+            for banned in ZERO_LOSS_AFTER_EXECUTION_PHRASES_MASTER:
+                with self.subTest(directive=name, phrase=banned):
+                    self.assertNotIn(squash(banned), folded,
+                                     "%s 가 알려진 옛 결함 문구(집행 뒤 손실 0 단언)를 유지한다: %r" % (name, banned))
+
+    def test_master_no_response_policy_matches_cso(self):
+        """MASTER §11-6 과 그 생성물 CEO_TEMPLATE 도 CSO §2·§1-2 ⑦ 과 같은 **개정 문면**을 정확히 1회 가져야 한다
+        (완결 조항 핀 — 감시선이 아니다). 금지 문구 감시선은 위 `…carry_no_known_zero_loss_phrasing` 이다."""
         master = self.raw["MASTER_DIRECTIVE.md"]
         ceo = self.raw["CEO_TEMPLATE.md"]
         clause = dict(SAFETY_CLAUSES["MASTER_DIRECTIVE.md"])["무응답 무손실 단언 금지"]
         for name, raw in (("MASTER_DIRECTIVE.md", master), ("CEO_TEMPLATE.md", ceo)):
-            folded = squash(raw)
-            for banned in MASTER_BANNED_ZERO_LOSS:
-                with self.subTest(directive=name, token=banned):
-                    self.assertNotIn(squash(banned), folded,
-                                     "%s 가 금지된 무손실 단언을 유지한다: %r" % (name, banned))
             with self.subTest(directive=name, clause="무응답 무손실 단언 금지"):
                 spans = bounded_spans(normalize(strip_html_comments(raw)), normalize(clause))
                 self.assertEqual(len(spans), 1,
