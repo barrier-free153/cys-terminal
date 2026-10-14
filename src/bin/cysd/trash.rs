@@ -2259,9 +2259,11 @@ mod tests {
         let r = certify_entry(&entry, &dev_of).expect_err("교차장치면 인증이 거부돼야 한다");
         assert_eq!(r.code, R_DESC_DEVICE, "사유 코드가 장치 경계여야 한다");
         assert_eq!(
-            r.boundary.as_deref(),
-            Some(boundary.display().to_string().as_str()),
-            "거부는 인증을 무너뜨린 **경계 경로**를 들고 있어야 한다"
+            r.boundary.as_deref().map(Path::new),
+            Some(boundary.as_path()),
+            "거부는 인증을 무너뜨린 **경계 경로**를 들고 있어야 한다 \
+             (★표시 문자열이 아니라 경로로 비교한다 — 윈도우는 같은 경로를 \
+             역슬래시로 적어서 문자열 비교만 깨졌다 · S68 ①)"
         );
         // ★항목 전체 거부 — 경계 바깥의 파일도 그대로 있어야 한다(부분 제거 금지).
         assert!(entry.join("state/keep.txt").exists(), "경계 밖 파일이 사라졌다 = 부분 제거");
@@ -2272,7 +2274,11 @@ mod tests {
         assert_eq!(ls.len(), 1);
         assert_eq!(ls[0]["kind"], "refusal");
         assert_eq!(ls[0]["reason_code"], R_DESC_DEVICE);
-        assert_eq!(ls[0]["boundary"], boundary.display().to_string());
+        assert_eq!(
+            Path::new(ls[0]["boundary"].as_str().expect("원장의 boundary 는 문자열이다")),
+            boundary.as_path(),
+            "원장도 같은 **경계 경로**를 들고 있어야 한다(경로로 비교 · S68 ①)"
+        );
         assert_eq!(ls[0]["human_verified"], false, "원장은 사람을 증명하지 않는다");
         assert_eq!(ls[0]["identity"], "token_holder");
         let _ = std::fs::remove_dir_all(&root);
