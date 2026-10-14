@@ -2545,7 +2545,11 @@ mod tests {
     /// ★성찰 A-2 의 수정: 점 파일(`.producer`)은 **오너가 보는 첫 단계 목록에 섞이지 않는다**
     /// (설계 r2 §3.4). 표식을 쓰기 시작한 뒤 생긴 결함이라 시험이 그 조합을 그대로 만든다.
     /// ★성찰 A-1 의 수정: 같은 줄의 `producer_chip` 과 `deletable` 은 **한 번의 판독**에서 나와야
-    /// 서로 모순될 수 없다 — 아래 두 경우가 그 일치를 잠근다(살아 있는 pid / 죽은 pid).
+    /// 서로 모순될 수 없다 — 아래의 **불변식**이 그 일치를 잠근다(막는 표지 ⇒ 고를 수 없다).
+    /// ★S68 ②: 살아 있는 pid / 죽은 pid 의 **리터럴 매핑은 이 검체가 더 이상 주장하지 않는다** —
+    /// non-unix 에서 `real_alive` 가 모든 pid 에 `None` 을 돌려 성립하지 않기 때문이다(D2).
+    /// 그 리터럴은 바로 아래 `list_maps_a_live_and_a_dead_producer_pid_to_running_and_interrupted_unix`
+    /// (`#[cfg(unix)]`)가 지킨다.
     #[test]
     fn list_hides_dot_files_and_never_contradicts_itself_about_the_producer() {
         let root = rig("dotfiles");
@@ -2574,18 +2578,47 @@ mod tests {
 
         let v = list_payload(&root, &state);
         let ents = v["entries"].as_array().unwrap();
+        // (1) 점 파일은 첫 단계 목록에 **한 항목에서도** 섞이지 않고, 개수가 그 목록과 일치한다.
+        //     ★종전엔 한 항목(`dept-9…`)의 리터럴만 봤다 — 전수 불변식으로 넓힌다(S68 ②).
+        for e in ents {
+            let kids = e["children_depth1"].as_array().unwrap();
+            for k in kids {
+                assert!(!k.as_str().unwrap().starts_with('.'), "점 파일이 목록에 들어왔다: {k}");
+            }
+            assert_eq!(
+                e["children_total"].as_u64().unwrap() as usize,
+                kids.len(),
+                "개수와 목록이 어긋난다: {e:?}"
+            );
+        }
         let g = ents.iter().find(|e| e["name"] == "dept-9-1760000000").unwrap();
-        let kids = g["children_depth1"].as_array().unwrap();
-        assert_eq!(kids.len(), 1, "점 파일이 첫 단계 목록에 섞였다: {kids:?}");
-        assert_eq!(kids[0], "state");
-        assert_eq!(g["children_total"], 1, "개수가 점 파일을 센다");
-        assert_eq!(g["producer_chip"], producer_chip(&ProducerState::ActiveOpen));
-        assert_eq!(g["deletable"], false, "돌고 있다고 적으면서 고를 수 있게 두면 모순이다");
-
-        let d = ents.iter().find(|e| e["name"] == "dept-10-1760000000").unwrap();
-        assert_eq!(d["producer_chip"], producer_chip(&ProducerState::InterruptedOpen));
-        assert_eq!(d["deletable"], true, "끝내지 못한 생산자는 타이핑 확인 뒤 지울 수 있다");
-        assert_eq!(d["children_depth1"].as_array().unwrap().len(), 1);
+        assert_eq!(g["children_depth1"].as_array().unwrap()[0], "state");
+        // (2) ★같은 줄이 스스로를 반박하지 않는다 — **막는 표지**(돌고 있다·판정 불가)이면서
+        //     고를 수 있는 줄은 있을 수 없다. 리터럴 두 개가 아니라 **불변식**으로 적는다:
+        //     윈도우에서는 생산자 생존이 `None`(판정 불가)이라 리터럴 쪽이 구조적으로 성립하지 않는다
+        //     (D2 · S68 ②) — 그 리터럴은 아래 `#[cfg(unix)]` 절반이 지킨다.
+        let mut blocking_rows = 0usize;
+        for e in ents {
+            let chip = e["producer_chip"].as_str().unwrap();
+            let deletable = e["deletable"].as_bool().unwrap();
+            let blocking = chip == producer_chip(&ProducerState::ActiveOpen)
+                || chip == producer_chip(&ProducerState::Undeterminable);
+            if blocking {
+                blocking_rows += 1;
+                assert!(!deletable, "표지가 {chip:?} 인데 줄을 고를 수 있다 = 자기모순");
+            }
+            // ★한 방향만 불변식이다: `deletable` 은 봉인 잔재(`interrupted`)에서도 거짓이므로
+            //   "막지 않는 표지 ⇒ 고를 수 있다" 는 성립하지 않는다(`:1390` 의 두 항 논리곱).
+        }
+        // ★불변식이 **공허하지 않음**을 같은 자리에서 단언한다(이 묶음의 추가분 · 리그 probe 에는
+        //   없었다): 막는 표지가 한 줄도 없으면 위 루프는 무엇도 거부할 수 없고, 표식 쓰기가
+        //   조용히 깨진 날에도 초록이 난다. 거부할 수 없는 게이트는 게이트가 아니다.
+        //   살아 있는 pid 는 unix 에서 `돌고 있다`·non-unix 에서 `판정 불가`이고 **둘 다 막는 표지**라
+        //   이 단언은 전 플랫폼에서 성립한다.
+        assert!(
+            blocking_rows >= 1,
+            "막는 표지가 한 줄도 없다 = 위 불변식이 공허하다(표식 픽스처가 깨졌는지 보라)"
+        );
 
         // 판독은 항목마다 한 번이다 — 두 번 읽으면 두 값이 서로 다른 순간을 볼 수 있다.
         let src = include_str!("trash.rs");
@@ -2595,6 +2628,45 @@ mod tests {
             1,
             "list_payload 이 표식 상태를 두 번 읽는다(A-1 회귀)"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ★S68 ② 의 분할된 절반 — **pid 생존 매핑**은 unix 에서만 성립한다. `real_alive` 가
+    /// non-unix 에서 **모든 pid 에 `None`** 을 돌려 표지가 `판정 불가`가 되기 때문이다(D2).
+    /// 이름이 그 사실을 말한다 — 위 크로스플랫폼 절반은 pid 매핑을 약속하지 않는다.
+    /// ★D2 가 고쳐지면 이 절반은 `cfg` 없이 전 플랫폼으로 돌아온다(그것이 진짜 수리다).
+    #[cfg(unix)]
+    #[test]
+    fn list_maps_a_live_and_a_dead_producer_pid_to_running_and_interrupted_unix() {
+        let root = rig("dotfiles-unix");
+        let state = root.join("sd");
+        std::fs::create_dir_all(&state).unwrap();
+        let live = root.join("dept-9-1760000000");
+        mk(&live, "state/x.txt", b"x");
+        std::fs::write(
+            live.join(".producer"),
+            format!(
+                r#"{{"v":1,"state":"open","producer":"t","pid":{},"start_token":"","ts":1}}"#,
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        let dead = root.join("dept-10-1760000000");
+        mk(&dead, "state/y.txt", b"y");
+        std::fs::write(
+            dead.join(".producer"),
+            r#"{"v":1,"state":"open","producer":"t","pid":4294967294,"start_token":"","ts":1}"#,
+        )
+        .unwrap();
+        let v = list_payload(&root, &state);
+        let ents = v["entries"].as_array().unwrap();
+        let g = ents.iter().find(|e| e["name"] == "dept-9-1760000000").unwrap();
+        assert_eq!(g["producer_chip"], producer_chip(&ProducerState::ActiveOpen));
+        assert_eq!(g["deletable"], false, "돌고 있다고 적으면서 고를 수 있게 두면 모순이다");
+        let d = ents.iter().find(|e| e["name"] == "dept-10-1760000000").unwrap();
+        assert_eq!(d["producer_chip"], producer_chip(&ProducerState::InterruptedOpen));
+        assert_eq!(d["deletable"], true, "끝내지 못한 생산자는 타이핑 확인 뒤 지울 수 있다");
+        assert_eq!(d["children_depth1"].as_array().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 
