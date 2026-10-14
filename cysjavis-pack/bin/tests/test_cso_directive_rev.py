@@ -2426,10 +2426,20 @@ class CsoDirectiveRevision(unittest.TestCase):
         숫자를 강제하는 검체가 저장소에 없었다(CSO 는 여유가 3 B). 줄 수는 CEO 합성 제출단위 핀이 간접으로 막지만 바이트는 아무것도 막지 않는다.
         ★래칫: 지침을 **줄이면 아래 상한도 함께 낮춘다** — 줄인 커밋이 이 숫자를 새 크기로 내리지 않으면 그 여유가 다음 증가를 조용히 받아 준다. 늘려야 할 때는 이 숫자를 올리는 것이 아니라 먼저 다른 곳을 줄인다
         (예산을 올리는 변경은 그 사유를 커밋 메시지에 적는다 — 이 핀이 붉어지는 순간이 그 결정을 사람 눈에 올리는 자리다). 단위 = 파일의 UTF-8 바이트(줄바꿈 포함)."""
+        # ★2026-10-14 재기준선(S64-IMPL · 부서장 결정, 조건 5개) — 모양은 그대로다: 정확한 **최대값** 단언(≤), 창·허용오차·퍼센트 여유 없음.
+        #   ① 무엇이 얼마나 키웠나 (단위 B · 출처 = 각 커밋의 `git cat-file -s <sha>:cysjavis-pack/directives/<파일>`):
+        #     CSO    57,365(0a20e3ba) → 57,698(S8 만료 약속 삭제문: 8211c199 이 되돌림 2분 뒤 57,723 으로 다시 넘겼고, fba8da68 이 되돌림을 되돌려 57,698)  +333
+        #                              → 59,715(33288649: 안전지점·사이클 예고 16줄)                                                          +2,017   = 59,715
+        #     MASTER 98,706(0a20e3ba) → 100,723(33288649: 같은 16줄)                                                                         +2,017   = 100,723
+        #     CEO    107,320(0a20e3ba) → 107,422(S8: 8211c199·fba8da68 의 같은 문안)  +102
+        #                              → 114,340(bec69f49: 오너 복원 조항 59줄, 6,918 B)  +6,918
+        #                              → 116,357(33288649: 같은 16줄)                    +2,017   = 116,357   (CEO 는 MASTER 바이트 연접이라 16줄이 두 번 센다)
+        #   ② 받아들인 것 = **오늘 현장의 헌장 크기 그대로**다. 앞으로 늘려도 된다는 면허가 **아니다** — 다음 증가는 이 핀이 다시 붉어져 사람 결정으로 올라온다.
+        #     되돌릴 때: 지침을 줄이는 커밋이 아래 세 숫자를 새 크기로 함께 내린다(래칫). 상한 = 이 날의 실측 크기이므로 1 B 만 늘어도 적색이다.
         size = lambda name: os.path.getsize(os.path.join(REAL_DIRECTIVES_DIR, name))   # 실제 파일(전체 검체 재실행이 DIRECTIVES_DIR 을 임시 사본으로 바꿔도 영향 없다)
-        self.assertLessEqual(size("CSO_DIRECTIVE.md"), 57368, "CSO_DIRECTIVE.md 바이트 예산(57,368) 초과 — 늘리지 말고 줄여라(줄이면 이 상한도 낮춘다)")
-        self.assertLessEqual(size("MASTER_DIRECTIVE.md"), 99272, "MASTER_DIRECTIVE.md 바이트 예산(99,272) 초과 — 늘리지 말고 줄여라(줄이면 이 상한도 낮춘다)")
-        self.assertLessEqual(size("CEO_TEMPLATE.md"), 107886, "CEO_TEMPLATE.md 바이트 예산(107,886) 초과 — 늘리지 말고 줄여라(줄이면 이 상한도 낮춘다 · 생성물이라 MASTER 와 머리글 바이트가 함께 든다)")
+        self.assertLessEqual(size("CSO_DIRECTIVE.md"), 59715, "CSO_DIRECTIVE.md 바이트 예산(59,715) 초과 — 늘리지 말고 줄여라(줄이면 이 상한도 낮춘다)")
+        self.assertLessEqual(size("MASTER_DIRECTIVE.md"), 100723, "MASTER_DIRECTIVE.md 바이트 예산(100,723) 초과 — 늘리지 말고 줄여라(줄이면 이 상한도 낮춘다)")
+        self.assertLessEqual(size("CEO_TEMPLATE.md"), 116357, "CEO_TEMPLATE.md 바이트 예산(116,357) 초과 — 늘리지 말고 줄여라(줄이면 이 상한도 낮춘다 · 생성물이라 MASTER 와 머리글 바이트가 함께 든다)")
 
     def test_utf8_and_lf(self):
         """세 지시문 모두 엄격 UTF-8 로 읽히고 CRLF 가 없어야 한다(Windows 체크아웃 회귀)."""
@@ -2753,6 +2763,11 @@ class TriageRemainingIssues(unittest.TestCase):
                     for test in loader.loadTestsFromTestCase(case):
                         if test.id().endswith(_FULL_SUITE_TEST):
                             continue
+                        # ★증폭기 차단(S64-IMPL): 바이트 예산 핀은 편집된 사본이 아니라 **실제 파일**을 잰다(REAL_DIRECTIVES_DIR) —
+                        #   정당한 편집이 무엇을 하든 결과가 같으므로 셀 안에서 다시 돌릴 이유가 없고, 돌리면 진짜 예산 적색 1건이
+                        #   8셀로 복제된다(13 = 독립 5 + 그림자 8 의 원인). 이 핀은 위에서 한 번만 센다.
+                        if test.id().endswith(_REAL_FILE_PINS):
+                            continue
                         suite.addTest(test)
                 return suite.run(unittest.TestResult())
             finally:
@@ -2815,11 +2830,17 @@ class TriageRemainingIssues(unittest.TestCase):
                                 or any(v != self.raw[k] for k, v in (extra or {}).items()),
                                 "정당한 편집 앵커 부재(검체가 낡았다)")
                 result = full_suite_rc(cso_text, template_text, extra)
+                if not result.wasSuccessful():
+                    # ★13 이 13개의 독립 원인으로 읽히지 않게 같은 줄에 센다: 편집하지 않은 사본에서도 붉은 것(독립) + 이 편집이 새로 붉힌 것(파생).
+                    base = full_suite_rc(cso, template)
+                    base_ids = {t[0].id() for t in base.failures + base.errors}
+                    ids = [t[0].id() for t in result.failures + result.errors]
+                    indep = [i for i in ids if i in base_ids]
                 self.assertTrue(
                     result.wasSuccessful(),
-                    "정당한 편집이 전체 검체에서 거짓 적색을 냈다(%s): failures=%d errors=%d\n%s"
-                    % (label, len(result.failures), len(result.errors),
-                       "\n".join(t[0].id() for t in result.failures + result.errors)))
+                    "정당한 편집이 전체 검체에서 거짓 적색을 냈다(%s): 실패 %d = 독립(미편집 사본도 붉음) %d + 이 편집이 새로 붉힘 %d\n%s"
+                    % (label, len(ids), len(indep), len(ids) - len(indep), "\n".join(ids))
+                    if not result.wasSuccessful() else "")
 
         # ★D7 음성 대조 — **같은 입력**(조항 내부 주석 문서)에서 조항을 지우거나 뒤집으면 전체
         #   검체는 붉어야 한다. 이것이 없으면 위 통과 대조는 "투영을 느슨하게 해서 다 통과" 로도
@@ -2910,6 +2931,7 @@ ZERO_LOSS_AFTER_EXECUTION_PHRASES_MASTER = ("미저장 작업 없음 확정", "c
 # CSO §2 쪽 감시 문구(같은 방향) — 위 상수와 같은 한계를 가진다. 맨 `손실0`·`손실0)` 는 같은 이유로 뺐다.
 ZERO_LOSS_AFTER_EXECUTION_PHRASES_CSO = ("미저장 작업 없음 확정", "clear 집행(손실0)", "손실 0을")
 _FULL_SUITE_TEST = "test_triage_positive_controls_pass_through_full_suite"
+_REAL_FILE_PINS = ("test_directive_byte_budget_ratchet",)   # 실제 저장소 파일을 재는 핀 — 전체 검체 셀 안에서 제외(증폭기 차단)
 _IN_FULL_SUITE = False          # C6 의 재귀 가드(전체 검체 안에서 자기 자신을 다시 돌리지 않는다)
 
 
