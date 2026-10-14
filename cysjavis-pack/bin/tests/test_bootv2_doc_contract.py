@@ -35,12 +35,15 @@
   ③ terminal 11종 등재 · exit 12/13/14/15 **주체 귀속** · 코드 상수 대조(유령 0)
   ④ session-start.sh 에 ack 줄 **부재**(T1-8 · 음성 방향)
   ⑤ CEO_TEMPLATE == 생성기 합성식 출력(바이트 등가)
+  ⑤-b ★오너 복원 조항이 CEO_TEMPLATE·fragment 양쪽에 **선언된 바이트 그대로** 실재
+     (gemini minor-1 — 조항을 지우고 재생성하면 ⑤도 표지 핀도 초록이라 조용히 사라진다)
   ⑥ ★음성 대조(계측 타당성) — 위 다섯 축을 각각 무력화한 **변조 사본**은 통과하지 못한다
   ⑦ U13 착수 게이트 정본(WORKER §0 · REVIEWER §1-2) 실재 + CSO·MASTER 무접촉(회귀 핀) +
      그 축의 음성 대조(MU10 재현 — 절 삭제 사본은 반드시 FAIL)
 출력: PASS/FAIL 행 · 실패 시 exit 1 · 전부 통과 시 종료 토큰 BOOTV2-DOC-CONTRACT-OK.
 실행 규약(CI 동형): CYS_PACK_DIR="$(mktemp -d)" python3 bin/tests/test_bootv2_doc_contract.py
 """
+import hashlib
 import io
 import os
 import re
@@ -262,6 +265,55 @@ def ceo_drift(fragment_bytes, master_bytes, ceo_bytes, separator):
     return []
 
 
+# ⑤-b ★오너 복원 조항 필수 핀 (gemini minor-1 · 부서장 결정 2026-10-14: **검체 쪽 핀**)
+#   무엇을 막는가: 누군가 `scripts/ceo_template_header.md` 에서 오너 복원 조항을 지우고
+#   `python3 scripts/gen_ceo_template.py` 를 돌려 커밋하면 ⑤(합성식 등가)가 성립하고 생성기의
+#   표지 핀 3개도 남아 **모든 게이트가 초록**이다 ⇒ 오너가 직접 쓴 조항이 **조용히** 사라진다.
+#   ★왜 생성기의 `EXPECTED_MARKER_PINS` 에 문구를 더하지 않았나(리뷰어 1차 권고를 기각한 이유):
+#   그 집합은 자유 목록이 아니라 `scripts/gen_ceo_template.py` 가 `set(javis_preflight.MARKER_PINS)`
+#   와 **등가로 단언**하는 집합이고, 그 집합은 `javis_preflight` 의 **C03 승격 판정 술어**다
+#   ⇒ 문구 하나를 더하면 적색이거나 **제품의 승격 술어가 움직인다**. minor 는 제품 술어를
+#   움직이지 않는다(부서장 판정).
+#   ★어휘 목록이 아니라 **모양**으로 잰다(이 레인의 교훈: 산문 위의 검사는 낱말·행위치·바이트
+#   세 축에서 새므로, 수리는 규칙의 모양을 바꾸는 것이다): 조항을 **구조로** 잘라내고
+#   (머리글 → 다음 최상위 `## [` 절) 그 바이트를 **선언된 길이·sha256** 과 대조한다.
+#   ⇒ 오너가 조항을 고치면 이 두 상수를 함께 갱신해야 적색이 풀린다. 그 **loud 적색이 이 핀의
+#   의도**다 — 결함은 변경이 아니라 **조용한 소실**이었다.
+#   범위: ⑤와 같이 **repo 전용**(fragment 실재가 조건)이다. 배포 설치본의 옛 템플릿을
+#   적색으로 만들지 않는다(⑦ 축과 같은 규율).
+OWNER_CLAUSE_HEADING = "## [CEO 와 master 의 차이"
+OWNER_CLAUSE_BYTES = 6918
+OWNER_CLAUSE_SHA256 = "ef982427f25c5b2c9ad18bca217af043f06ac82e899700ee33ba0887493c1e4c"
+_TOP_SECTION_RE = re.compile(r"(?m)^## \[")
+
+
+def owner_clause_slice(text):
+    """조항 바이트를 **구조로** 잘라낸다 — 머리글부터 다음 최상위 절까지(없으면 끝까지).
+    머리글이 없으면 None = 조항이 사라졌다."""
+    i = text.find(OWNER_CLAUSE_HEADING)
+    if i < 0:
+        return None
+    m = _TOP_SECTION_RE.search(text, i + 1)
+    return text[i:m.start()] if m else text[i:]
+
+
+def owner_clause_violations(label, text):
+    """⑤-b 오너 복원 조항 — 위반 목록(빈 목록 = 통과). 원본과 변조 사본을 **같은 함수**로 잰다."""
+    blk = owner_clause_slice(text)
+    if blk is None:
+        return ["%s: 조항 머리글 부재(%r) — 조항이 사라졌다" % (label, OWNER_CLAUSE_HEADING)]
+    b = blk.encode("utf-8")
+    bad = []
+    if len(b) != OWNER_CLAUSE_BYTES:
+        bad.append("%s: 조항 %dB != 선언 %dB — 잘림·증보다(오너가 고쳤다면 이 파일의 두 상수를 함께 갱신하라)"
+                   % (label, len(b), OWNER_CLAUSE_BYTES))
+    h = hashlib.sha256(b).hexdigest()
+    if h != OWNER_CLAUSE_SHA256:
+        bad.append("%s: 조항 sha256 %s… != 선언 %s… — 본문이 바뀌었다(오너가 고쳤다면 두 상수를 함께 갱신하라)"
+                   % (label, h[:16], OWNER_CLAUSE_SHA256[:16]))
+    return bad
+
+
 # ⑦ U13 착수 게이트 정본(0.14.41 WP-C1 · 리뷰1 I-1) — 저장소 수준 문안 핀. 런타임
 #   CONTENT_PINS 가 아니다(`.new` 미병합 기존 설치를 C03 FAIL 시키지 않는다 — 이 파일이
 #   읽는 것은 repo 트리의 `directives/*.md` 뿐이고 팩 배포본 무접촉).
@@ -373,6 +425,10 @@ try:
         drift = ceo_drift(read_bytes(FRAGMENT), read_bytes(MASTER_MD),
                           read_bytes(CEO_MD), gen.SEPARATOR)
         check("5 CEO_TEMPLATE 이 생성기 합성식과 바이트 등가", not drift, "%s" % drift)
+        _ocl = (owner_clause_violations("CEO_TEMPLATE.md", read(CEO_MD))
+                + owner_clause_violations("fragment", read(FRAGMENT)))
+        check("5b 오너 복원 조항이 CEO_TEMPLATE·fragment 양쪽에 선언된 바이트 그대로 실재(gemini minor-1)",
+              not _ocl, "%s" % _ocl)
     else:
         print("SKIP 5 CEO_TEMPLATE 합성 대조 — fragment 부재(배포 팩 트리 · repo 전용 축)")
         gen = None
@@ -459,6 +515,23 @@ try:
     check("6o 변조⑧ REVIEWER §1-2 통째 삭제본(MU10 재현)은 ⑦ 축을 통과 못 함",
           bool(start_gate_missing(m_reviewer_mu10, "## 1-2. 착수 게이트")),
           "변조본이 통과했다(계측 무효 — I-1 재발)")
+    # ★변조⑩⑪ — ⑤b 핀의 계측 타당성. 둘로 나누는 이유: 삭제 변조는 **머리글 부재**라는
+    #   선행 arm 에서 죽으므로, 그것만으로는 길이·해시 arm 이 하중을 지는지 알 수 없다
+    #   (이 레인의 교훈: 변이는 **판별 단언**에서 죽어야 한다).
+    _ceo_text = read(CEO_MD)
+    _ocl_blk = owner_clause_slice(_ceo_text)
+    if _ocl_blk is None:
+        print("SKIP 6q/6r 오너 조항 음성 대조 — 이 트리의 CEO_TEMPLATE 에 조항이 없다")
+    else:
+        m_owner_del = _ceo_text.replace(_ocl_blk, "", 1)
+        check("6q 변조⑩ 오너 복원 조항 **삭제**본은 ⑤b 핀을 통과 못 함",
+              bool(owner_clause_violations("변조본", m_owner_del)), "변조본이 통과했다(계측 무효)")
+        m_owner_trunc = _ceo_text.replace(_ocl_blk, _ocl_blk[:len(_ocl_blk) // 2], 1)
+        _tv = owner_clause_violations("변조본", m_owner_trunc)
+        check("6r 변조⑪ 머리글을 남긴 **절반 잘림**본은 ⑤b 의 길이·해시 arm 에서 죽는다",
+              bool(_tv) and all("머리글 부재" not in v for v in _tv),
+              "판별 arm 이 하중을 지지 않는다: %s" % _tv)
+
     m_cso_leak = cso + "\n## 99. 착수 게이트 (변조 유입)\n" if cso else ""
     if m_cso_leak:
         check("6p 변조⑨ CSO 에 '착수 게이트' 문자열이 섞이면 7c 가 잡는다",
