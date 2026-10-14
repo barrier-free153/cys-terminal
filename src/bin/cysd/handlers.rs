@@ -30982,6 +30982,8 @@ mod tests {
         #[test]
         fn b3_status_polling_does_not_restat_the_identity_file() {
             let (daemon, seat, home, folder, _t) = b3_reported_seat("h8", 995_141);
+            // `control.dashboard` 가 알려진 프로필 폴더를 열거해 신원을 읽는다(m-5) — 실제 홈에 프로필 폴더가 N 개면 첫 폴링이 N 번 읽어 `reads` 가 N 이 된다. 홈을 임시 홈으로 대체해 이 검체를 홈 내용에서 떼어 낸다.
+            let _home_guard = crate::accounts::test_home::set(&home);
             for _ in 0..4 {
                 let _ = b3_usage_objs(&daemon, seat);
             }
