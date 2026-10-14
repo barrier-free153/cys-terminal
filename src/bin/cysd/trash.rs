@@ -3462,7 +3462,13 @@ mod tests {
         const N: usize = 500_000;
         const CEILING_NS_PER_ENTRY: u128 = 200;
         // 생산 코드의 프런티어와 **같은 꼴**이다(`certify_entry_until` 의 `stack`).
-        let seed = PathBuf::from("/Users/cys/.local/state/cys-trash/dept-9-1760000000/d00000");
+        // ★경로 값은 **개인 홈 경로를 쓰지 않는다** — 이 트리는 공개되고 `scripts/secret-scan.sh`
+        //   (PUBLIC 발행 전 fail-closed 게이트 · 오너 2026-06-14)가 개인 경로를 차단한다.
+        //   이 값은 **디스크에 닿지 않는 합성 입력**이다(clone 되어 Vec 에 쌓였다가 해제될 뿐
+        //   열거·stat 를 하지 않는다). ⛔**바이트 길이를 바꾸지 마라** — 이 검체가 재는 것은
+        //   해제 단가이고 그 단가는 값의 **할당 크기**에 딸려 있다(실측: 58 B 유지 시 13 ns ·
+        //   `std::env::temp_dir()` 기반 83 B 로 바꾸면 중앙값 15 ns·최대 19 ns 로 올랐다).
+        let seed = PathBuf::from("/home/user/.local/state/cys-trash/dept-9-1760000000/d00000");
         let mut front: Vec<(PathBuf, usize)> = Vec::new();
         for i in 0..N {
             front.push((seed.clone(), i % 7));

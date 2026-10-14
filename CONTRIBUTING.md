@@ -20,6 +20,24 @@ bash scripts/secret-scan.sh --all  # secret/PII gate (fail-closed)
 sh scripts/version-check.sh      # version SOT consistency (release PRs only)
 ```
 
+**Before any push to the public remote — work branches included, not only releases** — run
+`bash scripts/secret-scan.sh --all` and require **exit code 0**. Exit 1 means findings: **stop, fix,
+do not push** (the gate is fail-closed; its output redacts the offending value). Exit 2 means
+"could not judge" and is **not** a pass either.
+
+Wire it per clone so it also runs on every commit:
+`ln -sf ../../scripts/secret-scan.sh .git/hooks/pre-commit`. In a **linked worktree** the hooks
+directory is shared (`$GIT_COMMON_DIR/hooks`) and that relative path resolves to the *main
+checkout's* copy, which may be an older revision of the scanner — prefer a hook that execs
+`"$(git rev-parse --show-toplevel)"/scripts/secret-scan.sh` so the scanner shipped with the tree
+being committed is the one that runs.
+
+Why this paragraph exists (measured 2026-10-14): the scanner has been fail-closed since 2026-06-14,
+but this clone had no `pre-commit` hook (only `.sample` files, `core.hooksPath` unset) and the
+checklist carried the command only on the *release* path — so a work-branch push put a personal
+absolute path into a public ref, and CI reported it **after** the push. A gate placed behind an
+irreversible step is not a gate.
+
 When upgrading `wry` in `Cargo.lock` (currently 0.55.1), rerun `ui/e2e/dragdrop_gate.py` to verify macOS/Linux drop coordinates still use logical px.
 
 ## Directive edits

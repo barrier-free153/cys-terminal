@@ -4,6 +4,19 @@
 > ①버전 범프(아래 §0 **8곳** = 수동 6 + `Cargo.lock` 2패키지)+`cargo build`(Cargo.lock 재생성)
 > +로컬 `bash scripts/secret-scan.sh --all` clean 확인
 > ②main push ③`git tag vX.Y.Z && git push origin vX.Y.Z`(태그=오너 직접·가드)
+>
+> ★**밀기 전 게이트 — 전 ref 공통**(2026-10-14 추가 · S51): 릴리스 경로만이 아니라 **작업 브랜치
+>  push 를 포함한 모든 원격 push 앞에서** `bash scripts/secret-scan.sh --all` 을 돌려 **rc 0** 을
+>  확인한다. ⛔**rc 1 이면 멈춘다**(발견 = PUBLIC 발행 차단 · fail-closed · 출력은 값을 가린다).
+>  **rc 2 는 '판정 불가'이고 통과가 아니다**. 커밋마다 돌게 하려면 pre-commit 훅으로 배선한다
+>  (`ln -sf ../../scripts/secret-scan.sh .git/hooks/pre-commit` — ★링크드 워크트리는 hooks 를
+>  공유하므로 그 상대 경로가 **본 체크아웃의 사본**을 가리킨다. 커밋되는 트리 자신의 스캐너를
+>  쓰려면 훅이 `"$(git rev-parse --show-toplevel)"/scripts/secret-scan.sh` 를 exec 하게 하라).
+>  근거(실측 2026-10-14): 도구는 2026-06-14 부터 fail-closed 였는데 **아무도 밀기 전에 돌리지
+>  않았다** — 이 저장소에 pre-commit 훅이 없었고(hooks 에 `.sample` 뿐 · `core.hooksPath` 미설정)
+>  이 칸이 **릴리스 경로에만** 있었다. 그래서 작업 브랜치 push 가 개인 절대경로 1줄을 공개 ref 에
+>  올렸고, CI step#3 이 그것을 push **뒤에** 보고했다. **게이트가 비가역 걸음 뒤에 있으면 게이트가
+>  아니다**(사후 보고일 뿐이다).
 > ④CI 4잡(mac signed·mac x86 sidecar·**windows NSIS**·pack) green + windows-build.yml T5 green
 >  (windows-build.yml PTY 스모크는 **pane env 실주입 관측** — U-20 `CLAUDE_CODE_GIT_BASH_PATH`·
 >  좌석 토큰 `CYS_SEAT_TOKEN` — 까지 게이트한다. 단 **벤더 링크 분절**(claude 가 그 env 로 훅을
