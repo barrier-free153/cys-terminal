@@ -7685,3 +7685,9 @@ mod bridge_probe_tests {
     }
 }
 
+
+// ★A-PRIME-S1 — 비동기 휴지통 미리보기 잡 식별자(`jobId`↔`job_id`) 이름 결박 핀 —
+// 테스트 전용 모듈(프로덕션 코드 0행). 화면·Tauri·데몬 세 소스를 읽어 **양쪽에서 꺼내 대조**한다.
+// 파일 맨 끝에 두는 것은 cysd 쪽 테스트 전용 모듈 규약과 같은 이유다(첫 `#[cfg(test)]` 앵커).
+#[cfg(test)]
+mod job_name_binding_tests;
