@@ -26695,7 +26695,7 @@ mod tests {
     }
 
     /// ★(리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED) CEO 좌석 입력줄에 **좌석 밖** 발신자의 Return 누락 잔여 — 부서장→CEO 소켓
-    /// master(CEO_TEMPLATE:33 · 자기신고 from = Claimed)·익명 CLI(from 없음) — 가 있어도 AutoEligible 결재는 CEO 로 간다
+    /// master(CEO_TEMPLATE 의 「부서장이 CEO 소켓으로 교차 push」 줄 · 자기신고 from = Claimed)·익명 CLI(from 없음) — 가 있어도 AutoEligible 결재는 CEO 로 간다
     /// (pre-H 처럼 잔여 뒤에 병합 제출). 종전에는 매 결재가 ceo_seat_draft 로 사람에게 갔다. 음성 대조: GUI 모양 삽입(오너
     /// 클릭 · human + machine_origin + 오너 토큰)은 종전대로 escalation. RED(HEAD f1b1a7e8): approval.stalled{ceo_seat_draft}.
     #[test]

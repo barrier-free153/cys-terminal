@@ -1097,7 +1097,7 @@ jobs:
       #   없다(pack-release.yml PACK_MIN_BINARY_OVERRIDE 와 같은 커밋에서 같은 판단).
       # ★0.14.41 상향(2026-09-23 · 오너 18항목 U16 WP-E 통합 · master 결재). 이 세대 팩이
       #   **0.14.41 에 처음 생긴 CLI 표면의 실행을 직접 지시**한다 — MASTER_DIRECTIVE.md:352·
-      #   CEO_TEMPLATE.md:52·433(`cys team-propose --name … --purpose …`) · javis_phoenix.py:2044
+      #   CEO_TEMPLATE.md 의 「cys team-propose --name "<팀 이름>"」 두 출현(`cys team-propose --name … --purpose …`) · javis_phoenix.py:2044
       #   (`cys reinject --check --ack-only`). 부재 실측(2026-09-23 · v0.14.40=126cfdd0 대조):
       #   `git show 126cfdd0:src/bin/cys.rs | grep -c TeamPropose` → 0, `Reinject` 구조체에
       #   `ack_only` 필드 부재(같은 트리 grep 은 무관한 `_only` 단어의 오탐 2건뿐, 실제
@@ -1108,8 +1108,8 @@ jobs:
       #   PACK_MIN_BINARY_OVERRIDE 와 같은 커밋에서 동시 상향(두 값 동일 계약).
       # ★0.14.42 상향(2026-09-27 · 소켓·전달 개선 + 팀 확인창 대화 승인 + 사용량 계정 통합 발행 준비).
       #   이 세대 팩이 **0.14.42 에 처음 생긴 CLI 표면의 실행을 직접 지시**한다 —
-      #   MASTER_DIRECTIVE.md:351·CEO_TEMPLATE.md:432(`cys-dept create --team-token <토큰>` → cys-dept:1749
-      #   `cys team-token consume|settle|inspect`) · MASTER_DIRECTIVE.md:356·CEO_TEMPLATE.md:437
+      #   MASTER_DIRECTIVE.md:351·CEO_TEMPLATE.md 의 「① `cys-dept create --team-token <토큰>`」 줄(`cys-dept create --team-token <토큰>` → cys-dept:1749
+      #   `cys team-token consume|settle|inspect`) · MASTER_DIRECTIVE.md:356·CEO_TEMPLATE.md 의 「④ 생성 성공(①의 exit 0) **뒤에만**」 줄
       #   (`cys feed reply <id> allow --team-token <토큰>`) · hooks/cys-agy-statusline.sh:12
       #   (`cys usage-report-stdin --agy`) · hooks/session-start.sh:78(`cys usage-register --source clear` —
       #   이것만 rc 2 폴백이 있다). 부재 실측(2026-09-27 · v0.14.41=cecf4c57 대조):

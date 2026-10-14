@@ -17,9 +17,9 @@
   + [cysjavis-pack/directives/MASTER_DIRECTIVE.md 바이트 무수정]
   → cysjavis-pack/directives/CEO_TEMPLATE.md  (utf-8 · 개행 무변형 — 바이너리 연접)
 
-★fragment :22 좌표 계약: fragment 의 22행(라벨 규약 줄)은 합성본에서도 22행이다 —
-  src/bin/cysd/delivery.rs:8 이 `CEO_TEMPLATE.md:22` 좌표를 참조하므로 fragment 선두부에
-  줄을 끼워 넣지 마라(본 스크립트도 합성본 선두에 아무것도 덧붙이지 않는다).
+★인용 계약: 합성본의 조항은 줄 번호가 아니라 파일명 + 인용 문자열로 인용한다(예: CEO_TEMPLATE.md 의 「라벨 없는 push 는 수신 노드의 임무 게이트에서」 줄)
+  — 옛 「fragment 22행 좌표 계약」은 폐기됐다(오너 조항 59줄이 14행에 들어와 그 줄이 81행이 됐다 · bec69f49 · 줄 번호를 지키는 검사는 없었다).
+  본 스크립트는 합성본 선두에 아무것도 덧붙이지 않는다(--check ① 이 단언한다).
 
 사용:
     python3 scripts/gen_ceo_template.py            # 재합성 → CEO_TEMPLATE.md 기록
