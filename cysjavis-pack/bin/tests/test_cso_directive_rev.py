@@ -2671,17 +2671,52 @@ class TriageRemainingIssues(unittest.TestCase):
         옛 결함은 같은 검증을 `신선(미저장 작업 없음 확정)=…clear 집행(손실0)` 으로 정의해 같은 문서가 같은 상태에서
         반대로 지시한 것이다.
 
-        이 검사가 잡는 것: 공백·줄바꿈·`**` 강조를 접은 뒤(squash) 아래 **완결 문구** 셋이 §2 에 있는가.
+        이 검사가 잡는 것: 공백·줄바꿈·`**` 강조를 접은 뒤(squash) `ZERO_LOSS_AFTER_EXECUTION_PHRASES_CSO`
+        의 **알려진 문구 조각들**이 §2 에 있는가.
+        ★그 목록의 **실제 형태**(⑻ codex N1 — 종전 서술이 목록보다 좁게 약속했다): 분류는 이 파일의
+        `ZERO_LOSS_PHRASE_CLASSES_CSO` 가 정본이고 손으로 요약하지 않는다. 분류가 목록과 어긋나면
+        `test_zero_loss_phrase_classification_matches_the_watch_list` 가 적색이 된다. 분류 결과는
+        **셋 중 하나만** 집행 분기를 문구 안에 담는다(`clear 집행(손실0)`) — `미저장 작업 없음 확정` 은
+        옛 결함 문장의 **신선 정의** 쪽이고, `손실 0을` 은 **완결 문구가 아니라 조각**이다.
+        ⇒ ★그러므로 이 감시선은 "집행 분기를 품은 완결형만 건다" 가 **아니다**. 알려진 결함 문장의
+        **조각들**을 건다. 그 조각 둘은 참인 문장에도 나타날 수 있어 **거짓 적색의 여지**가 남는다
+        (관례로 남긴 한계 · 리뷰어 읽기가 받친다).
         ★이 검사가 **잡지 못하는 것**(커버 범위를 부풀리지 않는다): 다른 어휘('집행 후 손실 없음'·'무손실'·'유실 0'),
         전각·제로폭 문자로 쓴 같은 문구, 집행/미집행 분기를 나눠 쓴 서술. 그 범위는 리뷰어의 읽기 관례다.
         ★맨 토큰 `손실0`·`손실0)` 는 감시 문구에서 뺐다 — `…clear 미집행 · 손실 0)` 처럼 **집행하지 않았으니
-        손실이 없다**는 참인 문장까지 붉혔기 때문이다(거짓 적색). 문구는 집행 분기를 품은 완결형으로만 건다."""
+        손실이 없다**는 참인 문장까지 붉혔기 때문이다(거짓 적색)."""
         section2 = section_body(self.cso, "## 2.")
         folded = squash(section2)
         for banned in ZERO_LOSS_AFTER_EXECUTION_PHRASES_CSO:
             with self.subTest(phrase=banned):
                 self.assertNotIn(squash(banned), folded,
                                  "§2 가 알려진 옛 결함 문구(집행 뒤 손실 0 단언)를 지시한다: %r" % banned)
+
+    # ── ⑻ codex N1 ────────────────────────────────────────────────────────
+    def test_zero_loss_phrase_classification_matches_the_watch_list(self):
+        """★이 검사의 존재 이유: **서술이 감시 목록보다 넓어지는 것**을 기계가 막는다(codex N1).
+
+        독스트링은 변이로 재기 어렵다 — 그래서 설명을 산문이 아니라 **데이터**(분류표)로 두고,
+        그 데이터가 감시 목록과 **집합으로 같은지** 여기서 단언한다. 문구를 더하거나 빼면서 분류를
+        갱신하지 않으면 이 줄이 적색이 되므로, 다음 사람은 '분류하지 않은 감시 문구' 를 남길 수 없다.
+        ⇒ 독스트링 자신은 여전히 기계가 증명하지 않는다(관례). 그러나 독스트링이 가리키는 **분류**는
+        증명된다 — 설명을 목록에서 파생시키라는 요구가 닫히는 자리가 거기다."""
+        self.assertEqual(
+            set(ZERO_LOSS_PHRASE_CLASSES_CSO), set(ZERO_LOSS_AFTER_EXECUTION_PHRASES_CSO),
+            "감시 목록과 분류표가 어긋난다 — 문구를 고쳤으면 분류도 같이 고쳐라")
+        for phrase, (complete, has_branch, note) in ZERO_LOSS_PHRASE_CLASSES_CSO.items():
+            with self.subTest(phrase=phrase):
+                self.assertIsInstance(note, str)
+                self.assertTrue(note, "분류에 설명이 없다")
+                # ★분류는 선언이 아니라 **문구에서 파생**된다: '집행' 이 문구 안에 있는가.
+                self.assertEqual(has_branch, "집행" in phrase,
+                                 "집행 분기 분류가 문구의 실제 글자와 어긋난다: %r" % phrase)
+                self.assertEqual(complete, not phrase.rstrip().endswith(("을", "를", "이", "가")),
+                                 "완결형 분류가 문구의 실제 꼴과 어긋난다: %r" % phrase)
+        # ★그리고 **하나뿐**이라는 사실 자체를 핀한다 — 종전 서술("셋 모두")이 틀렸던 자리다.
+        self.assertEqual(
+            [p for p in ZERO_LOSS_AFTER_EXECUTION_PHRASES_CSO if "집행" in p], ["clear 집행(손실0)"],
+            "집행 분기를 문구 안에 담는 감시 문구가 하나가 아니다 — 독스트링 서술을 다시 보라")
 
     # ── C4(codex major) ───────────────────────────────────────────────────
     def test_triage_cycle_agent_rebaseline_is_disclosed(self):
@@ -2930,6 +2965,20 @@ INVERTED_PROHIBITIONS = (
 ZERO_LOSS_AFTER_EXECUTION_PHRASES_MASTER = ("미저장 작업 없음 확정", "clear 집행(손실0)")
 # CSO §2 쪽 감시 문구(같은 방향) — 위 상수와 같은 한계를 가진다. 맨 `손실0`·`손실0)` 는 같은 이유로 뺐다.
 ZERO_LOSS_AFTER_EXECUTION_PHRASES_CSO = ("미저장 작업 없음 확정", "clear 집행(손실0)", "손실 0을")
+# ★⑻ codex N1 수리 — 감시 문구의 **분류표**. 독스트링이 "셋 모두 집행 분기를 품은 완결형" 이라고
+#   적었는데 실제 목록은 그보다 넓다(아래 분류가 그 사실이다). 설명을 손으로 요약하지 않고
+#   **목록에서 파생**시키기 위해 분류를 데이터로 둔다 — 그리고 분류와 목록이 어긋나면
+#   `test_zero_loss_phrase_classification_matches_the_watch_list` 가 **적색**이 된다
+#   (서술이 목록보다 넓어지는 일을 기계가 막는 자리).
+#   ⛔감시 문구를 더하거나 빼지 않았다(부서장 ⒞ — 금지 어휘 확장 금지 · ⒝⒤ 를 골랐다: 셋은 **한
+#   문장**(`신선(미저장 작업 없음 확정)=…clear 집행(손실0)`)의 조각이라 빼면 그 결함의 부분 재출현을
+#   놓친다. 고른 이유는 보고에 적었다).
+ZERO_LOSS_PHRASE_CLASSES_CSO = {
+    # 문구: (완결형인가, 집행 분기를 품는가, 무엇인가)
+    "미저장 작업 없음 확정": (True, False, "옛 결함 문장의 **신선 정의** 쪽 — '집행' 을 담지 않는다"),
+    "clear 집행(손실0)": (True, True, "'집행' 을 담은 완결형 — 분기가 문구 안에 있다"),
+    "손실 0을": (False, False, "★**조각** — 옛 결함 문장의 꼬리(조사까지만)"),
+}
 _FULL_SUITE_TEST = "test_triage_positive_controls_pass_through_full_suite"
 _REAL_FILE_PINS = ("test_directive_byte_budget_ratchet",)   # 실제 저장소 파일을 재는 핀 — 전체 검체 셀 안에서 제외(증폭기 차단)
 _IN_FULL_SUITE = False          # C6 의 재귀 가드(전체 검체 안에서 자기 자신을 다시 돌리지 않는다)
